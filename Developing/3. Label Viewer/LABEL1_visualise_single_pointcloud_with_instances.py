@@ -1,0 +1,1544 @@
+# -*- coding: utf-8 -*-
+"""
+Single Point Cloud Viewer with Surrounding Utilities — Indicative Depth
++ Class Label Colour Toggle  +  Left-Click Segment Picking
+========================================================================
+Visualises one PLY point cloud together with all utility infrastructure
+(pipes, cables, components) that falls within a buffer
+around the point cloud's bounding box.
+
+Class Label Toggle
+------------------
+  Press  L  or use the checkbox in the panel to toggle between the
+  original RGB colours and per-class semantic colours.
+
+  OpenTrench3D class mapping:
+      0  Background   (grey)
+      1  Pipe         (red)
+      2  Trench       (blue)
+      3  Backfill     (green)
+
+Depth handling for Z = -99  (no reliable measurement)
+------------------------------------------------------
+  Before loading utilities, a VisualizerWithEditing window opens so you
+  can manually pick one or more points on the ground surface:
+
+      Shift + Left-Click   to select a ground-level vertex
+      Q  or close window   when finished picking
+
+  The average Z of the picked points becomes the ground level reference.
+  For each utility vertex with Z = -99, depth is then estimated as:
+
+      Z_estimated  =  ground_level  -  vejledendeDybde / 1000
+
+  where vejledendeDybde is the indicative (suggested) depth below ground
+  level stored as an attribute on the utility feature, in millimetres.
+
+  If vejledendeDybde is not available the vertex falls back to the mean
+  of valid Z values on the same feature, or the picked ground level.
+
+  Components (Vandkomponent, etc.) do not carry vejledendeDybde.  For those
+  the script uses the average depth of the corresponding pipe layer, or
+  falls back to the picked ground level.
+
+Usage
+-----
+  Set PLY_FILE below to any individual .ply site file, then run.
+
+Picking
+-------
+  Left-Click  on any pipe segment or component sphere to show all its
+  GML attribute fields in the "Selected Feature" panel.  The nearest
+  segment / sphere centre is highlighted in yellow.
+
+  Picking uses true point-to-segment distance for accuracy.
+
+Keyboard shortcuts
+------------------
+  C   pivot to cloud centroid           P   pivot to pipe centroid
+  0   pivot to world origin
+  ]   increase opacity +0.05           [   decrease opacity -0.05
+  L   toggle class label colours
+  H   help                             Esc quit
+"""
+
+import open3d as o3d
+import open3d.visualization.gui as gui
+import open3d.visualization.rendering as rendering
+import geopandas as gpd
+import numpy as np
+from pathlib import Path
+import re
+import time
+import glob as _globmod
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+PLY_FILE = (
+    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
+    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
+)
+
+AREA_REF_GEOJSON = (
+    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
+    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
+)
+
+GML_PATH = (
+    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
+    r"\Python\Thesis\Data\Ledningspakke_3383910\consolidated.gml"
+)
+
+# Circular crop radius (metres) around the point cloud centroid (XY).
+# The scene (point cloud + utilities) is clipped to a disc of this radius.
+# Recommended maximum: 2.0 m — larger values show too much surrounding context.
+CROP_RADIUS = 2.0
+
+_ply_stem = Path(PLY_FILE).stem
+_ply_parent = Path(PLY_FILE).parent
+_instance_candidates = sorted(
+    _ply_parent.glob(f"{_ply_stem}_instances_*"),
+    key=lambda p: p.name,
+    reverse=True,
+)
+INSTANCE_DIR = str(_instance_candidates[0]) if _instance_candidates else ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITY LAYER DEFINITIONS — colour per LER 2.0 / project convention
+# ─────────────────────────────────────────────────────────────────────────────
+LINE_LAYERS = {
+    "Vandledning":                  {"color": [0.200, 0.500, 1.000], "fallback_radius": 0.005},
+    "Afloebsledning":               {"color": [0.545, 0.271, 0.075], "fallback_radius": 0.005},
+    "Gasledning":                   {"color": [1.000, 0.800, 0.000], "fallback_radius": 0.005},
+    "Elledning":                    {"color": [0.900, 0.100, 0.100], "fallback_radius": 0.005},
+    "Telekommunikationsledning":    {"color": [0.200, 0.800, 0.200], "fallback_radius": 0.005},
+    "Foeringsroer":                 {"color": [0.500, 0.900, 0.500], "fallback_radius": 0.005},
+    "LedningUkendtForsyningsart":   {"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},
+    "Ledningstrace":                {"color": [1.000, 0.500, 0.500], "fallback_radius": 0.005},
+}
+
+COMPONENT_LAYERS = {
+    "Vandkomponent":                  {"color": [0.000, 0.900, 0.900]},
+    "Afloebskomponent":               {"color": [0.700, 0.400, 0.200]},
+    "Gaskomponent":                   {"color": [1.000, 0.900, 0.300]},
+    "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
+    "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
+}
+
+COMPONENT_SPHERE_RADIUS = 0.05
+
+# Vandledning diameter → colour mapping
+DIAMETER_COLORS = {
+    0:   [0.502, 0.502, 0.502],
+    32:  [0.702, 0.851, 1.000],
+    63:  [0.400, 0.698, 1.000],
+    120: [0.102, 0.459, 1.000],
+    150: [0.000, 0.278, 0.800],
+    160: [0.000, 0.180, 0.522],
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+_required = {"PLY_FILE": PLY_FILE, "AREA_REF_GEOJSON": AREA_REF_GEOJSON, "GML_PATH": GML_PATH}
+_missing = [(n, p) for n, p in _required.items() if not Path(p).exists()]
+if _missing:
+    print("\n[CONFIG ERROR] Missing paths:")
+    for n, p in _missing:
+        print(f"  {n:<20} = {p}")
+    raise SystemExit(1)
+
+print("Config paths OK.\n")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1.  Auto-detect area from the PLY path
+# ─────────────────────────────────────────────────────────────────────────────
+_ply_path = Path(PLY_FILE)
+_area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.parent.name, re.IGNORECASE)
+if not _area_match:
+    _area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.name, re.IGNORECASE)
+if not _area_match:
+    print("[ERROR] Cannot determine area number from PLY path.")
+    raise SystemExit(1)
+
+AREA_NUMBER = int(_area_match.group(1))
+AREA_NAME   = f"Area{AREA_NUMBER}"
+print(f"Detected area: {AREA_NAME}  (from path)")
+
+ref   = gpd.read_file(AREA_REF_GEOJSON)
+area  = ref[ref["name"] == AREA_NAME]
+if area.empty:
+    print(f"[ERROR] No origin for '{AREA_NAME}' in {AREA_REF_GEOJSON}")
+    raise SystemExit(1)
+
+area_row = area.iloc[0]
+TX, TY, TZ = area_row.geometry.x, area_row.geometry.y, area_row.geometry.z
+print(f"Origin -> TX={TX:.3f}  TY={TY:.3f}  TZ={TZ:.3f}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2.  Load the single point cloud + class labels
+# ─────────────────────────────────────────────────────────────────────────────
+_t0 = time.perf_counter()
+print(f"\nLoading point cloud: {_ply_path.name} ...")
+pcd = o3d.io.read_point_cloud(str(PLY_FILE))
+pts = np.asarray(pcd.points)
+print(f"  {len(pts):,} points loaded")
+
+# Read class labels directly from the ASCII PLY (no plyfile dependency)
+print("  Reading class labels from PLY ...")
+class_labels = None
+with open(str(PLY_FILE), 'r') as f:
+    header_lines = []
+    property_names = []
+    for line in f:
+        line = line.strip()
+        header_lines.append(line)
+        if line.startswith("property "):
+            # e.g. "property uchar class" → "class"
+            property_names.append(line.split()[-1])
+        if line == "end_header":
+            break
+
+    if "class" in property_names:
+        class_col_idx = property_names.index("class")
+        # Read remaining lines as data
+        labels = []
+        for line in f:
+            parts = line.split()
+            if len(parts) > class_col_idx:
+                labels.append(int(parts[class_col_idx]))
+        class_labels = np.array(labels, dtype=int)
+        unique_classes = np.unique(class_labels)
+        print(f"  Class labels found: {len(class_labels):,} values, "
+              f"unique classes: {sorted(unique_classes.tolist())}")
+    else:
+        print(f"  [WARNING] No 'class' property in PLY (found: {property_names})"
+              " — class colouring disabled")
+
+# Store original RGB colours
+original_colors = np.asarray(pcd.colors).copy()
+
+cloud_centroid_full = pts.mean(axis=0)
+
+# ── Circular crop of the point cloud around its XY centroid ────────────────
+_crop_cx_local = float(cloud_centroid_full[0])
+_crop_cy_local = float(cloud_centroid_full[1])
+_dxy2 = ((pts[:, 0] - _crop_cx_local) ** 2 +
+         (pts[:, 1] - _crop_cy_local) ** 2)
+_crop_mask = _dxy2 <= (CROP_RADIUS ** 2)
+
+n_full = len(pts)
+pts = pts[_crop_mask]
+
+# Rebuild the PointCloud so the viewer only sees the cropped disc
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(pts)
+original_colors = original_colors[_crop_mask]
+pcd.colors = o3d.utility.Vector3dVector(original_colors)
+if class_labels is not None:
+    class_labels = class_labels[_crop_mask]
+
+print(f"  Circular crop (r={CROP_RADIUS} m): {n_full:,} -> {len(pts):,} points")
+
+cloud_centroid = pts.mean(axis=0) if len(pts) > 0 else cloud_centroid_full
+
+# Bounding box of the cropped cloud (local coordinates)
+pc_min = pts.min(axis=0)
+pc_max = pts.max(axis=0)
+
+# Circular crop center in UTM (used when filtering utilities from the GML)
+_crop_cx_utm = _crop_cx_local + TX
+_crop_cy_utm = _crop_cy_local + TY
+_crop_r2     = CROP_RADIUS * CROP_RADIUS
+
+print(f"  Local bbox:  X[{pc_min[0]:.1f}, {pc_max[0]:.1f}]  "
+      f"Y[{pc_min[1]:.1f}, {pc_max[1]:.1f}]  "
+      f"Z[{pc_min[2]:.1f}, {pc_max[2]:.1f}]")
+print(f"  Crop center (UTM): ({_crop_cx_utm:.1f}, {_crop_cy_utm:.1f})  "
+      f"r = {CROP_RADIUS} m")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b. Load instance PLY files and compute bounding boxes
+# ─────────────────────────────────────────────────────────────────────────────
+INSTANCE_COLORS = [
+    [1.00, 0.20, 0.20],  # red
+    [0.20, 0.60, 1.00],  # blue
+    [0.20, 0.90, 0.20],  # green
+    [1.00, 0.60, 0.00],  # orange
+    [0.80, 0.20, 1.00],  # purple
+    [0.00, 0.90, 0.90],  # cyan
+    [1.00, 1.00, 0.20],  # yellow
+    [1.00, 0.40, 0.70],  # pink
+    [0.60, 0.40, 0.20],  # brown
+    [0.50, 1.00, 0.50],  # lime
+]
+
+_instance_dir = Path(INSTANCE_DIR)
+_instance_files = sorted(_instance_dir.glob("*.ply")) if _instance_dir.is_dir() else []
+
+instance_data = []
+for _i, _inst_path in enumerate(_instance_files):
+    _inst_pcd = o3d.io.read_point_cloud(str(_inst_path))
+    _inst_pts = np.asarray(_inst_pcd.points)
+    if len(_inst_pts) == 0:
+        continue
+    _obb = _inst_pcd.get_oriented_bounding_box()
+    _col = INSTANCE_COLORS[_i % len(INSTANCE_COLORS)]
+    _obb.color = _col
+    instance_data.append({
+        "name": _inst_path.stem,
+        "path": _inst_path,
+        "pcd": _inst_pcd,
+        "obb": _obb,
+        "color": _col,
+        "n_pts": len(_inst_pts),
+    })
+
+instance_data.sort(key=lambda d: d["n_pts"], reverse=True)
+for _i, _d in enumerate(instance_data):
+    _d["color"] = INSTANCE_COLORS[_i % len(INSTANCE_COLORS)]
+    _d["obb"].color = _d["color"]
+
+if instance_data:
+    print(f"\n  Loaded {len(instance_data)} instances from {_instance_dir.name}/ (sorted largest first)")
+    for _i, _d in enumerate(instance_data):
+        print(f"    [{_i}] {_d['name']}: {_d['n_pts']:,} points")
+else:
+    print(f"\n  [warn] No instance PLY files found in {INSTANCE_DIR}")
+
+INSTANCE_LABEL_OPTIONS = [
+    "PowerLine",
+    "DrainageLine",
+    "OilPipeLine",
+    "GasLine",
+    "ThermalLine",
+    "Conduit",
+    "WaterLine",
+    "TelecomunicationLine",
+    "OtherLine",
+    "LineUnknownServiceType",
+]
+
+_instance_labels = {}
+_current_inst_idx = [0]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3.  Pick ground-level points interactively
+# ─────────────────────────────────────────────────────────────────────────────
+def pick_points(pcd):
+    """
+    Open a VisualizerWithEditing window so the user can pick ground-level
+    vertices with  Shift + Left-Click.
+
+    Close the window (press Q or the X button) when done picking.
+    Returns a list of picked point indices.
+    """
+    print("\n" + "=" * 62)
+    print("  GROUND-LEVEL POINT PICKING")
+    print("=" * 62)
+    print("  Shift + Left-Click  to select points on the ground surface.")
+    print("  Pick one or more points that represent the ground level.")
+    print("  Press Q or close the window when finished.")
+    print("=" * 62 + "\n")
+
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window(window_name="Pick ground-level points  (Shift+Click, then Q to finish)",
+                      width=1280, height=720)
+    vis.add_geometry(pcd)
+    vis.run()   # blocks until user closes window
+    vis.destroy_window()
+
+    picked = vis.get_picked_points()
+    return picked
+
+
+picked_indices = pick_points(pcd) 
+
+if len(picked_indices) == 0:
+    print("[WARNING] No points picked!  Falling back to P95 of point cloud Z.")
+    GROUND_Z = float(np.percentile(pts[:, 2], 95))
+    _ground_normal = np.array([0.0, 0.0, 1.0])
+else:
+    picked_pts = pts[picked_indices]
+    GROUND_Z   = float(np.mean(picked_pts[:, 2]))
+    print(f"\n  Picked {len(picked_indices)} ground-level point(s):")
+    for i, idx in enumerate(picked_indices):
+        p = pts[idx]
+        print(f"    [{i+1}]  index {idx:>8,}  ->  "
+              f"X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
+    if len(picked_pts) >= 3:
+        _v1 = picked_pts[1] - picked_pts[0]
+        _v2 = picked_pts[2] - picked_pts[0]
+        _ground_normal = np.cross(_v1, _v2)
+        _gn_len = np.linalg.norm(_ground_normal)
+        if _gn_len > 1e-9:
+            _ground_normal /= _gn_len
+            if _ground_normal[2] < 0:
+                _ground_normal = -_ground_normal
+        else:
+            _ground_normal = np.array([0.0, 0.0, 1.0])
+    else:
+        _ground_normal = np.array([0.0, 0.0, 1.0])
+
+_ground_center = np.array([_crop_cx_local, _crop_cy_local, GROUND_Z])
+
+print(f"\n  Ground level (local) = {GROUND_Z:.3f} m")
+print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
+print(f"  Ground normal        = [{_ground_normal[0]:.4f}, {_ground_normal[1]:.4f}, {_ground_normal[2]:.4f}]")
+
+# Ground plane equation: n . (P - _ground_center) = 0
+# Solve for Z at any local (x, y):
+#   n[0]*(x - cx) + n[1]*(y - cy) + n[2]*(z - cz) = 0
+#   z = cz - (n[0]*(x - cx) + n[1]*(y - cy)) / n[2]
+def _ground_z_at(x_local, y_local):
+    if abs(_ground_normal[2]) < 1e-9:
+        return GROUND_Z
+    return float(
+        _ground_center[2]
+        - (_ground_normal[0] * (x_local - _ground_center[0])
+           + _ground_normal[1] * (y_local - _ground_center[1]))
+        / _ground_normal[2]
+    )
+
+# Depth estimation counters
+_depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4.  Geometry helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def segment_to_cylinder(p1, p2, radius, color, resolution=12): # define a function to convert a segment to a cylinder
+    vec    = p2 - p1 # calculate the vector between the two points
+    length = np.linalg.norm(vec)
+    if length < 1e-6: # if the length is less than 1e-6, return None
+        return None
+
+    cyl = o3d.geometry.TriangleMesh.create_cylinder( 
+        radius=radius, height=length, resolution=resolution, split=1) # create a cylinder   
+    z_axis    = np.array([0.0, 0.0, 1.0]) # define the z-axis
+    direction = vec / length # calculate the direction of the vector
+    cross     = np.cross(z_axis, direction) # calculate the cross product of the z-axis and the direction
+    cross_norm = np.linalg.norm(cross) # calculate the norm of the cross product
+    dot        = np.dot(z_axis, direction) # calculate the dot product of the z-axis and the direction
+
+    if cross_norm > 1e-6:
+        axis  = cross / cross_norm # calculate the axis of the cylinder
+        angle = np.arctan2(cross_norm, dot) # calculate the angle of the cylinder
+        R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle) # calculate the rotation matrix
+        cyl.rotate(R, center=[0.0, 0.0, 0.0]) # rotate the cylinder
+    elif dot < 0:
+        R = o3d.geometry.get_rotation_matrix_from_axis_angle(
+            np.array([1.0, 0.0, 0.0]) * np.pi # define the rotation matrix for a 180 degree rotation around the x-axis
+        )
+        cyl.rotate(R, center=[0.0, 0.0, 0.0]) # rotate the cylinder
+
+    cyl.translate((p1 + p2) / 2.0) # translate the cylinder to the midpoint of the segment
+    cyl.paint_uniform_color(color) # paint the cylinder with the color
+    return cyl # return the cylinder
+
+
+def _batch_point_to_segment_dists(p, p1s, p2s): # define a function to calculate the minimum distance from a point to a segment
+    """ 
+    Vectorised minimum distances from point p to each segment p1s[i]->p2s[i].
+    p   : (3,)
+    p1s : (N, 3)
+    p2s : (N, 3)
+    Returns dists : (N,) # return the distances
+    """
+    d     = p2s - p1s                        # (N, 3) # calculate the vector between the two points
+    denom = np.einsum('ij,ij->i', d, d)      # (N,)  squared lengths # calculate the squared lengths of the vector
+    v     = p - p1s                          # (N, 3) # calculate the vector from the point to the segment
+    t     = np.einsum('ij,ij->i', v, d)     # (N,)  dot products # calculate the dot products of the vector and the segment
+    # avoid divide-by-zero for degenerate segments
+    safe  = denom > 1e-12 # avoid divide-by-zero for degenerate segments
+    t_clamped        = np.where(safe, np.clip(t / np.where(safe, denom, 1.0), 0.0, 1.0), 0.0) # calculate the clamped values
+    closest = p1s + t_clamped[:, None] * d       # (N, 3) nearest points on segments
+    diff    = p - closest                         # (N, 3)
+    dists   = np.sqrt(np.einsum('ij,ij->i', diff, diff))  # (N,)
+    return dists
+
+
+def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm): # define a function to clean the coordinates with depth
+    """
+    Translate UTM -> local.  For vertices with Z = -99 (no reliable
+    measurement), estimate depth using:
+        Z = ground_level(XY) - vejledendeDybde / 1000
+    If vejledendeDybde is not available, fall back to mean of valid Z
+    on the same feature, or the global ground level.
+    """
+    coords = coords_raw.copy().astype(float) # convert the coordinates to float if the shape of the coordinates is 2, add a zero column to the coordinates
+    if coords.shape[1] == 2:
+        coords = np.hstack([coords, np.zeros((len(coords), 1))]) # add a zero column to the coordinates
+
+    # Translate XY to local first (Z stays in absolute UTM for now)
+    coords[:, 0] -= TX # subtract the translation from the x-coordinates
+    coords[:, 1] -= TY # subtract the translation from the y-coordinates
+
+    bad = coords[:, 2] == -99 # check if the z-coordinates are -99
+    if bad.any():
+        # Parse indicative depth (mm -> m)
+        ind_depth_m = None # initialize the indicative depth
+        if vejledende_dybde_mm is not None:
+            try:
+                d = float(vejledende_dybde_mm) # convert the indicative depth to float
+                if d > 0:
+                    ind_depth_m = d / 1000.0 # convert the indicative depth to meters
+            except (ValueError, TypeError):
+                pass
+
+        # Mean of valid Z on this feature (absolute UTM Z)
+        good_z = coords[~bad, 2] # get the valid z-coordinates
+        feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
+
+        for idx in np.where(bad)[0]:
+            local_x = coords[idx, 0]
+            local_y = coords[idx, 1]
+            ground_z_here = _ground_z_at(local_x, local_y)
+            if ind_depth_m is not None:
+                coords[idx, 2] = (ground_z_here + TZ) - ind_depth_m
+                _depth_stats["estimated"] += 1
+            elif feature_mean_z is not None:
+                coords[idx, 2] = feature_mean_z
+                _depth_stats["fallback_feature_mean"] += 1
+            else:
+                coords[idx, 2] = ground_z_here + TZ
+                _depth_stats["fallback_global"] += 1
+
+    # Now translate Z to local
+    coords[:, 2] -= TZ
+    return coords
+
+
+def _segments_in_bbox(coords_utm):
+    """Conservative check: any part of the polyline within the circular crop (UTM)."""
+    dx = coords_utm[:, 0] - _crop_cx_utm
+    dy = coords_utm[:, 1] - _crop_cy_utm
+    d2 = dx * dx + dy * dy
+    if (d2 <= _crop_r2).any():
+        return True
+    # Fallback AABB overlap — catches segments that cross the disc but
+    # have no vertex inside it; the segment clipper makes the final call.
+    xs, ys = coords_utm[:, 0], coords_utm[:, 1]
+    if xs.max() < _crop_cx_utm - CROP_RADIUS: return False
+    if xs.min() > _crop_cx_utm + CROP_RADIUS: return False
+    if ys.max() < _crop_cy_utm - CROP_RADIUS: return False
+    if ys.min() > _crop_cy_utm + CROP_RADIUS: return False
+    return True
+
+
+def _point_in_bbox(x, y):
+    dx = x - _crop_cx_utm
+    dy = y - _crop_cy_utm
+    return (dx * dx + dy * dy) <= _crop_r2
+
+
+def _pt_in_local_bbox(x, y):
+    dx = x - _crop_cx_local
+    dy = y - _crop_cy_local
+    return (dx * dx + dy * dy) <= _crop_r2
+
+
+def _clip_segment_to_bbox(p1, p2):
+    """
+    Clip a 3D line segment (p1 -> p2) to the local circular crop in XY.
+    Circle: center = (_crop_cx_local, _crop_cy_local), radius = CROP_RADIUS.
+    Returns (clipped_p1, clipped_p2) or None if entirely outside.
+
+    Z is linearly interpolated along the segment parameter, matching how
+    the previous Liang-Barsky rectangular clipper handled it.
+    """
+    x1 = p1[0] - _crop_cx_local
+    y1 = p1[1] - _crop_cy_local
+    x2 = p2[0] - _crop_cx_local
+    y2 = p2[1] - _crop_cy_local
+
+    dx = x2 - x1
+    dy = y2 - y1
+    a  = dx * dx + dy * dy
+
+    if a < 1e-12:
+        # Degenerate — segment is a single point
+        if x1 * x1 + y1 * y1 <= _crop_r2:
+            return p1, p2
+        return None
+
+    b = 2.0 * (x1 * dx + y1 * dy)
+    c = x1 * x1 + y1 * y1 - _crop_r2
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return None
+
+    sq      = np.sqrt(disc)
+    t_enter = (-b - sq) / (2.0 * a)
+    t_exit  = (-b + sq) / (2.0 * a)
+
+    t0 = max(0.0, t_enter)
+    t1 = min(1.0, t_exit)
+    if t0 > t1:
+        return None
+
+    c1 = p1 + t0 * (p2 - p1)
+    c2 = p1 + t1 * (p2 - p1)
+    return c1, c2
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5.  Load utility lines (pipes / cables) within bbox
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n--- Loading utility lines within bbox ---")
+all_pipe_meshes   = []          # flat list — kept for wireframe merge only
+_pipe_layer_cyls  = {}          # layer_name -> [TriangleMesh, ...]  per-layer
+_pipe_layer_seg_pts = {}        # layer_name -> ([p1, ...], [p2, ...]) for XRay centerlines
+layer_stats = {}
+all_pipe_coords = []
+
+# Picking data — segment endpoints, midpoints, and their GML attributes
+pick_seg_p1        = []   # list of np.array([x,y,z])  — segment start
+pick_seg_p2        = []   # list of np.array([x,y,z])  — segment end
+pick_seg_midpoints = []   # list of np.array([x,y,z])  — for highlight placement
+pick_seg_attrs     = []   # list of [(label, value), ...]
+pick_seg_layer     = []   # layer name per segment
+
+# Store per-utility-type average depth for component fallback
+_layer_avg_depth_local = {}
+
+for layer_name, cfg in LINE_LAYERS.items():
+    try:
+        gdf = gpd.read_file(GML_PATH, layer=layer_name)
+    except Exception as e:
+        print(f"  {layer_name}: skip ({e})")
+        continue
+
+    default_color   = cfg["color"]
+    fallback_radius = cfg["fallback_radius"]
+    n_features = 0
+    n_segments = 0
+    _layer_z_vals = []
+
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+
+        # Handle MultiLineString (e.g. Ledningstrace) by extracting sub-lines
+        if geom.geom_type == "MultiLineString":
+            sub_geoms = list(geom.geoms)
+        else:
+            sub_geoms = [geom]
+
+        # Determine radius and colour (same for all sub-geometries of one feature)
+        diam_mm = 0.0
+        if "udvendigDiameter" in row.index:
+            try:
+                diam_mm = float(row["udvendigDiameter"] or 0)
+            except (ValueError, TypeError):
+                diam_mm = 0.0
+
+        radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
+
+        if layer_name == "Vandledning" and diam_mm > 0:
+            color = DIAMETER_COLORS.get(int(diam_mm), default_color)
+        else:
+            color = default_color
+
+        # Get indicative depth for this feature
+        vejl_dybde = None
+        if "vejledendeDybde" in row.index:
+            vejl_dybde = row.get("vejledendeDybde", None)
+
+        # Extract all GML attributes for picking display
+        row_attrs = []
+        for col in row.index:
+            if col == "geometry":
+                continue
+            val     = row[col]
+            val_str = str(val) if (val is not None and str(val) != "nan") else "—"
+            row_attrs.append((col, val_str))
+
+        feature_hit = False
+        for sub_geom in sub_geoms:
+            coords_raw = np.array(sub_geom.coords, dtype=float)
+            if not _segments_in_bbox(coords_raw):
+                continue
+
+            coords = _clean_coords_with_depth(coords_raw, vejl_dybde)
+            all_pipe_coords.append(coords)
+            _layer_z_vals.extend(coords[:, 2].tolist())
+            feature_hit = True
+
+            for i in range(len(coords) - 1):
+                clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
+                if clipped is None:
+                    continue
+                cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
+                if cyl is not None:
+                    all_pipe_meshes.append(cyl)
+                    _pipe_layer_cyls.setdefault(layer_name, []).append(cyl)
+                    if layer_name not in _pipe_layer_seg_pts:
+                        _pipe_layer_seg_pts[layer_name] = ([], [])
+                    _pipe_layer_seg_pts[layer_name][0].append(clipped[0].copy())
+                    _pipe_layer_seg_pts[layer_name][1].append(clipped[1].copy())
+                    midpt = (clipped[0] + clipped[1]) / 2.0
+                    pick_seg_p1.append(clipped[0].copy())
+                    pick_seg_p2.append(clipped[1].copy())
+                    pick_seg_midpoints.append(midpt)
+                    pick_seg_attrs.append(row_attrs)
+                    pick_seg_layer.append(layer_name)
+                    n_segments += 1
+
+        if feature_hit:
+            n_features += 1
+
+    layer_stats[layer_name] = (n_features, n_segments)
+    if _layer_z_vals:
+        _layer_avg_depth_local[layer_name] = float(np.mean(_layer_z_vals))
+    if n_features > 0:
+        print(f"  {layer_name:<35} {n_features:>4} features  {n_segments:>5} segments")
+
+pick_seg_p1        = np.array(pick_seg_p1)        if pick_seg_p1        else np.empty((0, 3))
+pick_seg_p2        = np.array(pick_seg_p2)        if pick_seg_p2        else np.empty((0, 3))
+pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.empty((0, 3))
+
+print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments")
+print(f"\n  Depth estimation stats:")
+print(f"    Estimated from vejledendeDybde + ground model: {_depth_stats['estimated']}")
+print(f"    Fallback to feature mean Z:                    {_depth_stats['fallback_feature_mean']}")
+print(f"    Fallback to global ground level:               {_depth_stats['fallback_global']}")
+
+# Per-layer merged pipe meshes (used for individual visibility toggles)
+_pipe_layer_meshes = {}
+for _ln, _cyls in _pipe_layer_cyls.items():
+    _m = _cyls[0]
+    for _c in _cyls[1:]:
+        _m += _c
+    _m.compute_vertex_normals()
+    _pipe_layer_meshes[_ln] = _m
+
+# Per-layer XRay centerline LineSets — one line per clipped segment, rendered
+# with depth_func="always" so thin pipes are visible through thick ones.
+_pipe_layer_centerlines = {}
+for _ln, (p1s, p2s) in _pipe_layer_seg_pts.items():
+    _cl_pts   = []
+    _cl_lines = []
+    for _ci, (_cp1, _cp2) in enumerate(zip(p1s, p2s)):
+        _cl_pts.extend([_cp1, _cp2])
+        _cl_lines.append([2 * _ci, 2 * _ci + 1])
+    _cl_ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.array(_cl_pts)),
+        lines=o3d.utility.Vector2iVector(_cl_lines),
+    )
+    _cl_ls.paint_uniform_color(LINE_LAYERS[_ln]["color"])
+    _pipe_layer_centerlines[_ln] = _cl_ls
+
+# Combined wireframe (all layers) for the wireframe overlay toggle.
+# Build from per-layer meshes using the non-mutating `+` operator so that
+# _pipe_layer_meshes entries are not corrupted (using `+=` on all_pipe_meshes[0]
+# would mutate the first layer's merged mesh to contain all layers).
+combined_pipe_wire = None
+if _pipe_layer_meshes:
+    _wf_meshes = list(_pipe_layer_meshes.values())
+    _wire_src = _wf_meshes[0]
+    for _m in _wf_meshes[1:]:
+        _wire_src = _wire_src + _m  # non-mutating: creates a new merged mesh each time
+    combined_pipe_wire = o3d.geometry.LineSet.create_from_triangle_mesh(_wire_src)
+    combined_pipe_wire.paint_uniform_color([1.0, 1.0, 1.0])
+
+# Pipe centroid
+pipe_centroid = np.array([0.0, 0.0, 0.0])
+if all_pipe_coords:
+    pipe_centroid = np.vstack(all_pipe_coords).mean(axis=0)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6.  Load utility components (points) within bbox
+# ─────────────────────────────────────────────────────────────────────────────
+# Map component layer -> corresponding line layer for depth estimation
+_COMP_TO_LINE = {
+    "Vandkomponent":               "Vandledning",
+    "Afloebskomponent":            "Afloebsledning",
+    "Gaskomponent":                "Gasledning",
+    "Elkomponent":                 "Elledning",
+    "Telekommunikationskomponent": "Telekommunikationsledning",
+}
+
+print("\n--- Loading utility components within bbox ---")
+all_comp_meshes    = []     # flat list (kept for count reporting)
+_comp_layer_spheres = {}    # layer_name -> [TriangleMesh, ...]  per-layer
+comp_stats = {}
+_comp_depth_stats = {"from_pipe_avg": 0, "from_ground": 0}
+
+# Picking data for components
+pick_comp_centres = []
+pick_comp_attrs   = []
+pick_comp_layer   = []
+
+for layer_name, cfg in COMPONENT_LAYERS.items():
+    try:
+        gdf_c = gpd.read_file(GML_PATH, layer=layer_name)
+    except Exception:
+        continue
+
+    color = cfg["color"]
+    n_comp = 0
+
+    # Get the average depth of the corresponding line layer for fallback
+    parent_line = _COMP_TO_LINE.get(layer_name)
+    parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
+
+    for _, row in gdf_c.iterrows():
+        g = row.geometry
+        if not _point_in_bbox(g.x, g.y):
+            continue
+
+        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+
+        # Crop to local buffered bbox
+        if not _pt_in_local_bbox(pt[0], pt[1]):
+            continue
+
+        if g.z == -99 or pt[2] <= -98:
+            # Component has no reliable Z — estimate from parent pipe depth
+            # or from ground model
+            if parent_avg_z is not None:
+                # Use average depth of the corresponding utility type
+                pt[2] = parent_avg_z
+                _comp_depth_stats["from_pipe_avg"] += 1
+            else:
+                pt[2] = _ground_z_at(pt[0], pt[1])
+                _comp_depth_stats["from_ground"] += 1
+
+        sphere = o3d.geometry.TriangleMesh.create_sphere(
+            radius=COMPONENT_SPHERE_RADIUS, resolution=12
+        )
+        sphere.translate(pt)
+        sphere.paint_uniform_color(color)
+        all_comp_meshes.append(sphere)
+        _comp_layer_spheres.setdefault(layer_name, []).append(sphere)
+
+        # Store picking data
+        pick_comp_centres.append(pt.copy())
+        comp_row_attrs = []
+        for col in row.index:
+            if col == "geometry":
+                continue
+            val     = row[col]
+            val_str = str(val) if (val is not None and str(val) != "nan") else "—"
+            comp_row_attrs.append((col, val_str))
+        pick_comp_attrs.append(comp_row_attrs)
+        pick_comp_layer.append(layer_name)
+
+        n_comp += 1
+
+    comp_stats[layer_name] = n_comp
+    if n_comp > 0:
+        print(f"  {layer_name:<35} {n_comp:>4} components")
+
+pick_comp_centres = np.array(pick_comp_centres) if pick_comp_centres else np.empty((0, 3))
+
+print(f"\n  Total: {len(all_comp_meshes)} component spheres")
+print(f"  Component depth estimation:")
+print(f"    From parent pipe average Z: {_comp_depth_stats['from_pipe_avg']}")
+print(f"    From ground model:          {_comp_depth_stats['from_ground']}")
+
+# Per-layer merged component meshes
+_comp_layer_meshes = {}
+for _ln, _spheres in _comp_layer_spheres.items():
+    _m = _spheres[0]
+    for _s in _spheres[1:]:
+        _m += _s
+    _m.compute_vertex_normals()
+    _comp_layer_meshes[_ln] = _m
+
+_t_load = time.perf_counter()
+print(f"\nData loaded in {_t_load - _t0:.2f}s")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Coordinate frame + circular crop wireframe + point cloud normals
+# ─────────────────────────────────────────────────────────────────────────────
+frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+    size=0.5, origin=cloud_centroid
+)
+
+# Estimate normals on the cropped point cloud so we can shade it with the
+# `defaultLit` shader.  
+try:
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=30)
+    )
+    pcd.orient_normals_towards_camera_location(
+        cloud_centroid + np.array([0.0, 0.0, 5.0])
+    )
+except Exception as _e:
+    print(f"  [warn] point cloud normal estimation failed: {_e}")
+
+# Circle wireframe showing the crop boundary on the ground plane
+_N_CIRCLE = 72
+_theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
+# Build two tangent vectors in the ground plane
+_n = _ground_normal
+if abs(_n[0]) < 0.9:
+    _t1 = np.cross(_n, np.array([1.0, 0.0, 0.0]))
+else:
+    _t1 = np.cross(_n, np.array([0.0, 1.0, 0.0]))
+_t1 /= np.linalg.norm(_t1)
+_t2 = np.cross(_n, _t1)
+bbox_wire_pts = np.array([
+    _ground_center + CROP_RADIUS * (np.cos(t) * _t1 + np.sin(t) * _t2)
+    for t in _theta
+])
+bbox_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
+bbox_ls = o3d.geometry.LineSet(
+    points=o3d.utility.Vector3dVector(bbox_wire_pts),
+    lines=o3d.utility.Vector2iVector(bbox_lines),
+)
+bbox_ls.paint_uniform_color([1.0, 1.0, 0.0])
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8.  Material helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
+    # Lit + transparent so the opacity slider still works AND the pipes
+    # get shaded by normals (gives depth cues that flat-colour rendering lacks).
+    mat            = rendering.MaterialRecord()
+    mat.shader     = "defaultLitTransparency"
+    mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
+    return mat
+
+
+def make_dotted_bbox_lineset(
+    obb: o3d.geometry.OrientedBoundingBox,
+    dash_len: float = 0.08,
+    gap_len: float = 0.05,
+) -> o3d.geometry.LineSet:
+    """Create a dotted-style bbox by splitting each edge into short segments."""
+    solid_ls = o3d.geometry.LineSet.create_from_oriented_bounding_box(obb)
+    pts = np.asarray(solid_ls.points)
+    lines = np.asarray(solid_ls.lines)
+
+    out_pts = []
+    out_lines = []
+
+    for i0, i1 in lines:
+        p0 = pts[int(i0)]
+        p1 = pts[int(i1)]
+        edge_vec = p1 - p0
+        edge_len = float(np.linalg.norm(edge_vec))
+        if edge_len <= 1e-9:
+            continue
+
+        t = 0.0
+        while t < edge_len:
+            t_dash_end = min(t + dash_len, edge_len)
+            a = p0 + edge_vec * (t / edge_len)
+            b = p0 + edge_vec * (t_dash_end / edge_len)
+            base = len(out_pts)
+            out_pts.extend([a, b])
+            out_lines.append([base, base + 1])
+            t += dash_len + gap_len
+
+    dotted_ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.asarray(out_pts)),
+        lines=o3d.utility.Vector2iVector(np.asarray(out_lines, dtype=np.int32)),
+    )
+    return dotted_ls
+
+
+def make_point_material() -> rendering.MaterialRecord:
+    # `defaultLit` + estimated normals + SSAO post-processing is the closest
+    # Open3D equivalent to an EDL shader. Points near geometric ridges end
+    # up darker, giving a strong depth cue for the class-coloured cloud.
+    mat            = rendering.MaterialRecord()
+    mat.shader     = "defaultLit"
+    mat.point_size = 3.0
+    return mat
+
+
+def make_pipe_wire_material() -> rendering.MaterialRecord:
+    mat            = rendering.MaterialRecord()
+    mat.shader     = "unlitLine"
+    mat.line_width = 1.5
+    return mat
+
+
+def make_centerline_material() -> rendering.MaterialRecord:
+    mat            = rendering.MaterialRecord()
+    mat.shader     = "unlitLine"
+    mat.line_width = 2.5
+    try:
+        # Render centerlines through all occluding geometry so thin pipes
+        # remain visible even when embedded inside thick pipe cylinders.
+        mat.depth_func = "always"
+    except AttributeError:
+        pass  # older Open3D — centerlines depth-test normally
+    return mat
+
+
+def make_frame_material() -> rendering.MaterialRecord:
+    mat        = rendering.MaterialRecord()
+    mat.shader = "defaultUnlit"
+    return mat
+
+
+def linear_to_srgb(c: float) -> float:
+    if c <= 0.0031308:
+        return 12.92 * c
+    return 1.055 * (c ** (1.0 / 2.4)) - 0.055
+
+
+def _add_mesh(scene, name, mesh, mat):
+    """Add a TriangleMesh to the scene, ensuring vertex normals exist first."""
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+    scene.add_geometry(name, mesh, mat)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9.  Build GUI
+# ─────────────────────────────────────────────────────────────────────────────
+POINT_CLOUD_GEOM = "point_cloud"
+PIPE_WIRE_GEOM   = "pipes_wire"
+FRAME_GEOM       = "frame"
+BBOX_GEOM        = "bbox_wire"
+HIGHLIGHT_GEOM   = "highlight"
+
+def _inst_bbox_gn(idx): return f"inst_bbox_{idx}"
+def _inst_pts_gn(idx):  return f"inst_pts_{idx}"
+
+_instance_visible = {i: True for i in range(len(instance_data))}
+
+# Per-layer geometry names
+def _pipe_gn(ln):       return f"pipe_{ln}"
+def _comp_gn(ln):       return f"comp_{ln}"
+def _centerline_gn(ln): return f"centerline_{ln}"
+
+# Per-layer visibility state (True = shown)
+_layer_visible = {ln: True for ln in LINE_LAYERS}
+_layer_visible.update({ln: False for ln in COMPONENT_LAYERS})  # start with all components hidden
+if "Ledningstrace" in _layer_visible:
+    _layer_visible["Ledningstrace"] = False  # start with Ledningstrace hidden
+
+pipe_opacity = [1.0]
+origin_pt    = np.array([0.0, 0.0, 0.0])
+pick_active  = [False]
+origin_frame_visible  = [False] # toggled by the "Show origin axis" checkbox
+pipe_wireframe_active = [False] # toggled by the "Wireframe pipes" checkbox
+centerline_xray_active = [False] # toggled by the "XRay centerlines" checkbox
+ler_utilities_visible = [True]   # toggled by the "Show LER utilities" checkbox
+
+app = gui.Application.instance
+app.initialize()
+
+window = app.create_window(
+    f"{_ply_path.stem}  |  Utilities + depth + class labels  |  press H for help",
+    1460, 840,
+)
+em = window.theme.font_size
+
+scene_widget = gui.SceneWidget()
+scene_widget.scene = rendering.Open3DScene(window.renderer)
+scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
+
+# Enable post-processing (SSAO + tone-mapping)
+try:
+    scene_widget.scene.view.set_post_processing(True)
+except Exception as _e:
+    print(f"  [warn] could not enable post-processing: {_e}")
+
+# Add point cloud
+scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
+
+# Add per-layer pipe meshes (filled); wireframe is a separate combined overlay
+for _ln, _mesh in _pipe_layer_meshes.items():
+    _alpha0 = 1.0 if _layer_visible.get(_ln, True) else 0.0
+    _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh, make_mesh_material(_alpha0))
+
+# Add combined wireframe overlay (hidden by default)
+if combined_pipe_wire is not None:
+    scene_widget.scene.add_geometry(
+        PIPE_WIRE_GEOM, combined_pipe_wire, make_pipe_wire_material()
+    )
+    scene_widget.scene.show_geometry(PIPE_WIRE_GEOM, False)
+
+# Add per-layer XRay centerlines (hidden by default)
+for _ln, _cls in _pipe_layer_centerlines.items():
+    scene_widget.scene.add_geometry(_centerline_gn(_ln), _cls, make_centerline_material())
+    scene_widget.scene.show_geometry(_centerline_gn(_ln), False)
+
+# Add per-layer component meshes
+for _ln, _mesh in _comp_layer_meshes.items():
+    _alpha0 = 1.0 if _layer_visible.get(_ln, True) else 0.0
+    _add_mesh(scene_widget.scene, _comp_gn(_ln), _mesh, make_mesh_material(_alpha0))
+
+# Add frame and bbox wireframe
+scene_widget.scene.add_geometry(FRAME_GEOM, frame, make_frame_material())
+scene_widget.scene.show_geometry(FRAME_GEOM, origin_frame_visible[0])
+
+line_mat            = rendering.MaterialRecord()
+line_mat.shader     = "unlitLine"
+line_mat.line_width = 3.0
+scene_widget.scene.add_geometry(BBOX_GEOM, bbox_ls, line_mat)
+
+# Add instance bounding boxes and point clouds (only first visible initially)
+for _idx, _inst in enumerate(instance_data):
+    _bb_mat            = rendering.MaterialRecord()
+    _bb_mat.shader     = "unlitLine"
+    _bb_mat.line_width = 4.0
+    _bb_ls = make_dotted_bbox_lineset(_inst["obb"])
+    _bb_ls.paint_uniform_color([1.0, 1.0, 1.0])  # force per-instance bbox to white
+    scene_widget.scene.add_geometry(_inst_bbox_gn(_idx), _bb_ls, _bb_mat)
+
+    _inst_pt_mat              = rendering.MaterialRecord()
+    _inst_pt_mat.shader       = "defaultUnlit"
+    _inst_pt_mat.point_size   = 3.0
+    scene_widget.scene.add_geometry(_inst_pts_gn(_idx), _inst["pcd"], _inst_pt_mat)
+
+    _show = (_idx == 0)
+    scene_widget.scene.show_geometry(_inst_bbox_gn(_idx), _show)
+    scene_widget.scene.show_geometry(_inst_pts_gn(_idx), _show)
+
+bounds = scene_widget.scene.bounding_box
+_init_d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
+_init_eye = cloud_centroid + np.array([0.0, 0.0, _init_d])
+scene_widget.look_at(cloud_centroid.tolist(), _init_eye.tolist(), [0.0, 1.0, 0.0])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10.  Right-side control panel
+# ─────────────────────────────────────────────────────────────────────────────
+PANEL_WIDTH = int(20 * em)
+panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+
+# Title
+panel.add_child(gui.Label(f"Points: {len(pts):,}"))
+panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
+panel.add_fixed(int(0.5 * em))
+
+origin_toggle_cb = gui.Checkbox("Show origin axis")
+origin_toggle_cb.checked = False
+
+
+def _on_origin_toggle(checked):
+    origin_frame_visible[0] = checked
+    scene_widget.scene.show_geometry(FRAME_GEOM, checked)
+    window.post_redraw()
+
+
+origin_toggle_cb.set_on_checked(_on_origin_toggle)
+panel.add_child(origin_toggle_cb)
+panel.add_fixed(int(0.5 * em))
+
+# ── Utility Legend (Ledningspakke_3383910) ───────────────────────────────────
+ler_toggle_cb = gui.Checkbox("Ledningspakke_3383910")
+ler_toggle_cb.checked = True
+
+
+def _on_ler_toggle(checked):
+    ler_utilities_visible[0] = checked
+    for ln in _pipe_layer_meshes:
+        if not _layer_visible.get(ln, True):
+            continue
+        alpha = pipe_opacity[0] if checked else 0.0
+        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+    for ln in _comp_layer_meshes:
+        if not _layer_visible.get(ln, True):
+            continue
+        alpha = pipe_opacity[0] if checked else 0.0
+        scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
+    window.post_redraw()
+
+
+ler_toggle_cb.set_on_checked(_on_ler_toggle)
+panel.add_child(ler_toggle_cb)
+panel.add_fixed(int(0.3 * em))
+
+
+def _make_pipe_toggle(ln):
+    def _cb(checked):
+        _layer_visible[ln] = checked
+        _ler = ler_utilities_visible[0]
+        if ln in _pipe_layer_meshes:
+            alpha = pipe_opacity[0] if (_ler and checked and not pipe_wireframe_active[0]) else 0.0
+            scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+        if ln in _pipe_layer_centerlines:
+            scene_widget.scene.show_geometry(
+                _centerline_gn(ln), _ler and checked and centerline_xray_active[0]
+            )
+        window.post_redraw()
+    return _cb
+
+
+def _make_comp_toggle(ln):
+    def _cb(checked):
+        _layer_visible[ln] = checked
+        _ler = ler_utilities_visible[0]
+        if ln in _comp_layer_meshes:
+            alpha = pipe_opacity[0] if (_ler and checked) else 0.0
+            scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
+        window.post_redraw()
+    return _cb
+
+
+# Line layers — only show legend entry if the layer produced actual geometry
+for layer_name, cfg in LINE_LAYERS.items():
+    if layer_name not in _pipe_layer_meshes:
+        continue
+    n_feat, _ = layer_stats.get(layer_name, (0, 0))
+    col = cfg["color"]
+    sr, sg, sb = (linear_to_srgb(c) for c in col)
+    row    = gui.Horiz(int(0.3 * em))
+    swatch = gui.Button("   ")
+    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
+    swatch.toggleable = False
+
+    cb = gui.Checkbox(f"{layer_name} ({n_feat})")
+    cb.checked = _layer_visible.get(layer_name, True)
+    cb.set_on_checked(_make_pipe_toggle(layer_name))
+
+    row.add_child(swatch)
+    row.add_fixed(int(0.4 * em))
+    row.add_child(cb)
+    panel.add_child(row)
+    panel.add_fixed(int(0.15 * em))
+
+# Component layers — only show legend entry if the layer produced actual geometry
+for layer_name, cfg in COMPONENT_LAYERS.items():
+    if layer_name not in _comp_layer_meshes:
+        continue
+    n_comp = comp_stats.get(layer_name, 0)
+    col = cfg["color"]
+    sr, sg, sb = (linear_to_srgb(c) for c in col)
+
+    row    = gui.Horiz(int(0.3 * em))
+    swatch = gui.Button("   ")
+    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
+    swatch.toggleable = False
+
+    cb = gui.Checkbox(f"{layer_name} ({n_comp})")
+    cb.checked = _layer_visible.get(layer_name, False)
+    cb.set_on_checked(_make_comp_toggle(layer_name))
+
+    row.add_child(swatch)
+    row.add_fixed(int(0.4 * em))
+    row.add_child(cb)
+    panel.add_child(row)
+    panel.add_fixed(int(0.15 * em))
+
+# ── Utility Opacity ──────────────────────────────────────────────────────────
+panel.add_fixed(int(0.8 * em))
+
+opacity_value_label = gui.Label("1.00")
+lbl_row = gui.Horiz(int(0.25 * em))
+lbl_row.add_child(gui.Label("Utility Opacity"))
+lbl_row.add_stretch()
+lbl_row.add_child(opacity_value_label)
+panel.add_child(lbl_row)
+
+opacity_slider = gui.Slider(gui.Slider.DOUBLE)
+opacity_slider.set_limits(0.0, 1.0)
+opacity_slider.double_value = 1.0
+
+
+def _apply_opacity(val: float):
+    val = max(0.0, min(1.0, val))
+    pipe_opacity[0] = val
+    opacity_slider.double_value = val
+    opacity_value_label.text    = f"{val:.2f}"
+    _ler = ler_utilities_visible[0]
+
+    for ln in _pipe_layer_meshes:
+        alpha = val if (_ler and _layer_visible.get(ln, True) and not pipe_wireframe_active[0]) else 0.0
+        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+
+    for ln in _comp_layer_meshes:
+        alpha = val if (_ler and _layer_visible.get(ln, True)) else 0.0
+        scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
+
+    window.post_redraw()
+
+
+opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
+panel.add_child(opacity_slider)
+panel.add_fixed(int(0.4 * em))
+
+panel.add_child(gui.Label("Quick set"))
+btn_row = gui.Horiz(int(0.2 * em))
+for pct in (0, 25, 50, 75, 100):
+    btn = gui.Button(f"{pct}%")
+    def _make_cb(a):
+        def _cb(): _apply_opacity(a)
+        return _cb
+    btn.set_on_clicked(_make_cb(pct / 100.0))
+    btn_row.add_child(btn)
+panel.add_child(btn_row)
+
+panel.add_stretch()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10b.  Left-side Instance Labeling panel
+# ─────────────────────────────────────────────────────────────────────────────
+LEFT_PANEL_WIDTH = int(18 * em)
+left_panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+
+if instance_data:
+    _inst_progress_lbl = gui.Label(
+        f"Instance 1 / {len(instance_data)}:  {instance_data[0]['name']}"
+    )
+    _inst_progress_lbl.text_color = gui.Color(1.0, 1.0, 0.3, 1.0)
+    left_panel.add_child(_inst_progress_lbl)
+    left_panel.add_fixed(int(0.1 * em))
+
+    _inst_pts_lbl = gui.Label(f"  {instance_data[0]['n_pts']:,} points")
+    _inst_pts_lbl.text_color = gui.Color(0.7, 0.7, 0.7, 1.0)
+    left_panel.add_child(_inst_pts_lbl)
+    left_panel.add_fixed(int(0.1 * em))
+
+    _inst_assigned_lbl = gui.Label("")
+    _inst_assigned_lbl.text_color = gui.Color(0.3, 1.0, 0.3, 1.0)
+    _inst_assigned_lbl.visible = False
+    left_panel.add_child(_inst_assigned_lbl)
+    left_panel.add_fixed(int(0.4 * em))
+
+    left_panel.add_child(gui.Label("Assign label (or press 1-0):"))
+    left_panel.add_fixed(int(0.2 * em))
+
+_labeled_output_dir = Path(INSTANCE_DIR) / "labeled" if instance_data else None
+if _labeled_output_dir and not _labeled_output_dir.exists():
+    _labeled_output_dir.mkdir(parents=True)
+
+
+_LABEL_TO_ID = {name: i + 1 for i, name in enumerate(INSTANCE_LABEL_OPTIONS)}
+
+
+def _save_instance_ply(idx, label_name):
+    if not _labeled_output_dir or idx >= len(instance_data):
+        return
+    inst = instance_data[idx]
+    pcd = inst["pcd"]
+    pts = np.asarray(pcd.points)
+    has_colors = pcd.has_colors()
+    colors = np.asarray(pcd.colors) if has_colors else None
+    has_normals = pcd.has_normals()
+    normals = np.asarray(pcd.normals) if has_normals else None
+    n = len(pts)
+    label_id = _LABEL_TO_ID.get(label_name, 0)
+
+    fname = f"{_ply_path.stem}_instance_{idx}_type_{label_name}.ply"
+    out_path = _labeled_output_dir / fname
+
+    with open(str(out_path), "w", encoding="utf-8") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        if has_colors:
+            f.write("property uchar red\n")
+            f.write("property uchar green\n")
+            f.write("property uchar blue\n")
+        if has_normals:
+            f.write("property float nx\n")
+            f.write("property float ny\n")
+            f.write("property float nz\n")
+        f.write("property int utility_type\n")
+        f.write("end_header\n")
+        for i in range(n):
+            parts = [f"{pts[i, 0]:.6f}", f"{pts[i, 1]:.6f}", f"{pts[i, 2]:.6f}"]
+            if has_colors:
+                r, g, b = int(colors[i, 0] * 255), int(colors[i, 1] * 255), int(colors[i, 2] * 255)
+                parts.extend([str(r), str(g), str(b)])
+            if has_normals:
+                parts.extend([f"{normals[i, 0]:.6f}", f"{normals[i, 1]:.6f}", f"{normals[i, 2]:.6f}"])
+            parts.append(str(label_id))
+            f.write(" ".join(parts) + "\n")
+
+    print(f"  [saved] {out_path}  (utility_type={label_id}: {label_name})")
+
+
+def _show_instance(idx):
+    if not instance_data:
+        return
+    for i in range(len(instance_data)):
+        vis = (i == idx)
+        scene_widget.scene.show_geometry(_inst_bbox_gn(i), vis)
+        scene_widget.scene.show_geometry(_inst_pts_gn(i), vis)
+    inst = instance_data[idx]
+    _inst_progress_lbl.text = (
+        f"Instance {idx + 1} / {len(instance_data)}:  {inst['name']}"
+    )
+    _inst_pts_lbl.text = f"  {inst['n_pts']:,} points"
+    if idx in _instance_labels:
+        _inst_assigned_lbl.text = f"  Label: {_instance_labels[idx]}"
+        _inst_assigned_lbl.visible = True
+    else:
+        _inst_assigned_lbl.visible = False
+    obb_center = np.asarray(inst["obb"].center)
+    _pivot_to(obb_center)
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+def _assign_label(label_name):
+    if not instance_data:
+        return
+    idx = _current_inst_idx[0]
+    _instance_labels[idx] = label_name
+    print(f"  [label] Instance {idx} ({instance_data[idx]['name']}) -> {label_name}")
+    _inst_assigned_lbl.text = f"  Label: {label_name}"
+    _inst_assigned_lbl.visible = True
+    _save_instance_ply(idx, label_name)
+    # Advance to next unlabeled instance, or next instance if all labeled
+    next_idx = None
+    for i in range(idx + 1, len(instance_data)):
+        if i not in _instance_labels:
+            next_idx = i
+            break
+    if next_idx is None:
+        for i in range(0, idx):
+            if i not in _instance_labels:
+                next_idx = i
+                break
+    if next_idx is not None:
+        _current_inst_idx[0] = next_idx
+        _show_instance(next_idx)
+    elif len(_instance_labels) == len(instance_data):
+        _inst_progress_lbl.text = "All instances labeled!"
+        _inst_pts_lbl.text = ""
+        print("  [done] All instances have been labeled.")
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+if instance_data:
+    def _make_label_cb(label_name):
+        def _cb():
+            _assign_label(label_name)
+        return _cb
+
+    for _li, _label_name in enumerate(INSTANCE_LABEL_OPTIONS):
+        _lbl_btn = gui.Button(f"{_li + 1}. {_label_name}")
+        _lbl_btn.set_on_clicked(_make_label_cb(_label_name))
+        left_panel.add_child(_lbl_btn)
+        left_panel.add_fixed(int(0.1 * em))
+
+    left_panel.add_fixed(int(0.4 * em))
+
+    _nav_row = gui.Horiz(int(0.3 * em))
+
+    _prev_btn = gui.Button("Prev")
+    def _on_prev():
+        if _current_inst_idx[0] > 0:
+            _current_inst_idx[0] -= 1
+            _show_instance(_current_inst_idx[0])
+    _prev_btn.set_on_clicked(_on_prev)
+    _nav_row.add_child(_prev_btn)
+
+    _skip_btn = gui.Button("Skip")
+    def _on_skip():
+        if _current_inst_idx[0] + 1 < len(instance_data):
+            _current_inst_idx[0] += 1
+            _show_instance(_current_inst_idx[0])
+    _skip_btn.set_on_clicked(_on_skip)
+    _nav_row.add_child(_skip_btn)
+
+    _next_btn = gui.Button("Next")
+    def _on_next():
+        if _current_inst_idx[0] + 1 < len(instance_data):
+            _current_inst_idx[0] += 1
+            _show_instance(_current_inst_idx[0])
+    _next_btn.set_on_clicked(_on_next)
+    _nav_row.add_child(_next_btn)
+
+    left_panel.add_child(_nav_row)
+    left_panel.add_fixed(int(0.3 * em))
+
+    _save_info = gui.Label(f"Saves to: {_labeled_output_dir.name}/")
+    _save_info.text_color = gui.Color(0.5, 0.5, 0.5, 1.0)
+    left_panel.add_child(_save_info)
+
+left_panel.add_stretch()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 12.  Camera helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _pivot_to(point: np.ndarray):
+    d   = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
+    eye = point + np.array([0.0, 0.0, d])
+    scene_widget.look_at(point.tolist(), eye.tolist(), [0.0, 1.0, 0.0])
+    print(f"  Pivot -> [{point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}]")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 13.  Key callbacks
+# ─────────────────────────────────────────────────────────────────────────────
+HANDLED = gui.Widget.EventCallbackResult.HANDLED
+IGNORED = gui.Widget.EventCallbackResult.IGNORED
+
+
+def on_key(event):
+    if event.type != gui.KeyEvent.DOWN:
+        return IGNORED
+    k = event.key
+
+    # Number keys 1-9 and 0 (=10) for quick instance labeling
+    if instance_data:
+        _num_keys = {ord(str(i)): i - 1 for i in range(1, 10)}
+        _num_keys[ord('0')] = 9
+        if k in _num_keys:
+            li = _num_keys[k]
+            if li < len(INSTANCE_LABEL_OPTIONS):
+                _assign_label(INSTANCE_LABEL_OPTIONS[li])
+                return HANDLED
+
+    if k == ord(']'):
+        _apply_opacity(pipe_opacity[0] + 0.05); return HANDLED
+    if k == ord('['):
+        _apply_opacity(pipe_opacity[0] - 0.05); return HANDLED
+
+    if k in (ord('C'), ord('c')):
+        print("Pivot -> cloud centroid")
+        _pivot_to(cloud_centroid)
+        return HANDLED
+    if k in (ord('P'), ord('p')):
+        print("Pivot -> pipe centroid")
+        _pivot_to(pipe_centroid)
+        return HANDLED
+
+    if k in (ord('H'), ord('h')):
+        print("\n-- Shortcuts ---------------------------------------------------")
+        print("  1-0            assign label to current instance (1-10)")
+        print("  C              pivot to point cloud centroid")
+        print("  P              pivot to pipe centroid (all utilities)")
+        print("  ]              increase opacity +0.05")
+        print("  [              decrease opacity -0.05")
+        print("  H              show this help")
+        print("----------------------------------------------------------------\n")
+        return HANDLED
+
+    return IGNORED
+
+
+scene_widget.set_on_key(on_key)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 14.  Layout + run
+# ─────────────────────────────────────────────────────────────────────────────
+def on_layout(layout_ctx):
+    r = window.content_rect
+    _lw = LEFT_PANEL_WIDTH if instance_data else 0
+    left_panel.frame   = gui.Rect(r.x, r.y, _lw, r.height)
+    scene_widget.frame = gui.Rect(r.x + _lw, r.y, r.width - _lw - PANEL_WIDTH, r.height)
+    panel.frame        = gui.Rect(r.x + r.width - PANEL_WIDTH, r.y, PANEL_WIDTH, r.height)
+
+
+window.set_on_layout(on_layout)
+if instance_data:
+    window.add_child(left_panel)
+window.add_child(scene_widget)
+window.add_child(panel)
+
+# Summary
+n_total_segs  = sum(s for _, s in layer_stats.values())
+n_total_comps = sum(comp_stats.values())
+print(f"\nRendering {len(pts):,} points  +  {n_total_segs:,} pipe segments  "
+      f"+  {n_total_comps} component spheres")
+print("Launching viewer ...\n")
+
+app.run()
+print("Viewer closed.")
