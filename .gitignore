@@ -1,0 +1,28 @@
+# ── Data files (large / binary) ──────────────────────────────────
+Data/
+Developing/Ouput/
+
+# ── Common data formats ─────────────────────────────────────────
+*.ply
+*.las
+*.laz
+*.gml
+*.GML
+*.gpkg
+*.dxf
+*.qgz
+*.qml
+*.sld
+*.zip
+
+# ── Python cache ─────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── Claude Code config ──────────────────────────────────────────
+.claude/
+
+# ── OS junk ──────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
