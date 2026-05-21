@@ -1,6 +1,6 @@
 # OpenTrench3D — Utility Infrastructure Labeling Pipeline
 
-Point cloud visualization and labeling tools for underground utility infrastructure, built on the [OpenTrench3D](https://github.com/OpenTrench3D) dataset and Danish LER (Ledningsregistrering) utility data.
+Point cloud visualization and labeling tools for underground utility infrastructure, built on the [OpenTrench3D](https://github.com/OpenTrench3D) dataset and Danish LER utility data.
 
 Developed as part of an MSc thesis at the University of Twente.
 
@@ -15,10 +15,6 @@ Thesis/
 │   ├── 3. Label Viewer/    # Instance labeling tool for assigning utility types
 │   ├── 4. Linking Viewer/  # (in development)
 │   ├── 5. Deviation Viewer/# (in development)
-│   ├── DBScan/             # DBSCAN clustering experiments
-│   ├── HDBScan/            # HDBSCAN clustering experiments
-│   ├── PLY_to_LAS/         # Format conversion utilities
-│   └── QML_Distributor/    # QGIS style distribution
 ├── Testing/                # Earlier prototypes and experiments
 └── .gitignore
 ```
