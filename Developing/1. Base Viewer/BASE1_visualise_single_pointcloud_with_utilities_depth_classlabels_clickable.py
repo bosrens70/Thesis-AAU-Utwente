@@ -26,20 +26,21 @@ Depth handling for Z = -99  (no reliable measurement)
       Shift + Left-Click   to select a ground-level vertex
       Q  or close window   when finished picking
 
-  The average Z of the picked points becomes the ground level reference.
-  For each utility vertex with Z = -99, depth is then estimated as:
+  Depth is resolved through a configurable hierarchy (DepthSource enum).
 
-      Z_estimated  =  ground_level  -  vejledendeDybde / 1000
+  Pipes — PIPE_DEPTH_CONFIG (in priority order):
+      1  REGISTERED    Direct Z measurement (not -99)
+      2  VEJLEDENDE    Z = ground_level(XY) - vejledendeDybde / 1000
+      3  FEATURE_MEAN  Mean of valid Z on the same GML feature
+      5  GROUND_PLANE  Fitted ground plane at this XY (surface level)
 
-  where vejledendeDybde is the indicative (suggested) depth below ground
-  level stored as an attribute on the utility feature, in millimetres.
+  Components — COMPONENT_DEPTH_CONFIG:
+      1  REGISTERED    Direct Z measurement (not -99)
+      4  LAYER_MEAN    Average depth of corresponding pipe layer
+      5  GROUND_PLANE  Fitted ground plane at this XY (surface level)
 
-  If vejledendeDybde is not available the vertex falls back to the mean
-  of valid Z values on the same feature, or the picked ground level.
-
-  Components (Vandkomponent, etc.) do not carry vejledendeDybde.  For those
-  the script uses the average depth of the corresponding pipe layer, or
-  falls back to the picked ground level.
+  Each level can be toggled on/off via DepthConfig.enabled_levels.
+  Per-vertex provenance is tracked in a sources array (DepthSource int8).
 
 Usage
 -----
@@ -57,7 +58,6 @@ Keyboard shortcuts
 ------------------
   C   pivot to cloud centroid           P   pivot to pipe centroid
   0   pivot to world origin
-  ]   increase opacity +0.05           [   decrease opacity -0.05
   L   toggle class label colours
   H   help                             Esc quit
 """
@@ -68,8 +68,54 @@ import open3d.visualization.rendering as rendering
 import geopandas as gpd
 import numpy as np
 from pathlib import Path
+from enum import IntEnum
+from dataclasses import dataclass
 import re
 import time
+import copy
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPTH HIERARCHY — enum, config, resolvers
+# ─────────────────────────────────────────────────────────────────────────────
+class DepthSource(IntEnum):
+    REGISTERED   = 1
+    VEJLEDENDE   = 2
+    FEATURE_MEAN = 3   # pipes only
+    LAYER_MEAN   = 4   # components only (parent pipe layer average)
+    GROUND_PLANE = 5
+    NONE         = 99
+
+
+@dataclass(frozen=True)
+class DepthConfig:
+    enabled_levels: frozenset
+    track_per_vertex: bool = True
+
+
+PIPE_DEPTH_CONFIG = DepthConfig(
+    enabled_levels=frozenset({
+        DepthSource.REGISTERED,
+        DepthSource.VEJLEDENDE,
+        DepthSource.FEATURE_MEAN,
+        DepthSource.GROUND_PLANE,
+    })
+)
+
+COMPONENT_DEPTH_CONFIG = DepthConfig(
+    enabled_levels=frozenset({
+        DepthSource.REGISTERED,
+        DepthSource.LAYER_MEAN,
+        DepthSource.GROUND_PLANE,
+    })
+)
+
+_STATS_KEY = {
+    DepthSource.VEJLEDENDE:   "estimated",
+    DepthSource.FEATURE_MEAN: "fallback_feature_mean",
+    DepthSource.LAYER_MEAN:   "fallback_layer_mean",
+    DepthSource.GROUND_PLANE: "fallback_global",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG
@@ -137,15 +183,6 @@ COMPONENT_LAYERS = {
 
 COMPONENT_SPHERE_RADIUS = 0.05
 
-# Vandledning diameter → colour mapping
-DIAMETER_COLORS = {
-    0:   [0.502, 0.502, 0.502],
-    32:  [0.702, 0.851, 1.000],
-    63:  [0.400, 0.698, 1.000],
-    120: [0.102, 0.459, 1.000],
-    150: [0.000, 0.278, 0.800],
-    160: [0.000, 0.180, 0.522],
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG VALIDATION
@@ -159,6 +196,8 @@ if _missing:
     raise SystemExit(1)
 
 print("Config paths OK.\n")
+
+_t_script_start = time.perf_counter()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Auto-detect area from the PLY path
@@ -175,7 +214,10 @@ AREA_NUMBER = int(_area_match.group(1))
 AREA_NAME   = f"Area{AREA_NUMBER}"
 print(f"Detected area: {AREA_NAME}  (from path)")
 
+_t1 = time.perf_counter()
 ref   = gpd.read_file(AREA_REF_GEOJSON)
+_t1b = time.perf_counter()
+print(f"  [timer] Read area GeoJSON: {_t1b - _t1:.3f}s")
 area  = ref[ref["name"] == AREA_NAME]
 if area.empty:
     print(f"[ERROR] No origin for '{AREA_NAME}' in {AREA_REF_GEOJSON}")
@@ -188,42 +230,45 @@ print(f"Origin -> TX={TX:.3f}  TY={TY:.3f}  TZ={TZ:.3f}")
 # ─────────────────────────────────────────────────────────────────────────────
 # 2.  Load the single point cloud + class labels
 # ─────────────────────────────────────────────────────────────────────────────
-_t0 = time.perf_counter()
 print(f"\nLoading point cloud: {_ply_path.name} ...")
+_t_ply0 = time.perf_counter()
 pcd = o3d.io.read_point_cloud(str(PLY_FILE))
 pts = np.asarray(pcd.points)
-print(f"  {len(pts):,} points loaded")
+_t_ply1 = time.perf_counter()
+print(f"  {len(pts):,} points loaded  [{_t_ply1 - _t_ply0:.3f}s]")
 
-# Read class labels directly from the ASCII PLY (no plyfile dependency)
+# Read class labels from ASCII PLY header + numpy bulk read
 print("  Reading class labels from PLY ...")
 class_labels = None
+_t_cls0 = time.perf_counter()
+
+# Parse header only (tiny) to find column index and header line count
+_ply_header_lines = 0
+_ply_property_names = []
 with open(str(PLY_FILE), 'r') as f:
-    header_lines = []
-    property_names = []
     for line in f:
-        line = line.strip()
-        header_lines.append(line)
-        if line.startswith("property "):
-            # e.g. "property uchar class" → "class"
-            property_names.append(line.split()[-1])
-        if line == "end_header":
+        _ply_header_lines += 1
+        stripped = line.strip()
+        if stripped.startswith("property "):
+            _ply_property_names.append(stripped.split()[-1])
+        if stripped == "end_header":
             break
 
-    if "class" in property_names:
-        class_col_idx = property_names.index("class")
-        # Read remaining lines as data
-        labels = []
-        for line in f:
-            parts = line.split()
-            if len(parts) > class_col_idx:
-                labels.append(int(parts[class_col_idx]))
-        class_labels = np.array(labels, dtype=int)
-        unique_classes = np.unique(class_labels)
-        print(f"  Class labels found: {len(class_labels):,} values, "
-              f"unique classes: {sorted(unique_classes.tolist())}")
-    else:
-        print(f"  [WARNING] No 'class' property in PLY (found: {property_names})"
-              " — class colouring disabled")
+if "class" in _ply_property_names:
+    _class_col = _ply_property_names.index("class")
+    class_labels = np.loadtxt(
+        str(PLY_FILE), dtype=int,
+        skiprows=_ply_header_lines, usecols=_class_col,
+    )
+    unique_classes = np.unique(class_labels)
+    print(f"  Class labels found: {len(class_labels):,} values, "
+          f"unique classes: {sorted(unique_classes.tolist())}")
+else:
+    print(f"  [WARNING] No 'class' property in PLY (found: {_ply_property_names})"
+          " — class colouring disabled")
+
+_t_cls1 = time.perf_counter()
+print(f"  [timer] Class label parsing: {_t_cls1 - _t_cls0:.3f}s")
 
 # Store original RGB colours
 original_colors = np.asarray(pcd.colors).copy()
@@ -347,8 +392,8 @@ def _ground_level_local(x: float, y: float) -> float:
 print(f"\n  Ground level (local) = {GROUND_Z:.3f} m") # print the ground level (local)
 print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m") # print the ground level (UTM)
 
-# Depth estimation counters (pipe line vertices only; incremented only inside crop disc XY)
-_depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
+# Depth estimation counters (incremented only inside crop disc XY)
+_depth_stats = {"registered": 0, "estimated": 0, "fallback_feature_mean": 0, "fallback_layer_mean": 0, "fallback_global": 0}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Geometry helpers
@@ -381,6 +426,36 @@ def segment_to_cylinder(p1, p2, radius, color, resolution=12): # define a functi
     cyl.translate((p1 + p2) / 2.0) # translate the cylinder to the midpoint of the segment
     cyl.paint_uniform_color(color) # paint the cylinder with the color
     return cyl # return the cylinder
+
+
+def segment_to_plane(p1, p2, width, color):
+    """Create a flat horizontal quad between p1 and p2 with the given width (metres)."""
+    vec = p2 - p1
+    length = np.linalg.norm(vec)
+    if length < 1e-6:
+        return None
+    fwd = vec / length
+    up = np.array([0.0, 0.0, 1.0])
+    side = np.cross(fwd, up)
+    side_len = np.linalg.norm(side)
+    if side_len < 1e-6:
+        side = np.array([1.0, 0.0, 0.0])
+    else:
+        side = side / side_len
+    half_w = width / 2.0
+    offset = side * half_w
+    v0 = p1 - offset
+    v1 = p1 + offset
+    v2 = p2 + offset
+    v3 = p2 - offset
+    verts = np.array([v0, v1, v2, v3], dtype=float)
+    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(verts),
+        o3d.utility.Vector3iVector(tris),
+    )
+    mesh.paint_uniform_color(color)
+    return mesh
 
 
 def _batch_point_to_segment_dists(p, p1s, p2s): # define a function to calculate the minimum distance from a point to a segment
@@ -416,65 +491,98 @@ def _pt_in_local_bbox(x, y):
     return (dx * dx + dy * dy) <= _crop_r2
 
 
-def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm): # define a function to clean the coordinates with depth
+def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
+                              cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
     """
-    Translate UTM -> local.  For vertices with Z = -99 (no reliable
-    measurement), estimate depth using:
-        Z = ground_level(XY) - vejledendeDybde / 1000
-    If vejledendeDybde is not available, fall back to mean of valid Z
-    on the same feature, or the global ground level.
+    Translate UTM -> local.  For vertices with Z = -99, resolve depth using
+    the ordered DepthSource hierarchy defined in *cfg*.
 
-    Global _depth_stats counters are incremented only for -99 vertices whose
-    XY lies inside the circular crop disc (_pt_in_local_bbox); all vertices
-    are still corrected so downstream clipping stays valid.
+    Returns (coords, sources) where sources is a DepthSource int8 array
+    (one entry per vertex) when cfg.track_per_vertex is True, else just coords.
     """
-    coords = coords_raw.copy().astype(float) # convert the coordinates to float if the shape of the coordinates is 2, add a zero column to the coordinates
+    coords = coords_raw.copy().astype(float)
     if coords.shape[1] == 2:
-        coords = np.hstack([coords, np.zeros((len(coords), 1))]) # add a zero column to the coordinates
+        coords = np.hstack([coords, np.zeros((len(coords), 1))])
 
-    # Translate XY to local first (Z stays in absolute UTM for now)
-    coords[:, 0] -= TX # subtract the translation from the x-coordinates
-    coords[:, 1] -= TY # subtract the translation from the y-coordinates
+    coords[:, 0] -= TX
+    coords[:, 1] -= TY
 
-    bad = coords[:, 2] == -99 # check if the z-coordinates are -99
+    n = len(coords)
+    sources = np.full(n, DepthSource.NONE, dtype=np.int8)
+
+    bad = coords[:, 2] == -99
+    sources[~bad] = DepthSource.REGISTERED
+
+    # Count registered vertices inside crop disc
+    for idx in np.where(~bad)[0]:
+        if _pt_in_local_bbox(coords[idx, 0], coords[idx, 1]):
+            _depth_stats["registered"] += 1
+
     if bad.any():
-        # Parse indicative depth (mm -> m)
-        ind_depth_m = None # initialize the indicative depth
+        # Pre-compute resolver inputs once per feature
+        ind_depth_m = None
         if vejledende_dybde_mm is not None:
             try:
-                d = float(vejledende_dybde_mm) # convert the indicative depth to float
+                d = float(vejledende_dybde_mm)
                 if d > 0:
-                    ind_depth_m = d / 1000.0 # convert the indicative depth to meters
+                    ind_depth_m = d / 1000.0
             except (ValueError, TypeError):
                 pass
 
-        # Mean of valid Z on this feature (absolute UTM Z)
-        good_z = coords[~bad, 2] # get the valid z-coordinates
+        good_z = coords[~bad, 2]
         feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
 
-        for idx in np.where(bad)[0]: # for each invalid z-coordinate
-            _inside_crop = _pt_in_local_bbox(coords[idx, 0], coords[idx, 1])
-            if ind_depth_m is not None: # if the indicative depth is not None
-                # Estimate using fitted ground plane at this XY point.
-                # coords XY are local; coords Z is still absolute UTM here.
-                _g_local = _ground_level_local(coords[idx, 0], coords[idx, 1])
-                coords[idx, 2] = (_g_local + TZ) - ind_depth_m
-                if _inside_crop:
-                    _depth_stats["estimated"] += 1
-            elif feature_mean_z is not None:
-                # Fall back to mean of valid Z on this feature
-                coords[idx, 2] = feature_mean_z # set the z-coordinate to the mean of the valid z-coordinates
-                if _inside_crop:
-                    _depth_stats["fallback_feature_mean"] += 1
-            else:
-                # Last resort: fitted ground plane at this XY (convert to UTM)
-                _g_local = _ground_level_local(coords[idx, 0], coords[idx, 1])
-                coords[idx, 2] = _g_local + TZ
-                if _inside_crop:
-                    _depth_stats["fallback_global"] += 1
+        # Resolver table: level -> callable(idx) -> float | None
+        def _resolve_vejledende(idx):
+            if ind_depth_m is None:
+                return None
+            g = _ground_level_local(coords[idx, 0], coords[idx, 1])
+            return (g + TZ) - ind_depth_m
 
-    # Now translate Z to local
+        def _resolve_feature_mean(idx):
+            return feature_mean_z
+
+        def _resolve_layer_mean(idx):
+            # parent_avg_z is in local coords; convert to absolute UTM
+            # so the final coords[:, 2] -= TZ brings it back to local
+            if parent_avg_z is None:
+                return None
+            return parent_avg_z + TZ
+
+        def _resolve_ground_plane(idx):
+            g = _ground_level_local(coords[idx, 0], coords[idx, 1])
+            return g + TZ
+
+        _RESOLVERS = {
+            DepthSource.VEJLEDENDE:   _resolve_vejledende,
+            DepthSource.FEATURE_MEAN: _resolve_feature_mean,
+            DepthSource.LAYER_MEAN:   _resolve_layer_mean,
+            DepthSource.GROUND_PLANE: _resolve_ground_plane,
+        }
+
+        ordered_levels = sorted(
+            lv for lv in cfg.enabled_levels if lv != DepthSource.REGISTERED
+        )
+
+        for idx in np.where(bad)[0]:
+            _inside_crop = _pt_in_local_bbox(coords[idx, 0], coords[idx, 1])
+            for level in ordered_levels:
+                resolver = _RESOLVERS.get(level)
+                if resolver is None:
+                    continue
+                z = resolver(idx)
+                if z is not None:
+                    coords[idx, 2] = z
+                    sources[idx] = level
+                    if _inside_crop:
+                        _depth_stats[_STATS_KEY[level]] += 1
+                    break
+
+    # Translate Z to local
     coords[:, 2] -= TZ
+
+    if cfg.track_per_vertex:
+        return coords, sources
     return coords
 
 
@@ -542,10 +650,13 @@ def _clip_segment_to_bbox(p1, p2):
 # 5.  Load utility lines (pipes / cables) within bbox
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n--- Loading utility lines within bbox ---")
+_t_pipes0 = time.perf_counter()
 all_pipe_meshes   = []          # flat list — kept for count reporting
 _pipe_layer_cyls  = {}          # layer_name -> [TriangleMesh, ...]  per-layer
+_pipe_seg_dsrc    = {}          # layer_name -> [DepthSource, ...]   per-segment
 layer_stats = {}
-all_pipe_coords = []
+all_pipe_coords  = []
+all_pipe_sources = []   # per-vertex DepthSource arrays, parallel to all_pipe_coords
 
 # Picking data — segment endpoints, midpoints, and their GML attributes
 pick_seg_p1        = []   # list of np.array([x,y,z])  — segment start
@@ -558,11 +669,13 @@ pick_seg_layer     = []   # layer name per segment
 _layer_avg_depth_local = {}
 
 for layer_name, cfg in LINE_LAYERS.items():
+    _t_layer0 = time.perf_counter()
     try:
         gdf = gpd.read_file(GML_PATH, layer=layer_name)
     except Exception as e:
         print(f"  {layer_name}: skip ({e})")
         continue
+    _t_layer_read = time.perf_counter()
 
     default_color   = cfg["color"]
     fallback_radius = cfg["fallback_radius"]
@@ -589,10 +702,19 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
-        if layer_name == "Vandledning" and diam_mm > 0:
-            color = DIAMETER_COLORS.get(int(diam_mm), default_color)
-        else:
-            color = default_color
+        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
+        bredde_m = None
+        if layer_name == "Ledningstrace":
+            bredde_m = 0.25  # fallback: 25 cm
+            if "bredde" in row.index:
+                try:
+                    b = float(row["bredde"] or 0)
+                    if b > 0:
+                        bredde_m = b / 1000.0
+                except (ValueError, TypeError):
+                    pass
+
+        color = default_color
 
         # Get indicative depth for this feature
         vejl_dybde = None
@@ -614,8 +736,9 @@ for layer_name, cfg in LINE_LAYERS.items():
             if not _segments_in_bbox(coords_raw):
                 continue
 
-            coords = _clean_coords_with_depth(coords_raw, vejl_dybde)
+            coords, seg_sources = _clean_coords_with_depth(coords_raw, vejl_dybde)
             all_pipe_coords.append(coords)
+            all_pipe_sources.append(seg_sources)
             _layer_z_vals.extend(coords[:, 2].tolist())
             feature_hit = True
 
@@ -623,10 +746,16 @@ for layer_name, cfg in LINE_LAYERS.items():
                 clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
                 if clipped is None:
                     continue
-                cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
+                if bredde_m is not None:
+                    cyl = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
+                else:
+                    cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
                 if cyl is not None:
                     all_pipe_meshes.append(cyl)
                     _pipe_layer_cyls.setdefault(layer_name, []).append(cyl)
+                    # Store dominant (worst) depth source for this segment
+                    _seg_src = DepthSource(max(int(seg_sources[i]), int(seg_sources[i + 1])))
+                    _pipe_seg_dsrc.setdefault(layer_name, []).append(_seg_src)
                     midpt = (clipped[0] + clipped[1]) / 2.0
                     pick_seg_p1.append(clipped[0].copy())
                     pick_seg_p2.append(clipped[1].copy())
@@ -638,21 +767,37 @@ for layer_name, cfg in LINE_LAYERS.items():
         if feature_hit:
             n_features += 1
 
+    _t_layer1 = time.perf_counter()
     layer_stats[layer_name] = (n_features, n_segments)
     if _layer_z_vals:
         _layer_avg_depth_local[layer_name] = float(np.mean(_layer_z_vals))
     if n_features > 0:
-        print(f"  {layer_name:<35} {n_features:>4} features  {n_segments:>5} segments")
+        print(f"  {layer_name:<35} {n_features:>4} features  {n_segments:>5} segments"
+              f"  [read {_t_layer_read - _t_layer0:.2f}s | process {_t_layer1 - _t_layer_read:.2f}s]")
 
 pick_seg_p1        = np.array(pick_seg_p1)        if pick_seg_p1        else np.empty((0, 3))
 pick_seg_p2        = np.array(pick_seg_p2)        if pick_seg_p2        else np.empty((0, 3))
 pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.empty((0, 3))
 
-print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments")
-print(f"\n  Depth estimation stats (pipe verts w/ Z=-99 inside crop disc, r={CROP_RADIUS} m):")
-print(f"    Estimated from vejledendeDybde + ground model: {_depth_stats['estimated']}")
-print(f"    Fallback to feature mean Z:                    {_depth_stats['fallback_feature_mean']}")
-print(f"    Fallback to global ground level:               {_depth_stats['fallback_global']}")
+_t_pipes1 = time.perf_counter()
+print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments  [{_t_pipes1 - _t_pipes0:.2f}s total]")
+print(f"\n  Depth hierarchy stats (pipe verts inside crop disc, r={CROP_RADIUS} m):")
+print(f"    1. Registered Z:        {_depth_stats['registered']}")
+print(f"    2. vejledendeDybde:      {_depth_stats['estimated']}")
+print(f"    3. Feature mean Z:       {_depth_stats['fallback_feature_mean']}")
+print(f"    4. Layer mean Z:         {_depth_stats['fallback_layer_mean']}")
+print(f"    5. Ground plane:         {_depth_stats['fallback_global']}")
+
+# Consolidated per-vertex depth source arrays
+if all_pipe_sources:
+    _all_pipe_sources_flat = np.concatenate(all_pipe_sources)
+    for src in DepthSource:
+        if src == DepthSource.NONE:
+            continue
+        _cnt = int(np.sum(_all_pipe_sources_flat == src))
+        if _cnt > 0:
+            print(f"    [{src.name:<14}] {_cnt:>6} vertices (all, incl. outside crop)")
+    del _all_pipe_sources_flat
 
 # Per-layer merged pipe meshes (used for individual visibility toggles)
 _pipe_layer_meshes = {}
@@ -681,23 +826,28 @@ _COMP_TO_LINE = {
 }
 
 print("\n--- Loading utility components within bbox ---")
+_t_comp0 = time.perf_counter()
 all_comp_meshes    = []     # flat list (kept for count reporting)
 _comp_layer_spheres = {}    # layer_name -> [TriangleMesh, ...]  per-layer
+_comp_seg_dsrc     = {}     # layer_name -> [DepthSource, ...]   per-component
 comp_stats = {}
 _comp_depth_stats = {"from_pipe_avg": 0, "from_ground": 0}
+all_comp_sources = []       # per-component DepthSource values
 
 # Picking data for components
 pick_comp_centres = []
 pick_comp_attrs   = []
 pick_comp_layer   = []
 
-for layer_name, cfg in COMPONENT_LAYERS.items():
+for layer_name, comp_cfg in COMPONENT_LAYERS.items():
+    _t_clayer0 = time.perf_counter()
     try:
         gdf_c = gpd.read_file(GML_PATH, layer=layer_name)
     except Exception:
         continue
+    _t_clayer_read = time.perf_counter()
 
-    color = cfg["color"]
+    color = comp_cfg["color"]
     n_comp = 0
 
     # Get the average depth of the corresponding line layer for fallback
@@ -709,23 +859,25 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         if not _point_in_bbox(g.x, g.y):
             continue
 
-        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+        # Use the unified resolver via _clean_coords_with_depth
+        coords_utm = np.array([[g.x, g.y, g.z]], dtype=float)
+        pt_arr, src_arr = _clean_coords_with_depth(
+            coords_utm, None,
+            cfg=COMPONENT_DEPTH_CONFIG, parent_avg_z=parent_avg_z,
+        )
+        pt = pt_arr[0]
+        comp_source = DepthSource(int(src_arr[0]))
 
-        # Crop to local buffered bbox
         if not _pt_in_local_bbox(pt[0], pt[1]):
             continue
 
-        if g.z == -99 or pt[2] <= -98:
-            # Component has no reliable Z — estimate from parent pipe depth
-            # or from ground model
-            if parent_avg_z is not None:
-                # Use average depth of the corresponding utility type
-                pt[2] = parent_avg_z
-                _comp_depth_stats["from_pipe_avg"] += 1
-            else:
-                # Fall back to fitted ground level at this XY point
-                pt[2] = _ground_level_local(pt[0], pt[1])
-                _comp_depth_stats["from_ground"] += 1
+        all_comp_sources.append(comp_source)
+
+        # Legacy counters for backward-compatible print output
+        if comp_source == DepthSource.LAYER_MEAN:
+            _comp_depth_stats["from_pipe_avg"] += 1
+        elif comp_source == DepthSource.GROUND_PLANE:
+            _comp_depth_stats["from_ground"] += 1
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12
@@ -734,6 +886,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         sphere.paint_uniform_color(color)
         all_comp_meshes.append(sphere)
         _comp_layer_spheres.setdefault(layer_name, []).append(sphere)
+        _comp_seg_dsrc.setdefault(layer_name, []).append(comp_source)
 
         # Store picking data
         pick_comp_centres.append(pt.copy())
@@ -749,16 +902,26 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
 
         n_comp += 1
 
+    _t_clayer1 = time.perf_counter()
     comp_stats[layer_name] = n_comp
     if n_comp > 0:
-        print(f"  {layer_name:<35} {n_comp:>4} components")
+        print(f"  {layer_name:<35} {n_comp:>4} components"
+              f"  [read {_t_clayer_read - _t_clayer0:.2f}s | process {_t_clayer1 - _t_clayer_read:.2f}s]")
 
 pick_comp_centres = np.array(pick_comp_centres) if pick_comp_centres else np.empty((0, 3))
 
-print(f"\n  Total: {len(all_comp_meshes)} component spheres")
+_t_comp1 = time.perf_counter()
+print(f"\n  Total: {len(all_comp_meshes)} component spheres  [{_t_comp1 - _t_comp0:.2f}s total]")
 print(f"  Component depth estimation:")
 print(f"    From parent pipe average Z: {_comp_depth_stats['from_pipe_avg']}")
 print(f"    From ground model:          {_comp_depth_stats['from_ground']}")
+if all_comp_sources:
+    for src in DepthSource:
+        if src == DepthSource.NONE:
+            continue
+        _cnt = sum(1 for s in all_comp_sources if s == src)
+        if _cnt > 0:
+            print(f"    [{src.name:<14}] {_cnt:>6} components")
 
 # Per-layer merged component meshes
 _comp_layer_meshes = {}
@@ -769,8 +932,62 @@ for _ln, _spheres in _comp_layer_spheres.items():
     _m.compute_vertex_normals()
     _comp_layer_meshes[_ln] = _m
 
+def srgb_to_linear(c: float) -> float:
+    if c <= 0.04045:
+        return c / 12.92
+    return ((c + 0.055) / 1.055) ** 2.4
+
+# ── Depth-source colour map (sRGB — used directly for GUI labels) ──────────
+_DSRC_COLOR_SRGB = {
+    DepthSource.REGISTERED:   [0.4, 1.0, 0.4],   # green
+    DepthSource.VEJLEDENDE:   [0.4, 0.8, 1.0],   # light blue
+    DepthSource.FEATURE_MEAN: [1.0, 0.7, 0.3],   # orange
+    DepthSource.LAYER_MEAN:   [1.0, 0.7, 0.3],   # orange
+    DepthSource.GROUND_PLANE: [1.0, 0.4, 0.4],   # red
+    DepthSource.NONE:         [0.5, 0.5, 0.5],   # grey
+}
+
+def _dsrc_linear(src):
+    """Convert sRGB depth-source colour to linear for Open3D meshes."""
+    s = _DSRC_COLOR_SRGB.get(src, [0.5, 0.5, 0.5])
+    return [srgb_to_linear(c) for c in s]
+
+# Build depth-coloured per-layer pipe meshes
+_pipe_layer_meshes_depth = {}
+for _ln, _cyls in _pipe_layer_cyls.items():
+    _dsrcs = _pipe_seg_dsrc.get(_ln, [])
+    _coloured = []
+    for _i, _c in enumerate(_cyls):
+        _dc = copy.deepcopy(_c)
+        _src = _dsrcs[_i] if _i < len(_dsrcs) else DepthSource.NONE
+        _dc.paint_uniform_color(_dsrc_linear(_src))
+        _coloured.append(_dc)
+    if _coloured:
+        _m = _coloured[0]
+        for _c2 in _coloured[1:]:
+            _m += _c2
+        _m.compute_vertex_normals()
+        _pipe_layer_meshes_depth[_ln] = _m
+
+# Build depth-coloured per-layer component meshes
+_comp_layer_meshes_depth = {}
+for _ln, _spheres in _comp_layer_spheres.items():
+    _dsrcs = _comp_seg_dsrc.get(_ln, [])
+    _coloured = []
+    for _i, _s in enumerate(_spheres):
+        _ds = copy.deepcopy(_s)
+        _src = _dsrcs[_i] if _i < len(_dsrcs) else DepthSource.NONE
+        _ds.paint_uniform_color(_dsrc_linear(_src))
+        _coloured.append(_ds)
+    if _coloured:
+        _m = _coloured[0]
+        for _s2 in _coloured[1:]:
+            _m += _s2
+        _m.compute_vertex_normals()
+        _comp_layer_meshes_depth[_ln] = _m
+
 _t_load = time.perf_counter()
-print(f"\nData loaded in {_t_load - _t0:.2f}s")
+print(f"\nAll data loaded in {_t_load - _t_script_start:.2f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Coordinate frame + circular crop wireframe + point cloud normals
@@ -779,17 +996,19 @@ frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
     size=0.5, origin=cloud_centroid
 )
 
-# Estimate normals on the cropped point cloud so we can shade it with the
-# `defaultLit` shader.  
+# Estimate normals — reduced parameters (only used for defaultLit shading).
+_t_norm0 = time.perf_counter()
 try:
     pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=30)
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.08, max_nn=12)
     )
     pcd.orient_normals_towards_camera_location(
         cloud_centroid + np.array([0.0, 0.0, 5.0])
     )
 except Exception as _e:
     print(f"  [warn] point cloud normal estimation failed: {_e}")
+_t_norm1 = time.perf_counter()
+print(f"  [timer] Normal estimation: {_t_norm1 - _t_norm0:.3f}s")
 
 # Circle wireframe showing the crop boundary at ground level
 _N_CIRCLE = 72
@@ -812,8 +1031,6 @@ bbox_ls.paint_uniform_color([1.0, 1.0, 0.0])
 # 8.  Material helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
-    # Lit + transparent so the opacity slider still works AND the pipes
-    # get shaded by normals (gives depth cues that flat-colour rendering lacks).
     mat            = rendering.MaterialRecord()
     mat.shader     = "defaultLitTransparency"
     mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
@@ -863,14 +1080,15 @@ def _comp_gn(ln):       return f"comp_{ln}"
 
 # Per-layer visibility state (True = shown)
 _layer_visible = {ln: True for ln in list(LINE_LAYERS) + list(COMPONENT_LAYERS)}
-_layer_visible["Ledningstrace"] = False
+_layer_visible["Ledningstrace"] = True
 
 pipe_opacity = [1.0]
 origin_pt    = np.array([0.0, 0.0, 0.0])
 pick_active  = [False]
 class_labels_active = [False]   # toggled by L key or checkbox
-origin_frame_visible  = [True]  # toggled by the "Show origin axis" checkbox
+origin_frame_visible  = [False]  # toggled by the "Show origin axis" checkbox
 
+_t_gui0 = time.perf_counter()
 app = gui.Application.instance
 app.initialize()
 
@@ -890,6 +1108,14 @@ try:
 except Exception as _e:
     print(f"  [warn] could not enable post-processing: {_e}")
 
+# Top-down directional sun light for utility mesh shading
+scene_widget.scene.scene.set_sun_light(
+    [0.0, 0.0, -1.0],        # direction: straight down
+    [1.0, 1.0, 1.0],         # white colour
+    75000,                    # intensity
+)
+scene_widget.scene.scene.enable_sun_light(True)
+
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
 
@@ -898,12 +1124,13 @@ for _ln, _mesh in _pipe_layer_meshes.items():
     alpha = pipe_opacity[0] if _layer_visible.get(_ln, True) else 0.0
     _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh, make_mesh_material(alpha))
 
-# Add per-layer component meshes
+# Add per-layer component meshes (hidden by default)
 for _ln, _mesh in _comp_layer_meshes.items():
-    _add_mesh(scene_widget.scene, _comp_gn(_ln), _mesh, make_mesh_material(1.0))
+    _add_mesh(scene_widget.scene, _comp_gn(_ln), _mesh, make_mesh_material(0.0))
 
 # Add frame and bbox wireframe
 scene_widget.scene.add_geometry(FRAME_GEOM, frame, make_frame_material())
+scene_widget.scene.show_geometry(FRAME_GEOM, False)
 
 line_mat            = rendering.MaterialRecord()
 line_mat.shader     = "unlitLine"
@@ -946,46 +1173,83 @@ panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Points: {len(pts):,}"))
 panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
-panel.add_fixed(int(0.5 * em))
-
-# Depth estimation info
-panel.add_child(gui.Label("--- Depth Estimation ---"))
-panel.add_fixed(int(0.3 * em))
 _pick_method = f"picked from {len(picked_indices)} point(s)" if picked_indices else "fallback P95"
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
-panel.add_fixed(int(0.15 * em))
-_est_total = _depth_stats["estimated"]
-_fb_total  = _depth_stats["fallback_feature_mean"] + _depth_stats["fallback_global"]
-est_lbl = gui.Label(f"  Est. indicative depth (in crop): {_est_total}")
-est_lbl.text_color = gui.Color(0.4, 1.0, 0.4, 1.0)
-panel.add_child(est_lbl)
-fb_lbl = gui.Label(f"  Fallback in crop (no indicative depth): {_fb_total}")
-fb_lbl.text_color = gui.Color(1.0, 0.7, 0.3, 1.0)
-panel.add_child(fb_lbl)
+panel.add_fixed(int(0.3 * em))
+
+# ── Depth Hierarchy toggle — recolours utilities by depth source ────────────
+_depth_hierarchy_active = [False]
+
+depth_toggle_cb = gui.Checkbox("Depth Hierarchy")
+depth_toggle_cb.checked = False
+
+def _dsrc_gui_color(src):
+    """sRGB depth-source colour as gui.Color (matches viewer appearance)."""
+    r, g, b = _DSRC_COLOR_SRGB[src]
+    return gui.Color(r, g, b, 1.0)
+
+_hierarchy_display = [
+    ("1. Registered Z",       _depth_stats["registered"],            _dsrc_gui_color(DepthSource.REGISTERED)),
+    ("2. vejledendeDybde",    _depth_stats["estimated"],             _dsrc_gui_color(DepthSource.VEJLEDENDE)),
+    ("3. Feature mean Z",     _depth_stats["fallback_feature_mean"], _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
+    ("4. Layer mean Z",       _depth_stats["fallback_layer_mean"],   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
+    ("5. Ground plane",       _depth_stats["fallback_global"],       _dsrc_gui_color(DepthSource.GROUND_PLANE)),
+]
+
+_depth_legend_container = gui.Vert(0)
+for _label, _count, _color in _hierarchy_display:
+    _lbl = gui.Label(f"  {_label}: {_count}")
+    _lbl.text_color = _color
+    _depth_legend_container.add_child(_lbl)
+_depth_legend_container.visible = False
+
+
+def _on_depth_toggle(checked):
+    _depth_hierarchy_active[0] = checked
+    _depth_legend_container.visible = checked
+    for ln in _pipe_layer_meshes:
+        mesh = _pipe_layer_meshes_depth[ln] if checked and ln in _pipe_layer_meshes_depth else _pipe_layer_meshes[ln]
+        alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
+        scene_widget.scene.remove_geometry(_pipe_gn(ln))
+        _add_mesh(scene_widget.scene, _pipe_gn(ln), mesh, make_mesh_material(alpha))
+    for ln in _comp_layer_meshes:
+        mesh = _comp_layer_meshes_depth[ln] if checked and ln in _comp_layer_meshes_depth else _comp_layer_meshes[ln]
+        alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
+        scene_widget.scene.remove_geometry(_comp_gn(ln))
+        _add_mesh(scene_widget.scene, _comp_gn(ln), mesh, make_mesh_material(alpha))
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+depth_toggle_cb.set_on_checked(_on_depth_toggle)
+panel.add_child(depth_toggle_cb)
+panel.add_child(_depth_legend_container)
+
+panel.add_fixed(int(0.3 * em))
+
+origin_toggle_cb = gui.Checkbox("Show origin axis")
+origin_toggle_cb.checked = False
+
+def _on_origin_toggle(checked):
+    origin_frame_visible[0] = checked
+    scene_widget.scene.show_geometry(FRAME_GEOM, checked)
+    window.post_redraw()
+
+origin_toggle_cb.set_on_checked(_on_origin_toggle)
+panel.add_child(origin_toggle_cb)
+
 panel.add_fixed(int(0.8 * em))
 
 # ── Class Label Toggle ──────────────────────────────────────────────────────
-panel.add_child(gui.Label("--- Class Labels ---"))
-panel.add_fixed(int(0.3 * em))
-
-class_toggle_cb = gui.Checkbox("Show class label colours  (L)")
+class_toggle_cb = gui.Checkbox("OpenTrench3D ID Class")
 class_toggle_cb.checked = False
 if class_colors is None:
     class_toggle_cb.enabled = False
 
-
-def _on_class_toggle(checked):
-    _toggle_class_labels(checked)
-
-class_toggle_cb.set_on_checked(_on_class_toggle)
-panel.add_child(class_toggle_cb)
-panel.add_fixed(int(0.3 * em))
-
-# Class label colour legend
+_class_legend_container = gui.Vert(0)
 if class_labels is not None:
     for cls_id in sorted(CLASS_LABELS.keys()):
         cfg = CLASS_LABELS[cls_id]
-        # Only show classes that actually appear in the data
         if cls_id not in np.unique(class_labels):
             continue
         n_pts = int((class_labels == cls_id).sum())
@@ -993,49 +1257,49 @@ if class_labels is not None:
         sr, sg, sb = (linear_to_srgb(c) for c in col)
 
         row     = gui.Horiz(int(0.3 * em))
-        swatch  = gui.Button("        ")
+        swatch  = gui.Button(" ")
         swatch.background_color = gui.Color(sr, sg, sb, 1.0)
         swatch.toggleable = False
+        swatch.vertical_padding_em = 0.0
+        swatch.horizontal_padding_em = 0.3
         row.add_child(swatch)
-        row.add_fixed(int(0.5 * em))
+        row.add_fixed(int(0.4 * em))
         row.add_child(gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"))
-        panel.add_child(row)
-        panel.add_fixed(int(0.15 * em))
+        _class_legend_container.add_child(row)
+_class_legend_container.visible = False
+
+
+def _on_class_toggle(checked):
+    _toggle_class_labels(checked)
+    _class_legend_container.visible = checked
+    window.set_needs_layout()
+
+class_toggle_cb.set_on_checked(_on_class_toggle)
+panel.add_child(class_toggle_cb)
+panel.add_child(_class_legend_container)
 
 panel.add_fixed(int(0.8 * em))
 
-# ── View options (origin axis) ──────────────────────────────────────────────
-panel.add_child(gui.Label("--- View Options ---"))
-panel.add_fixed(int(0.3 * em))
+# ── Utility Legend (with per-layer visibility toggles) ───────────────────────
+_gml_folder = Path(GML_PATH).parent.name
+_ler_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _gml_folder, re.IGNORECASE)
+_ler_label = f"{_ler_match.group(1)} {_ler_match.group(2)}" if _ler_match else _gml_folder
 
-origin_toggle_cb = gui.Checkbox("Show origin axis")
-origin_toggle_cb.checked = True
+_ler_active = [True]
+ler_toggle_cb = gui.Checkbox(_ler_label)
+ler_toggle_cb.checked = True
 
+_ler_legend_container = gui.Vert(int(0.3 * em))
 
-def _on_origin_toggle(checked):
-    origin_frame_visible[0] = checked
-    scene_widget.scene.show_geometry(FRAME_GEOM, checked)
-    window.post_redraw()
-
-
-origin_toggle_cb.set_on_checked(_on_origin_toggle)
-panel.add_child(origin_toggle_cb)
-panel.add_fixed(int(0.8 * em))
-
-# Opacity control
-panel.add_child(gui.Label("--- Transparency ---"))
-panel.add_fixed(int(0.3 * em))
-
+# Opacity slider (label + slider + value on one row)
 opacity_value_label = gui.Label("1.00")
-lbl_row = gui.Horiz(int(0.25 * em))
-lbl_row.add_child(gui.Label("Pipes + Components"))
-lbl_row.add_stretch()
-lbl_row.add_child(opacity_value_label)
-panel.add_child(lbl_row)
-
 opacity_slider = gui.Slider(gui.Slider.DOUBLE)
 opacity_slider.set_limits(0.0, 1.0)
 opacity_slider.double_value = 1.0
+
+slider_row = gui.Horiz(int(0.25 * em))
+slider_row.add_child(gui.Label("Opacity"))
+slider_row.add_child(opacity_slider)
 
 
 def _apply_opacity(val: float):
@@ -1056,26 +1320,10 @@ def _apply_opacity(val: float):
 
 
 opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
-panel.add_child(opacity_slider)
-panel.add_fixed(int(0.4 * em))
+_ler_legend_container.add_child(slider_row)
 
-panel.add_child(gui.Label("Quick set"))
-btn_row = gui.Horiz(int(0.2 * em))
-for pct in (0, 25, 50, 75, 100):
-    btn = gui.Button(f"{pct}%")
-    def _make_cb(a):
-        def _cb(): _apply_opacity(a)
-        return _cb
-    btn.set_on_clicked(_make_cb(pct / 100.0))
-    btn_row.add_child(btn)
-panel.add_child(btn_row)
-panel.add_fixed(int(0.4 * em))
-panel.add_child(gui.Label("Keys:  ]  +0.05    [  -0.05"))
-panel.add_fixed(int(1.2 * em))
-
-# ── Utility Legend (with per-layer visibility toggles) ───────────────────────
-panel.add_child(gui.Label("--- Utility Legend ---"))
-panel.add_fixed(int(0.3 * em))
+_pipe_checkboxes = []   # (layer_name, checkbox) for "toggle all" control
+_comp_checkboxes = []
 
 
 def _make_pipe_toggle(ln):
@@ -1098,6 +1346,22 @@ def _make_comp_toggle(ln):
     return _cb
 
 
+# "Toggle all segments" master checkbox
+_all_pipes_cb = gui.Checkbox("All segments")
+_all_pipes_cb.checked = True
+
+def _on_toggle_all_pipes(checked):
+    for ln, cb in _pipe_checkboxes:
+        cb.checked = checked
+        _layer_visible[ln] = checked
+        if ln in _pipe_layer_meshes:
+            alpha = pipe_opacity[0] if checked else 0.0
+            scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+    window.post_redraw()
+
+_all_pipes_cb.set_on_checked(_on_toggle_all_pipes)
+_ler_legend_container.add_child(_all_pipes_cb)
+
 # Line layers — only show legend entry if the layer produced actual geometry
 for layer_name in PIPE_LEGEND_UI_ORDER:
     if layer_name not in _pipe_layer_meshes:
@@ -1107,19 +1371,37 @@ for layer_name in PIPE_LEGEND_UI_ORDER:
     col = cfg["color"]
     sr, sg, sb = (linear_to_srgb(c) for c in col)
     row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button("   ")
+    swatch = gui.Button(" ")
     swatch.background_color = gui.Color(sr, sg, sb, 1.0)
     swatch.toggleable = False
+    swatch.vertical_padding_em = 0.0
+    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_feat})")
     cb.checked = _layer_visible.get(layer_name, True)
     cb.set_on_checked(_make_pipe_toggle(layer_name))
+    _pipe_checkboxes.append((layer_name, cb))
 
     row.add_child(swatch)
     row.add_fixed(int(0.4 * em))
     row.add_child(cb)
-    panel.add_child(row)
-    panel.add_fixed(int(0.15 * em))
+    _ler_legend_container.add_child(row)
+
+# "Toggle all components" master checkbox
+_all_comps_cb = gui.Checkbox("All components")
+_all_comps_cb.checked = False
+
+def _on_toggle_all_comps(checked):
+    for ln, cb in _comp_checkboxes:
+        cb.checked = checked
+        _layer_visible[ln] = checked
+        if ln in _comp_layer_meshes:
+            alpha = pipe_opacity[0] if checked else 0.0
+            scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
+    window.post_redraw()
+
+_all_comps_cb.set_on_checked(_on_toggle_all_comps)
+_ler_legend_container.add_child(_all_comps_cb)
 
 # Component layers — only show legend entry if the layer produced actual geometry
 for layer_name, cfg in COMPONENT_LAYERS.items():
@@ -1130,19 +1412,48 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     sr, sg, sb = (linear_to_srgb(c) for c in col)
 
     row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button("   ")
+    swatch = gui.Button(" ")
     swatch.background_color = gui.Color(sr, sg, sb, 1.0)
     swatch.toggleable = False
+    swatch.vertical_padding_em = 0.0
+    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_comp})")
-    cb.checked = True
+    cb.checked = False
+    _layer_visible[layer_name] = False
     cb.set_on_checked(_make_comp_toggle(layer_name))
+    _comp_checkboxes.append((layer_name, cb))
 
     row.add_child(swatch)
     row.add_fixed(int(0.4 * em))
     row.add_child(cb)
-    panel.add_child(row)
-    panel.add_fixed(int(0.15 * em))
+    _ler_legend_container.add_child(row)
+
+
+def _on_ler_toggle(checked):
+    _ler_active[0] = checked
+    _ler_legend_container.visible = checked
+    # Show/hide all utility geometry
+    for ln in _pipe_layer_meshes:
+        if checked:
+            # Restore per-layer visibility state
+            alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
+        else:
+            alpha = 0.0
+        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+    for ln in _comp_layer_meshes:
+        if checked:
+            alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
+        else:
+            alpha = 0.0
+        scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+ler_toggle_cb.set_on_checked(_on_ler_toggle)
+panel.add_child(ler_toggle_cb)
+panel.add_child(_ler_legend_container)
 
 panel.add_stretch()
 
@@ -1287,7 +1598,7 @@ def _do_pick(depth_image):
         return
 
     world = scene_widget.scene.camera.unproject(
-        ex, ey, depth,
+        sx, sy, depth,
         scene_widget.frame.width,
         scene_widget.frame.height,
     )
@@ -1412,15 +1723,10 @@ def on_key(event):
         return IGNORED
     k = event.key
 
-    if k == ord(']'):
-        _apply_opacity(pipe_opacity[0] + 0.05); return HANDLED
-    if k == ord('['):
-        _apply_opacity(pipe_opacity[0] - 0.05); return HANDLED
-
     if k in (ord('L'), ord('l')):
         new_state = not class_labels_active[0]
         class_toggle_cb.checked = new_state
-        _toggle_class_labels(new_state)
+        _on_class_toggle(new_state)
         return HANDLED
 
     if k in (ord('C'), ord('c')):
@@ -1442,8 +1748,6 @@ def on_key(event):
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  0              pivot to world origin (0, 0, 0)")
-        print("  ]              increase opacity +0.05")
-        print("  [              decrease opacity -0.05")
         print("  L              toggle class label colours on/off")
         print("  H              show this help")
         print("----------------------------------------------------------------\n")
@@ -1476,10 +1780,14 @@ window.add_child(scene_widget)
 window.add_child(panel)
 
 # Summary
+_t_gui1 = time.perf_counter()
 n_total_segs  = sum(s for _, s in layer_stats.values())
 n_total_comps = sum(comp_stats.values())
 print(f"\nRendering {len(pts):,} points  +  {n_total_segs:,} pipe segments  "
       f"+  {n_total_comps} component spheres")
+print(f"  [timer] GUI setup: {_t_gui1 - _t_gui0:.3f}s")
+_t_total = _t_gui1 - _t_script_start
+print(f"  [timer] Total startup (incl. ground picking): {_t_total:.2f}s")
 print("Launching viewer ...\n")
 
 app.run()
