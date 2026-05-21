@@ -1,6 +1,11 @@
 # ── Data files (large / binary) ──────────────────────────────────
 Data/
 Developing/Ouput/
+Testing/
+Developing/QML_Distributor/
+Developing/PLY_to_LAS/
+Developing/DBScan/
+Developing/HDBScan/
 
 # ── Common data formats ─────────────────────────────────────────
 *.ply

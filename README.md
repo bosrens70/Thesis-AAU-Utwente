@@ -15,7 +15,11 @@ Thesis/
 │   ├── 3. Label Viewer/    # Instance labeling tool for assigning utility types
 │   ├── 4. Linking Viewer/  # (in development)
 │   ├── 5. Deviation Viewer/# (in development)
-├── Testing/                # Earlier prototypes and experiments
+│   ├── DBScan/             # DBSCAN clustering experiments (git-ignored)
+│   ├── HDBScan/            # HDBSCAN clustering experiments (git-ignored)
+│   ├── PLY_to_LAS/         # Format conversion utilities (git-ignored)
+│   └── QML_Distributor/    # QGIS style distribution (git-ignored)
+├── Testing/                # Earlier prototypes and experiments (git-ignored)
 └── .gitignore
 ```
 
