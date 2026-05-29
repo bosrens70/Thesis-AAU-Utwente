@@ -62,15 +62,21 @@ CROP_RADIUS = 2.0
 # ─────────────────────────────────────────────────────────────────────────────
 # DEVIATION HEATMAP
 # ─────────────────────────────────────────────────────────────────────────────
-DEVIATION_THRESHOLDS = [0.00, 0.01, 0.02, 0.05, 0.10, 0.20, 0.50]
+# LER accuracy classes (DS/EN 17609:2022)
+DEVIATION_THRESHOLDS = [0.00, 0.25, 0.50, 1.00, 2.00]
 DEVIATION_COLORS = [
-    [0.0, 0.4, 0.8],   # 0.00 m  -blue (on-segment)
-    [0.0, 0.8, 0.2],   # 0.01 m  -green
-    [0.6, 0.9, 0.0],   # 0.02 m  -yellow-green
-    [1.0, 0.8, 0.0],   # 0.05 m  -yellow
-    [1.0, 0.5, 0.0],   # 0.10 m  -orange
-    [1.0, 0.2, 0.0],   # 0.20 m  -red-orange
-    [0.8, 0.0, 0.0],   # 0.50 m  -red (far)
+    [0.0, 0.7, 0.2],   # Class 1: <= 0.25 m  - green
+    [0.6, 0.9, 0.0],   # Class 2: <= 0.50 m  - yellow-green
+    [1.0, 0.8, 0.0],   # Class 3: <= 1.00 m  - yellow
+    [1.0, 0.4, 0.0],   # Class 4: <= 2.00 m  - orange
+    [0.8, 0.0, 0.0],   # Class 5: >  2.00 m  - red
+]
+DEVIATION_CLASS_LABELS = [
+    "Class 1:  ≤ 250 mm",
+    "Class 2:  ≤ 500 mm",
+    "Class 3:  ≤ 1000 mm",
+    "Class 4:  ≤ 2000 mm",
+    "Class 5:  > 2000 mm",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,6 +141,22 @@ def _forsyningsart_color(fa_value, fallback):
         if keyword in fa_lower:
             return color
     return fallback
+
+
+# Mapping: instance utility_type ID -> matching LER layer names
+# Also includes keywords to match Ledningstrace sub-groups (by forsyningsart)
+UTILITY_TO_LER_MATCH = {
+    1:  {"layers": ["Elledning"],                   "trace_kw": ["el"]},
+    2:  {"layers": ["Afloebsledning"],              "trace_kw": ["afloeb", "spilde"]},
+    3:  {"layers": [],                              "trace_kw": ["olie"]},
+    4:  {"layers": ["Gasledning"],                  "trace_kw": ["gas"]},
+    5:  {"layers": [],                              "trace_kw": ["varme", "fjern"]},
+    6:  {"layers": ["Foeringsroer"],                "trace_kw": []},
+    7:  {"layers": ["Vandledning"],                 "trace_kw": ["vand"]},
+    8:  {"layers": ["Telekommunikationsledning"],   "trace_kw": ["tele", "kommu"]},
+    9:  {"layers": [],                              "trace_kw": []},
+    10: {"layers": ["LedningUkendtForsyningsart"],  "trace_kw": []},
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PLY READER (ASCII + binary, with utility_type)
@@ -352,14 +374,32 @@ _t_ler0 = time.perf_counter()
 all_seg_p1 = []
 all_seg_p2 = []
 all_seg_layer = []
-ler_meshes = {}   # layer -> merged TriangleMesh (for visualisation)
-ler_stats = {}
+all_seg_active = []       # True = "i drift", False = "permanent ude af drift"
+ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
+ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
 
 def _in_crop_utm(coords):
+    """Conservative check: any part of the polyline within the circular crop (UTM).
+    First checks whether any vertex is inside the circle.
+    Falls back to an AABB overlap test to catch segments that cross the disc
+    but have no vertex inside it — the segment clipper makes the final call.
+    """
     dx = coords[:, 0] - _cx_utm
     dy = coords[:, 1] - _cy_utm
-    return (dx * dx + dy * dy <= _crop_r2).any()
+    if (dx * dx + dy * dy <= _crop_r2).any():
+        return True
+    # AABB fallback
+    xs, ys = coords[:, 0], coords[:, 1]
+    if xs.max() < _cx_utm - CROP_RADIUS:
+        return False
+    if xs.min() > _cx_utm + CROP_RADIUS:
+        return False
+    if ys.max() < _cy_utm - CROP_RADIUS:
+        return False
+    if ys.min() > _cy_utm + CROP_RADIUS:
+        return False
+    return True
 
 
 def _to_local(coords_utm, vejl_dybde_mm=None):
@@ -488,11 +528,13 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
     default_color = cfg["color"]
     fallback_r = cfg["fallback_radius"]
     is_trace = (layer_name == "Ledningstrace")
+    has_driftsstatus = "driftsstatus" in gdf.columns
 
     # For Ledningstrace: accumulate per-forsyningsart sub-layers
     _trace_sub_cyls = {}   # display_name -> [meshes]
-    _trace_sub_stats = {}  # display_name -> [n_feat, n_seg]
-    n_feat, n_seg = 0, 0
+    _trace_sub_stats = {}  # display_name -> [n_feat_act, n_seg_act, n_feat_inact, n_seg_inact]
+    n_feat_act, n_seg_act = 0, 0
+    n_feat_inact, n_seg_inact = 0, 0
     layer_cyls = []
 
     for _, row in gdf.iterrows():
@@ -500,6 +542,13 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
         if geom is None:
             continue
         subs = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
+
+        # Determine active / inactive
+        is_active = True
+        if has_driftsstatus:
+            ds = str(row.get("driftsstatus", "") or "").strip().lower()
+            if "ude af drift" in ds:
+                is_active = False
 
         diam_mm = 0.0
         if "udvendigDiameter" in row.index:
@@ -553,6 +602,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_p1.append(cp1)
                 all_seg_p2.append(cp2)
                 all_seg_layer.append(display_name)
+                all_seg_active.append(is_active)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
@@ -562,49 +612,117 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                         _trace_sub_cyls.setdefault(display_name, []).append(mesh)
                     else:
                         layer_cyls.append(mesh)
-                n_seg += 1
+                if is_active:
+                    n_seg_act += 1
+                else:
+                    n_seg_inact += 1
         if hit:
-            n_feat += 1
+            if is_active:
+                n_feat_act += 1
+            else:
+                n_feat_inact += 1
             if is_trace:
-                _trace_sub_stats.setdefault(display_name, [0, 0])
-                _trace_sub_stats[display_name][0] += 1
+                _trace_sub_stats.setdefault(display_name, [0, 0, 0, 0])
+                if is_active:
+                    _trace_sub_stats[display_name][0] += 1
+                else:
+                    _trace_sub_stats[display_name][2] += 1
 
     if is_trace:
-        # Store each forsyningsart sub-group as its own entry
         for dname, cyls in _trace_sub_cyls.items():
-            sub_nf = _trace_sub_stats.get(dname, [0, 0])[0]
-            sub_ns = len(cyls)
-            ler_stats[dname] = (sub_nf, sub_ns)
+            sub_stats = _trace_sub_stats.get(dname, [0, 0, 0, 0])
+            sub_stats[1] = len([c for c in cyls])  # total segments
+            ler_stats[dname] = tuple(sub_stats)
+
             m = cyls[0]
             for c in cyls[1:]:
                 m += c
             m.compute_vertex_normals()
             ler_meshes[dname] = m
-            # Store colour for legend
+
             fa_val = dname.split("(")[-1].rstrip(")").strip() if "(" in dname else ""
             LINE_LAYERS[dname] = {"color": _forsyningsart_color(fa_val, default_color),
                                   "fallback_radius": fallback_r}
-            print(f"  {dname:<35} {sub_nf:>4} features  {sub_ns:>5} segments")
+            parts = []
+            if sub_stats[0] > 0:
+                parts.append(f"{sub_stats[0]} active")
+            if sub_stats[2] > 0:
+                parts.append(f"{sub_stats[2]} inactive")
+            print(f"  {dname:<35} {', '.join(parts):>20}  "
+                  f"{len(cyls):>5} segments")
     else:
-        ler_stats[layer_name] = (n_feat, n_seg)
+        ler_stats[layer_name] = (n_feat_act, n_seg_act, n_feat_inact, n_seg_inact)
         if layer_cyls:
             m = layer_cyls[0]
             for c in layer_cyls[1:]:
                 m += c
             m.compute_vertex_normals()
             ler_meshes[layer_name] = m
-        if n_feat > 0:
-            print(f"  {layer_name:<35} {n_feat:>4} features  {n_seg:>5} segments")
+        if n_feat_act + n_feat_inact > 0:
+            parts = []
+            if n_feat_act > 0:
+                parts.append(f"{n_feat_act} active")
+            if n_feat_inact > 0:
+                parts.append(f"{n_feat_inact} inactive")
+            print(f"  {layer_name:<35} {', '.join(parts):>20}  "
+                  f"{n_seg_act + n_seg_inact:>5} segments")
 
 seg_p1 = np.array(all_seg_p1) if all_seg_p1 else np.empty((0, 3))
 seg_p2 = np.array(all_seg_p2) if all_seg_p2 else np.empty((0, 3))
+seg_active = np.array(all_seg_active, dtype=bool) if all_seg_active else np.empty(0, dtype=bool)
 n_total_segs = len(seg_p1)
+n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
+n_inactive_segs = n_total_segs - n_active_segs
 
 _t_ler1 = time.perf_counter()
-print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1f}s")
+print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1f}s"
+      f"  ({n_active_segs} active, {n_inactive_segs} inactive)")
 
 if n_total_segs == 0:
     print("[WARNING] No LER segments found -deviations will be infinite.")
+
+
+def _get_matching_segment_mask(utility_type, active_only=None):
+    """Return a boolean mask over seg_p1/seg_p2 for segments matching this utility type.
+
+    active_only: None = both, True = only active, False = only inactive.
+    """
+    match = UTILITY_TO_LER_MATCH.get(utility_type)
+    if match is None:
+        mask = np.ones(len(seg_p1), dtype=bool)
+    else:
+        mask = np.zeros(len(seg_p1), dtype=bool)
+        for i, layer_name in enumerate(all_seg_layer):
+            if layer_name in match["layers"]:
+                mask[i] = True
+            elif layer_name.startswith("Ledningstrace") and match["trace_kw"]:
+                layer_lower = layer_name.lower()
+                if any(kw in layer_lower for kw in match["trace_kw"]):
+                    mask[i] = True
+
+    # Filter by driftsstatus
+    if active_only is True:
+        mask &= seg_active
+    elif active_only is False:
+        mask &= ~seg_active
+    return mask
+
+
+def _get_matching_ler_names(utility_type):
+    """Return set of LER layer display names that match the given utility type."""
+    match = UTILITY_TO_LER_MATCH.get(utility_type)
+    if match is None:
+        return set()
+    names = set()
+    for layer_name in ler_meshes:
+        if layer_name in match["layers"]:
+            names.add(layer_name)
+        elif layer_name.startswith("Ledningstrace") and match["trace_kw"]:
+            layer_lower = layer_name.lower()
+            if any(kw in layer_lower for kw in match["trace_kw"]):
+                names.add(layer_name)
+    return names
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Load instances + compute deviations against LER segments
@@ -642,23 +760,57 @@ for inst_path in _inst_files:
         utility_type = utility_type_from_filename(inst_path.name)
     ut_label = UTILITY_TYPE_LABELS.get(utility_type, f"Unknown({utility_type})")
 
-    # Compute minimum distance from each instance point to nearest LER segment
-    dists = batch_point_to_segments(pts_inst, seg_p1, seg_p2)
+    # Compute distances: all matching segments (active + inactive combined for heatmap)
+    seg_mask_all = _get_matching_segment_mask(utility_type)
+    seg_mask_act = _get_matching_segment_mask(utility_type, active_only=True)
+    seg_mask_inact = _get_matching_segment_mask(utility_type, active_only=False)
+    n_act = int(seg_mask_act.sum())
+    n_inact = int(seg_mask_inact.sum())
+    n_matched = n_act + n_inact
+    has_ler = n_matched > 0
 
-    stats = {
-        "mean": float(np.mean(dists)),
-        "median": float(np.median(dists)),
-        "std": float(np.std(dists)),
-        "p95": float(np.percentile(dists, 95)),
-        "max": float(np.max(dists)),
-        "min": float(np.min(dists)),
-        "n_pts": len(pts_inst),
-    }
+    def _make_stats(d):
+        return {
+            "mean": float(np.mean(d)), "median": float(np.median(d)),
+            "std": float(np.std(d)), "p95": float(np.percentile(d, 95)),
+            "max": float(np.max(d)), "min": float(np.min(d)),
+            "n_pts": len(d),
+        }
 
-    # Deviation heatmap point cloud
+    _nan_stats = {"mean": np.nan, "median": np.nan, "std": np.nan,
+                  "p95": np.nan, "max": np.nan, "min": np.nan, "n_pts": len(pts_inst)}
+
+    # Combined (active + inactive) for heatmap colouring
+    if has_ler:
+        dists = batch_point_to_segments(pts_inst, seg_p1[seg_mask_all], seg_p2[seg_mask_all])
+        stats = _make_stats(dists)
+    else:
+        dists = np.full(len(pts_inst), np.nan)
+        stats = dict(_nan_stats)
+
+    # Separate stats for active / inactive
+    if n_act > 0:
+        dists_act = batch_point_to_segments(pts_inst, seg_p1[seg_mask_act], seg_p2[seg_mask_act])
+        stats_act = _make_stats(dists_act)
+    else:
+        dists_act = None
+        stats_act = dict(_nan_stats)
+
+    if n_inact > 0:
+        dists_inact = batch_point_to_segments(pts_inst, seg_p1[seg_mask_inact], seg_p2[seg_mask_inact])
+        stats_inact = _make_stats(dists_inact)
+    else:
+        dists_inact = None
+        stats_inact = dict(_nan_stats)
+
+    # Deviation heatmap point cloud (grey if no matching LER)
     pcd_dev = o3d.geometry.PointCloud()
     pcd_dev.points = o3d.utility.Vector3dVector(pts_inst)
-    pcd_dev.colors = o3d.utility.Vector3dVector(deviation_to_color(dists))
+    if has_ler:
+        pcd_dev.colors = o3d.utility.Vector3dVector(deviation_to_color(dists))
+    else:
+        pcd_dev.colors = o3d.utility.Vector3dVector(
+            np.tile([0.5, 0.5, 0.5], (len(pts_inst), 1)))
 
     # Original RGB point cloud
     pcd_rgb = o3d.geometry.PointCloud()
@@ -678,21 +830,33 @@ for inst_path in _inst_files:
         "name": inst_path.stem,
         "utility_type": utility_type,
         "label": ut_label,
+        "has_ler": has_ler,
+        "n_active_segs": n_act,
+        "n_inactive_segs": n_inact,
         "pcd_dev": pcd_dev,
         "pcd_rgb": pcd_rgb,
         "pcd_class": pcd_class,
         "distances": dists,
         "stats": stats,
+        "stats_active": stats_act,
+        "stats_inactive": stats_inact,
     }
     class_instances.setdefault(utility_type, []).append(inst_data)
 
     _ti1 = time.perf_counter()
-    print(f"  {inst_path.stem}: {len(pts_inst):,} pts  "
-          f"type={ut_label}  "
-          f"mean={stats['mean']*1000:.1f}mm  "
-          f"P95={stats['p95']*1000:.1f}mm  "
-          f"max={stats['max']*1000:.1f}mm  "
-          f"[{_ti1 - _ti0:.2f}s]")
+    if has_ler:
+        tag = f"active={n_act} inactive={n_inact}"
+        print(f"  {inst_path.stem}: {len(pts_inst):,} pts  "
+              f"type={ut_label}  "
+              f"LER({tag})  "
+              f"mean={stats['mean']*1000:.1f}mm  "
+              f"P95={stats['p95']*1000:.1f}mm  "
+              f"max={stats['max']*1000:.1f}mm  "
+              f"[{_ti1 - _ti0:.2f}s]")
+    else:
+        print(f"  {inst_path.stem}: {len(pts_inst):,} pts  "
+              f"type={ut_label}  "
+              f"** No matching LER utility **  [{_ti1 - _ti0:.2f}s]")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Per-class summary
@@ -704,25 +868,78 @@ print("=" * 72)
 class_summaries = {}
 for ut, instances in sorted(class_instances.items()):
     label = UTILITY_TYPE_LABELS.get(ut, f"Unknown({ut})")
-    all_dists = np.concatenate([inst["distances"] for inst in instances])
+    has_ler = any(inst["has_ler"] for inst in instances)
     total_pts = sum(inst["stats"]["n_pts"] for inst in instances)
+    total_act = sum(inst["n_active_segs"] for inst in instances)
+    total_inact = sum(inst["n_inactive_segs"] for inst in instances)
 
-    summary = {
-        "label": label, "n_instances": len(instances), "n_points": total_pts,
-        "mean": float(np.mean(all_dists)), "median": float(np.median(all_dists)),
-        "std": float(np.std(all_dists)), "p95": float(np.percentile(all_dists, 95)),
-        "max": float(np.max(all_dists)),
-    }
+    def _agg_stats(key):
+        """Aggregate per-instance stats arrays for a given stats key ('stats_active' or 'stats_inactive')."""
+        # We need the raw distances, but we only stored summary stats per split.
+        # Use the combined distances and filter isn't possible here,
+        # so we report from the per-instance stats (weighted is close enough for display).
+        vals = [inst[key] for inst in instances
+                if not np.isnan(inst[key].get("mean", np.nan))]
+        if not vals:
+            return None
+        # Re-aggregate from per-instance stats (approximate but representative)
+        all_n = sum(v["n_pts"] for v in vals)
+        w_mean = sum(v["mean"] * v["n_pts"] for v in vals) / all_n if all_n else np.nan
+        return {
+            "mean": w_mean,
+            "p95": max(v["p95"] for v in vals),
+            "max": max(v["max"] for v in vals),
+        }
+
+    if has_ler:
+        matched_dists = np.concatenate([
+            inst["distances"] for inst in instances if inst["has_ler"]])
+        summary = {
+            "label": label, "n_instances": len(instances), "n_points": total_pts,
+            "has_ler": True,
+            "n_active_segs": total_act, "n_inactive_segs": total_inact,
+            "mean": float(np.mean(matched_dists)),
+            "median": float(np.median(matched_dists)),
+            "std": float(np.std(matched_dists)),
+            "p95": float(np.percentile(matched_dists, 95)),
+            "max": float(np.max(matched_dists)),
+            "active_agg": _agg_stats("stats_active"),
+            "inactive_agg": _agg_stats("stats_inactive"),
+        }
+    else:
+        summary = {
+            "label": label, "n_instances": len(instances), "n_points": total_pts,
+            "has_ler": False,
+            "n_active_segs": 0, "n_inactive_segs": 0,
+            "mean": np.nan, "median": np.nan, "std": np.nan,
+            "p95": np.nan, "max": np.nan,
+            "active_agg": None, "inactive_agg": None,
+        }
     class_summaries[ut] = summary
 
     print(f"\n  {label} (type {ut})")
     print(f"    Instances:  {len(instances)}")
     print(f"    Points:     {total_pts:,}")
-    print(f"    Mean:       {summary['mean']*1000:>8.2f} mm")
-    print(f"    Median:     {summary['median']*1000:>8.2f} mm")
-    print(f"    Std dev:    {summary['std']*1000:>8.2f} mm")
-    print(f"    P95:        {summary['p95']*1000:>8.2f} mm")
-    print(f"    Max:        {summary['max']*1000:>8.2f} mm")
+    print(f"    LER segs:   {total_act} active, {total_inact} inactive")
+    if has_ler:
+        print(f"    ── Combined (all matching LER) ──")
+        print(f"    Mean:       {summary['mean']*1000:>8.2f} mm")
+        print(f"    Median:     {summary['median']*1000:>8.2f} mm")
+        print(f"    Std dev:    {summary['std']*1000:>8.2f} mm")
+        print(f"    P95:        {summary['p95']*1000:>8.2f} mm")
+        print(f"    Max:        {summary['max']*1000:>8.2f} mm")
+        if summary["active_agg"]:
+            a = summary["active_agg"]
+            print(f"    ── Active LER only ──")
+            print(f"    Mean:       {a['mean']*1000:>8.2f} mm   "
+                  f"P95: {a['p95']*1000:.2f} mm   Max: {a['max']*1000:.2f} mm")
+        if summary["inactive_agg"]:
+            ia = summary["inactive_agg"]
+            print(f"    ── Inactive LER only ──")
+            print(f"    Mean:       {ia['mean']*1000:>8.2f} mm   "
+                  f"P95: {ia['p95']*1000:.2f} mm   Max: {ia['max']*1000:.2f} mm")
+    else:
+        print(f"    ** No matching LER utility — deviation not computed **")
 
 print("\n" + "=" * 72)
 
@@ -837,7 +1054,7 @@ panel.add_child(gui.Label(f"Original: {len(pts_orig):,} pts"))
 total_inst = sum(inst["stats"]["n_pts"] for v in class_instances.values() for inst in v)
 n_inst = sum(len(v) for v in class_instances.values())
 panel.add_child(gui.Label(f"Instances: {n_inst} ({total_inst:,} pts)"))
-panel.add_child(gui.Label(f"LER segments: {n_total_segs:,}"))
+panel.add_child(gui.Label(f"LER segments: {n_total_segs:,} ({n_active_segs}a, {n_inactive_segs}i)"))
 panel.add_fixed(int(0.5 * em))
 
 # Colour mode
@@ -848,8 +1065,8 @@ for n in _MODE_NAMES:
 combo.selected_index = 0
 
 _heatmap_legend = gui.Vert(0)
-_heatmap_legend.add_child(gui.Label("Deviation (mm):"))
-for i, (th, col) in enumerate(zip(DEVIATION_THRESHOLDS, DEVIATION_COLORS)):
+_heatmap_legend.add_child(gui.Label("LER Accuracy Class:"))
+for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
     sr, sg, sb = (linear_to_srgb(c) for c in col)
     row = gui.Horiz(int(0.3 * em))
     sw = gui.Button(" ")
@@ -857,10 +1074,9 @@ for i, (th, col) in enumerate(zip(DEVIATION_THRESHOLDS, DEVIATION_COLORS)):
     sw.toggleable = False
     sw.vertical_padding_em = 0.0
     sw.horizontal_padding_em = 0.3
-    txt = f"{th*1000:.0f} - {DEVIATION_THRESHOLDS[i+1]*1000:.0f}" if i < len(DEVIATION_THRESHOLDS) - 1 else f">= {th*1000:.0f}"
     row.add_child(sw)
     row.add_fixed(int(0.4 * em))
-    row.add_child(gui.Label(txt))
+    row.add_child(gui.Label(lbl))
     _heatmap_legend.add_child(row)
 
 
@@ -880,6 +1096,62 @@ orig_cb = gui.Checkbox("Original cloud")
 orig_cb.checked = True
 orig_cb.set_on_checked(lambda c: (scene_widget.scene.show_geometry(ORIG_GEOM, c), window.post_redraw()))
 panel.add_child(orig_cb)
+
+# ── Utility filter (per-class view) ──
+panel.add_fixed(int(0.5 * em))
+panel.add_child(gui.Label("Utility filter:"))
+
+# Build filter entries: (label, utility_type or None for "all")
+_filter_entries = [("All utilities", None)]
+for _fut in sorted(class_summaries.keys()):
+    _fs = class_summaries[_fut]
+    _ler_names = _get_matching_ler_names(_fut)
+    if _ler_names:
+        _ler_short = ", ".join(sorted(_ler_names))
+        _filter_entries.append((f"{_fs['label']}  ↔  {_ler_short}", _fut))
+    else:
+        _filter_entries.append((f"{_fs['label']}  (no LER)", _fut))
+
+_active_filter = [None]   # None = show all
+
+filter_combo = gui.Combobox()
+for _flbl, _ in _filter_entries:
+    filter_combo.add_item(_flbl)
+filter_combo.selected_index = 0
+
+
+def _apply_utility_filter(filter_ut):
+    """Show/hide instances and LER layers to isolate one utility pair."""
+    _active_filter[0] = filter_ut
+    matching_ler = _get_matching_ler_names(filter_ut) if filter_ut is not None else None
+
+    # Instances: show only the selected utility type (or all)
+    for ut, instances in class_instances.items():
+        vis = (filter_ut is None or ut == filter_ut)
+        _class_visible[ut] = vis
+        for i, inst in enumerate(instances):
+            gn = f"inst_{ut}_{i}"
+            scene_widget.scene.show_geometry(gn, vis)
+
+    # LER layers: show only those matching the selected utility (or all)
+    for ln in ler_meshes:
+        if filter_ut is None:
+            vis = True
+        else:
+            vis = ln in matching_ler if matching_ler else False
+        _ler_visible[ln] = vis
+        scene_widget.scene.show_geometry(f"ler_{ln}", vis)
+
+    window.post_redraw()
+
+
+def _on_filter(val, idx):
+    _, filter_ut = _filter_entries[idx]
+    _apply_utility_filter(filter_ut)
+
+
+filter_combo.set_on_selection_changed(_on_filter)
+panel.add_child(filter_combo)
 
 # LER opacity slider
 panel.add_fixed(int(0.3 * em))
@@ -912,7 +1184,17 @@ for ln in LINE_LAYERS:
         continue
     col = LINE_LAYERS[ln]["color"]
     sr, sg, sb = (linear_to_srgb(c) for c in col)
-    nf, ns = ler_stats.get(ln, (0, 0))
+    st = ler_stats.get(ln, (0, 0, 0, 0))
+    nf_act = st[0]
+    nf_inact = st[2] if len(st) > 2 else 0
+
+    # Build label: e.g. "Gasledning (2a, 1i)"
+    parts = []
+    if nf_act > 0:
+        parts.append(f"{nf_act}a")
+    if nf_inact > 0:
+        parts.append(f"{nf_inact}i")
+    count_str = ", ".join(parts) if parts else "0"
 
     row = gui.Horiz(int(0.3 * em))
     sw = gui.Button(" ")
@@ -924,12 +1206,11 @@ for ln in LINE_LAYERS:
     def _make_ler_cb(layer):
         def _cb(checked):
             _ler_visible[layer] = checked
-            alpha = _ler_opacity[0] if checked else 0.0
-            scene_widget.scene.modify_geometry_material(f"ler_{layer}", make_mesh_mat(alpha))
+            scene_widget.scene.show_geometry(f"ler_{layer}", checked)
             window.post_redraw()
         return _cb
 
-    cb = gui.Checkbox(f"{ln} ({nf})")
+    cb = gui.Checkbox(f"{ln} ({count_str})")
     cb.checked = True
     cb.set_on_checked(_make_ler_cb(ln))
     row.add_child(sw)
@@ -972,10 +1253,21 @@ for ut in sorted(class_summaries.keys()):
     panel.add_child(row)
 
     stat_box = gui.Vert(0, gui.Margins(int(2.5 * em), 0, 0, 0))
-    stat_box.add_child(gui.Label(
-        f"{s['n_points']:,} pts  |  mean {s['mean']*1000:.1f}  |  P95 {s['p95']*1000:.1f} mm"))
-    stat_box.add_child(gui.Label(
-        f"median {s['median']*1000:.1f}  |  max {s['max']*1000:.1f}  |  std {s['std']*1000:.1f} mm"))
+    n_a = s.get("n_active_segs", 0)
+    n_i = s.get("n_inactive_segs", 0)
+    if s.get("has_ler", True):
+        stat_box.add_child(gui.Label(
+            f"{s['n_points']:,} pts  |  LER: {n_a}a {n_i}i"))
+        stat_box.add_child(gui.Label(
+            f"mean {s['mean']*1000:.1f}  |  P95 {s['p95']*1000:.1f}  |  max {s['max']*1000:.1f} mm"))
+        if s.get("active_agg") and s.get("inactive_agg"):
+            a = s["active_agg"]
+            ia = s["inactive_agg"]
+            stat_box.add_child(gui.Label(
+                f"active mean {a['mean']*1000:.0f}  |  inactive mean {ia['mean']*1000:.0f} mm"))
+    else:
+        stat_box.add_child(gui.Label(f"{s['n_points']:,} pts"))
+        stat_box.add_child(gui.Label("No matching LER utility"))
     panel.add_child(stat_box)
     panel.add_fixed(int(0.3 * em))
 
