@@ -35,13 +35,48 @@ from core.config import (
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
+    DepthSource, DepthConfig, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
 )
+from core.gui_helpers import make_legend_row
+from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear
 
 # Buffer (metres) around the Graveforesp polygon
 BUFFER = 2.0
 
+# ── Ground-plane fit settings ────────────────────────────────────────────────
+# The ground level is a single best-fit plane through the top surface of all
+# point clouds. We sample that top surface by binning points into XY cells and
+# taking a high percentile of Z per cell (top of trench = street surface),
+# then fit z = a*x + b*y + c to those samples.
+GROUND_CELL_M  = 2.0    # XY cell size (m) for top-surface sampling
+GROUND_PCTILE  = 95.0   # Z percentile per cell (top surface)
+GROUND_TRENCH_CLASS = 2  # class id whose top is the street surface ("Trench")
+
 # Alias for backward compat
 _DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
+
+
+def _cell_top_samples(pts, cell=GROUND_CELL_M, pctile=GROUND_PCTILE):
+    """
+    Bin points into XY cells of size `cell` and return one top-surface sample
+    per populated cell.
+
+    Returns an (M, 3) array of (cell_center_x, cell_center_y, pctile-Z). Using
+    a per-cell percentile (rather than every point) means the plane is fit to
+    the upper surface of the cloud, not its full thickness.
+    """
+    pts = np.asarray(pts, dtype=float)
+    if len(pts) == 0:
+        return np.empty((0, 3), dtype=float)
+    cells = np.floor(pts[:, :2] / cell).astype(np.int64)
+    uniq, inv = np.unique(cells, axis=0, return_inverse=True)
+    samples = np.empty((len(uniq), 3), dtype=float)
+    for k in range(len(uniq)):
+        zc = pts[inv == k, 2]
+        samples[k, 0] = (uniq[k, 0] + 0.5) * cell
+        samples[k, 1] = (uniq[k, 1] + 0.5) * cell
+        samples[k, 2] = np.percentile(zc, pctile)
+    return samples
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG VALIDATION
@@ -221,12 +256,14 @@ if not all_ply_files:
 print(f"\nSubsampled load (every {SUBSAMPLE_EVERY}th point) + crop for {len(all_ply_files)} sites ...")
 all_pcd_filtered = []
 all_class_labels = []
+site_names       = []   # PLY stem per kept site (parallel to all_pcd_filtered)
 total_pts_raw    = 0
 total_pts_read   = 0
 total_pts_filt   = 0
 
-# Per-site ground Z: list of (centroid_x_local, centroid_y_local, ground_z_local)
-_site_ground = []
+# Top-surface samples (one (x, y, z) per populated XY cell, across all clouds)
+# used to fit a single best-fit ground plane below.
+_ground_samples = []
 
 print(f"\n{'Site':>30}  {'Total':>10}  {'Read':>10}  {'In poly':>10}  {'Time':>6}")
 print("-" * 76)
@@ -276,6 +313,7 @@ for ply_path in all_ply_files:
     if rgb is not None:
         pcd_filt.colors = o3d.utility.Vector3dVector(rgb[final_mask].astype(float) / 255.0)
     all_pcd_filtered.append(pcd_filt)
+    site_names.append(ply_path.stem)
 
     # ── Class labels come for free from the subsampled read ───────────
     if cls is not None:
@@ -283,19 +321,16 @@ for ply_path in all_ply_files:
     else:
         all_class_labels.append(None)
 
-    # ── Per-site ground Z from class-2 ("Trench") P95 ───────────────
+    # ── Collect top-surface samples for the ground-plane fit ─────────
+    # Prefer class-2 ("Trench") points — the top of the trench is the
+    # street surface. Fall back to all points if the class is absent.
     _site_pts = xyz[final_mask]
-    _site_cx  = float(_site_pts[:, 0].mean())
-    _site_cy  = float(_site_pts[:, 1].mean())
     if cls is not None:
-        _trench_mask = cls[final_mask] == 2
-        if _trench_mask.sum() > 0:
-            _site_gz = float(np.percentile(_site_pts[_trench_mask, 2], 95))
-        else:
-            _site_gz = float(np.percentile(_site_pts[:, 2], 95))
+        _trench_mask = cls[final_mask] == GROUND_TRENCH_CLASS
+        _top_src = _site_pts[_trench_mask] if _trench_mask.sum() > 0 else _site_pts
     else:
-        _site_gz = float(np.percentile(_site_pts[:, 2], 95))
-    _site_ground.append((_site_cx, _site_cy, _site_gz))
+        _top_src = _site_pts
+    _ground_samples.append(_cell_top_samples(_top_src))
 
     _dt = time.perf_counter() - _t_ply
     print(f"  {ply_path.stem:>28}  {n_total:>10,}  {n_read:>10,}  {n_filt:>10,}  {_dt:.2f}s")
@@ -349,35 +384,116 @@ PC_Z_MIN = float(all_pts[:, 2].min())
 PC_Z_MAX = float(all_pts[:, 2].max())
 print(f"  Point cloud Z range: [{PC_Z_MIN:.2f}, {PC_Z_MAX:.2f}]")
 
+# Per-point → site mapping (same order as merged_pcd) + per-site point counts,
+# so a clicked point can be traced back to its source PLY (site).
+_site_point_counts = [len(np.asarray(p.points)) for p in all_pcd_filtered]
+_site_index_per_point = np.concatenate([
+    np.full(_site_point_counts[i], i, dtype=np.int32)
+    for i in range(len(all_pcd_filtered))
+]) if all_pcd_filtered else np.empty(0, dtype=np.int32)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Per-site ground level from class-2 ("Trench") P95
+# 3.  Ground level = locally-adaptive surface following the road
 # ─────────────────────────────────────────────────────────────────────────────
-# Each site gets its own ground Z from the P95 of its class-2 ("Trench")
-# points — the top of the trench where it meets the street surface.
-# Utilities look up the nearest site's ground Z for depth placement.
-# A global GROUND_Z (median of per-site values) is kept for the
-# Graveforesp surface mesh and as a final fallback.
+# A single plane cannot follow a long road with real elevation change: some
+# clouds end up well above/below it. Instead we keep the per-cell top-surface
+# samples and look up ground Z by inverse-distance weighting (IDW) over the
+# nearest samples, so the ground hugs the local road height. A global best-fit
+# plane is kept only as a smooth fallback for query points with no nearby
+# samples (and a scalar GROUND_Z as a last resort / label value).
 
-_site_ground_arr = np.array(_site_ground)  # (N, 3): cx, cy, gz
-_n_sites = len(_site_ground_arr)
+_GROUND_IDW_K     = 8       # nearest top-surface samples to blend
+_GROUND_IDW_POWER = 2.0     # IDW exponent (higher = more local)
 
-GROUND_Z = float(np.median(_site_ground_arr[:, 2]))
-_pick_method_tag = f"per-site auto ({_n_sites} sites, median)"
+_ground_samples = [s for s in _ground_samples if len(s)]
+_ground_pts = np.vstack(_ground_samples) if _ground_samples else np.empty((0, 3))
 
-print(f"\n  Per-site ground Z ({_n_sites} sites):")
-for i, (sx, sy, sgz) in enumerate(_site_ground):
-    print(f"    Site {i+1:>2}: centroid=({sx:.1f}, {sy:.1f})  ground_Z={sgz:.3f} m")
-print(f"  Global ground Z (median of sites) = {GROUND_Z:.3f} m")
+# Global plane (fallback + diagnostics)
+GROUND_PLANE, _plane_inliers = fit_plane_z(_ground_pts)
+
+# KD-tree over sample XY for fast local lookup
+_ground_xy = _ground_pts[:, :2].copy() if len(_ground_pts) else None
+_ground_z  = _ground_pts[:, 2].copy() if len(_ground_pts) else None
+_ground_tree = None
+if _ground_xy is not None and len(_ground_xy) >= 1:
+    try:
+        from scipy.spatial import cKDTree
+        _ground_tree = cKDTree(_ground_xy)
+    except Exception as _e:
+        print(f"  [warn] scipy KD-tree unavailable ({_e}); using brute-force IDW")
+
+if len(_ground_pts):
+    _n_tot = len(_ground_pts)
+    GROUND_Z = float(np.median(_ground_pts[:, 2]))
+    if GROUND_PLANE is not None:
+        _a, _b, _c = GROUND_PLANE
+        _pred = _ground_pts[:, 0] * _a + _ground_pts[:, 1] * _b + _c
+        _resid = _ground_pts[:, 2] - _pred
+        _plane_rms = float(np.sqrt(np.mean(_resid[_plane_inliers] ** 2)))
+        _slope_pct = float(np.hypot(_a, _b)) * 100.0
+        _z_spread  = float(_ground_pts[:, 2].max() - _ground_pts[:, 2].min())
+        print(f"\n  Ground model: local IDW over {_n_tot} top-surface samples")
+        print(f"    sample Z spread = {_z_spread:.2f} m  "
+              f"(plane slope {_slope_pct:.2f}%, plane RMS {_plane_rms*1000:.0f} mm)")
+        _pick_method_tag = (f"local IDW ({_n_tot} samples, "
+                            f"ΔZ {_z_spread:.2f} m)")
+    else:
+        _pick_method_tag = f"local IDW ({_n_tot} samples)"
+        print(f"\n  Ground model: local IDW over {_n_tot} top-surface samples")
+else:
+    GROUND_Z = float(np.percentile(all_pts[:, 2], GROUND_PCTILE))
+    _pick_method_tag = "global P95 (no ground samples)"
+    print(f"\n  [warn] No ground samples — using global P{GROUND_PCTILE:.0f} "
+          f"= {GROUND_Z:.3f} m")
 
 
 def _ground_z_at(x_local, y_local):
-    """Return the ground Z of the nearest site to the given local XY."""
-    dx = _site_ground_arr[:, 0] - x_local
-    dy = _site_ground_arr[:, 1] - y_local
-    nearest = np.argmin(dx * dx + dy * dy)
-    return float(_site_ground_arr[nearest, 2])
+    """
+    Local ground Z that follows the road surface, via IDW over the nearest
+    top-surface samples. Falls back to the best-fit plane (then scalar
+    GROUND_Z) where no samples exist.
+    """
+    if _ground_z is None or len(_ground_z) == 0:
+        if GROUND_PLANE is not None:
+            a, b, c = GROUND_PLANE
+            return float(a * x_local + b * y_local + c)
+        return GROUND_Z
 
-_depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
+    k = min(_GROUND_IDW_K, len(_ground_z))
+    if _ground_tree is not None:
+        d, idx = _ground_tree.query([x_local, y_local], k=k)
+        d   = np.atleast_1d(d)
+        idx = np.atleast_1d(idx)
+    else:
+        diff = _ground_xy - np.array([x_local, y_local])
+        dist = np.sqrt((diff * diff).sum(axis=1))
+        idx  = np.argpartition(dist, k - 1)[:k]
+        d    = dist[idx]
+
+    # Exact / near-exact hit → return that sample directly
+    if np.any(d < 1e-9):
+        return float(_ground_z[idx[int(np.argmin(d))]])
+
+    w = 1.0 / (d ** _GROUND_IDW_POWER)
+    return float(np.sum(w * _ground_z[idx]) / np.sum(w))
+
+# ── Depth-source colour map (sRGB — used for GUI labels and depth meshes) ────
+# Matches base_viewer so the two viewers read identically.
+_DSRC_COLOR_SRGB = {
+    DepthSource.REGISTERED:   [0.4, 1.0, 0.4],   # green
+    DepthSource.VEJLEDENDE:   [0.4, 0.8, 1.0],   # light blue
+    DepthSource.FEATURE_MEAN: [1.0, 0.7, 0.3],   # orange
+    DepthSource.LAYER_MEAN:   [1.0, 0.7, 0.3],   # orange
+    DepthSource.GROUND_PLANE: [1.0, 0.4, 0.4],   # red
+    DepthSource.NONE:         [0.5, 0.5, 0.5],   # grey
+}
+
+
+def _dsrc_linear(src):
+    """Depth-source colour converted from sRGB to linear for Open3D meshes."""
+    s = _DSRC_COLOR_SRGB.get(src, [0.5, 0.5, 0.5])
+    return [srgb_to_linear(c) for c in s]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4.  Geometry helpers
@@ -413,7 +529,17 @@ def segment_to_cylinder(p1, p2, radius, color, resolution=_CYL_RESOLUTION):
     return cyl
 
 
-def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
+def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
+                              cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
+    """
+    Translate UTM -> local. For vertices with Z = -99 (sentinel), resolve the
+    depth using the ordered DepthSource hierarchy defined in *cfg* — exactly
+    like base_viewer, but the ground level here is the best-fit plane sampled
+    via `_ground_z_at`.
+
+    Returns (coords, sources) where `sources` is a DepthSource int8 array
+    (one entry per vertex).
+    """
     coords = coords_raw.copy().astype(float)
     if coords.shape[1] == 2:
         coords = np.hstack([coords, np.zeros((len(coords), 1))])
@@ -421,8 +547,13 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
     coords[:, 0] -= TX
     coords[:, 1] -= TY
 
+    n = len(coords)
+    sources = np.full(n, DepthSource.NONE, dtype=np.int8)
+
     # Catch -99 and any near-sentinel values (float imprecision)
     bad = coords[:, 2] <= -98
+    sources[~bad] = DepthSource.REGISTERED
+
     if bad.any():
         ind_depth_m = None
         if vejledende_dybde_mm is not None:
@@ -436,21 +567,47 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
         good_z = coords[~bad, 2]
         feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
 
-        # Use the segment midpoint to find the nearest site's ground Z
-        _mid_x = float(coords[:, 0].mean())
-        _mid_y = float(coords[:, 1].mean())
-        _local_ground_z = _ground_z_at(_mid_x, _mid_y)
+        # Resolver table: level -> callable(idx) -> float | None (absolute UTM Z)
+        def _resolve_vejledende(idx):
+            if ind_depth_m is None:
+                return None
+            g = _ground_z_at(coords[idx, 0], coords[idx, 1])
+            return (g + TZ) - ind_depth_m
+
+        def _resolve_feature_mean(idx):
+            return feature_mean_z
+
+        def _resolve_layer_mean(idx):
+            # parent_avg_z is local; convert to absolute UTM so the final
+            # coords[:, 2] -= TZ brings it back to local.
+            if parent_avg_z is None:
+                return None
+            return parent_avg_z + TZ
+
+        def _resolve_ground_plane(idx):
+            return _ground_z_at(coords[idx, 0], coords[idx, 1]) + TZ
+
+        _RESOLVERS = {
+            DepthSource.VEJLEDENDE:   _resolve_vejledende,
+            DepthSource.FEATURE_MEAN: _resolve_feature_mean,
+            DepthSource.LAYER_MEAN:   _resolve_layer_mean,
+            DepthSource.GROUND_PLANE: _resolve_ground_plane,
+        }
+
+        ordered_levels = sorted(
+            lv for lv in cfg.enabled_levels if lv != DepthSource.REGISTERED
+        )
 
         for idx in np.where(bad)[0]:
-            if ind_depth_m is not None:
-                coords[idx, 2] = (_local_ground_z + TZ) - ind_depth_m
-                _depth_stats["estimated"] += 1
-            elif feature_mean_z is not None:
-                coords[idx, 2] = feature_mean_z
-                _depth_stats["fallback_feature_mean"] += 1
-            else:
-                coords[idx, 2] = _local_ground_z + TZ
-                _depth_stats["fallback_global"] += 1
+            for level in ordered_levels:
+                resolver = _RESOLVERS.get(level)
+                if resolver is None:
+                    continue
+                z = resolver(idx)
+                if z is not None:
+                    coords[idx, 2] = z
+                    sources[idx] = level
+                    break
 
     coords[:, 2] -= TZ
 
@@ -460,7 +617,7 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
     # should sit within the point cloud's vertical extent.
     coords[:, 2] = np.clip(coords[:, 2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
 
-    return coords
+    return coords, sources
 
 
 def _segments_in_bbox(coords_utm):
@@ -518,7 +675,8 @@ n_grave = len(grave_verts_2d)
 grave_verts_3d = np.zeros((n_grave, 3))
 grave_verts_3d[:, 0] = grave_verts_2d[:, 0]
 grave_verts_3d[:, 1] = grave_verts_2d[:, 1]
-grave_verts_3d[:, 2] = GROUND_Z
+# Follow the local ground surface so the polygon sits on the road height
+grave_verts_3d[:, 2] = [_ground_z_at(x, y) for x, y in grave_verts_2d]
 
 grave_triangles = []
 for i in range(1, n_grave - 1):
@@ -532,7 +690,8 @@ grave_mesh.compute_vertex_normals()
 
 print(f"  {n_grave} vertices, {len(grave_triangles)} triangles")
 
-grave_wire_pts = np.hstack([grave_xy_local, np.full((len(grave_xy_local), 1), GROUND_Z)])
+grave_wire_z = np.array([[_ground_z_at(x, y)] for x, y in grave_xy_local])
+grave_wire_pts = np.hstack([grave_xy_local, grave_wire_z])
 grave_lines = [[i, i + 1] for i in range(len(grave_wire_pts) - 1)]
 grave_ls = o3d.geometry.LineSet(
     points=o3d.utility.Vector3dVector(grave_wire_pts),
@@ -568,6 +727,8 @@ _t_step = time.perf_counter()
 print("\n--- Building utility line meshes ---")
 
 layer_meshes = {}
+layer_meshes_depth = {}          # layer_name -> depth-source-coloured mesh
+_pipe_seg_dsrc = {}              # layer_name -> [DepthSource, ...] per segment
 layer_stats = {}
 all_pipe_coords = []
 
@@ -613,6 +774,32 @@ def _batch_merge_meshes(mesh_list):
     combined.compute_vertex_normals()
     return combined
 
+
+def _build_depth_mesh(mesh_list, src_list):
+    """
+    Merge `mesh_list` like `_batch_merge_meshes`, but paint every mesh with its
+    depth-source colour (parallel `src_list`). Produces the alternate
+    'Depth Hierarchy' colouring without deep-copying individual meshes.
+    """
+    if not mesh_list:
+        return None
+    all_verts, all_tris, all_colors = [], [], []
+    offset = 0
+    for m, src in zip(mesh_list, src_list):
+        v = np.asarray(m.vertices)
+        t = np.asarray(m.triangles)
+        all_verts.append(v)
+        all_tris.append(t + offset)
+        all_colors.append(np.tile(_dsrc_linear(src), (len(v), 1)))
+        offset += len(v)
+
+    combined = o3d.geometry.TriangleMesh()
+    combined.vertices = o3d.utility.Vector3dVector(np.vstack(all_verts))
+    combined.triangles = o3d.utility.Vector3iVector(np.vstack(all_tris))
+    combined.vertex_colors = o3d.utility.Vector3dVector(np.vstack(all_colors))
+    combined.compute_vertex_normals()
+    return combined
+
 for layer_name, cfg in LINE_LAYERS.items():
     gdf = _cached_gdfs.get(layer_name)
     if gdf is None:
@@ -624,6 +811,7 @@ for layer_name, cfg in LINE_LAYERS.items():
     n_segments = 0
     _layer_z_vals = []
     layer_mesh_list = []
+    layer_src_list  = []   # DepthSource per segment (parallel to layer_mesh_list)
 
     for _, row in gdf.iterrows():
         geom = row.geometry
@@ -643,6 +831,19 @@ for layer_name, cfg in LINE_LAYERS.items():
                 diam_mm = 0.0
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
+
+        # Ledningstrace: render as a flat horizontal plane of width 'bredde'
+        # (matches base_viewer), instead of a cylinder.
+        bredde_m = None
+        if layer_name == "Ledningstrace":
+            bredde_m = 0.25  # fallback: 25 cm
+            if "bredde" in row.index:
+                try:
+                    b = float(row["bredde"] or 0)
+                    if b > 0:
+                        bredde_m = b / 1000.0
+                except (ValueError, TypeError):
+                    pass
 
         color = default_color
 
@@ -664,7 +865,7 @@ for layer_name, cfg in LINE_LAYERS.items():
             if not _segments_in_bbox(coords_raw):
                 continue
 
-            coords = _clean_coords_with_depth(coords_raw, vejl_dybde)
+            coords, seg_sources = _clean_coords_with_depth(coords_raw, vejl_dybde)
             all_pipe_coords.append(coords)
             _layer_z_vals.extend(coords[:, 2].tolist())
             feature_hit = True
@@ -673,9 +874,16 @@ for layer_name, cfg in LINE_LAYERS.items():
                 clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
                 if clipped is None:
                     continue
-                cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
+                if bredde_m is not None:
+                    cyl = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
+                else:
+                    cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
                 if cyl is not None:
+                    # Dominant (worst) depth source of the segment's endpoints
+                    _seg_src = DepthSource(max(int(seg_sources[i]),
+                                               int(seg_sources[i + 1])))
                     layer_mesh_list.append(cyl)
+                    layer_src_list.append(_seg_src)
                     midpt = (clipped[0] + clipped[1]) / 2.0
                     pick_seg_midpoints.append(midpt)
                     pick_seg_attrs.append(row_attrs)
@@ -693,14 +901,28 @@ for layer_name, cfg in LINE_LAYERS.items():
     combined = _batch_merge_meshes(layer_mesh_list)
     if combined is not None:
         layer_meshes[layer_name] = combined
+        _pipe_seg_dsrc[layer_name] = layer_src_list
+        _depth_combined = _build_depth_mesh(layer_mesh_list, layer_src_list)
+        if _depth_combined is not None:
+            layer_meshes_depth[layer_name] = _depth_combined
         print(f"  {layer_name:<35} {n_features:>4} features  {n_segments:>5} segments")
 
 pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.empty((0, 3))
 
+# Depth hierarchy stats — counted from rendered segments only (matches base_viewer)
+_depth_stats = {src: 0 for src in DepthSource if src != DepthSource.NONE}
+for _ln, _src_list in _pipe_seg_dsrc.items():
+    for _src in _src_list:
+        if _src != DepthSource.NONE:
+            _depth_stats[_src] = _depth_stats.get(_src, 0) + 1
+
 print(f"\n  Total line segments: {sum(s for _, s in layer_stats.values()):,}")
-print(f"  Depth stats: estimated={_depth_stats['estimated']}, "
-      f"fallback_mean={_depth_stats['fallback_feature_mean']}, "
-      f"fallback_global={_depth_stats['fallback_global']}")
+print(f"  Depth hierarchy stats (rendered pipe segments):")
+print(f"    1. Registered Z:     {_depth_stats.get(DepthSource.REGISTERED, 0)}")
+print(f"    2. vejledendeDybde:  {_depth_stats.get(DepthSource.VEJLEDENDE, 0)}")
+print(f"    3. Feature mean Z:   {_depth_stats.get(DepthSource.FEATURE_MEAN, 0)}")
+print(f"    4. Layer mean Z:     {_depth_stats.get(DepthSource.LAYER_MEAN, 0)}")
+print(f"    5. Ground plane:     {_depth_stats.get(DepthSource.GROUND_PLANE, 0)}")
 print(f"  [timer] Line mesh building: {time.perf_counter() - _t_step:.2f}s")
 
 # Pipe centroid
@@ -717,6 +939,8 @@ print("\n--- Building utility component meshes ---")
 _COMP_TO_LINE = COMP_TO_LINE
 
 comp_meshes = {}
+comp_meshes_depth = {}           # layer_name -> depth-source-coloured mesh
+_comp_seg_dsrc = {}              # layer_name -> [DepthSource, ...] per component
 comp_stats = {}
 
 pick_comp_centres = []
@@ -731,6 +955,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     color = cfg["color"]
     n_comp = 0
     comp_mesh_list = []
+    comp_src_list  = []   # DepthSource per component (parallel to comp_mesh_list)
 
     parent_line = _COMP_TO_LINE.get(layer_name)
     parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
@@ -766,10 +991,15 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
             continue
 
         if gz <= -98 or pt[2] <= -98:
+            # Component depth hierarchy: LAYER_MEAN (parent pipe) -> GROUND_PLANE
             if parent_avg_z is not None:
                 pt[2] = parent_avg_z
+                _comp_src = DepthSource.LAYER_MEAN
             else:
                 pt[2] = _ground_z_at(pt[0], pt[1])
+                _comp_src = DepthSource.GROUND_PLANE
+        else:
+            _comp_src = DepthSource.REGISTERED
 
         # Clamp to point cloud Z range
         pt[2] = np.clip(pt[2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
@@ -780,6 +1010,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         sphere.translate(pt)
         sphere.paint_uniform_color(color)
         comp_mesh_list.append(sphere)
+        comp_src_list.append(_comp_src)
 
         pick_comp_centres.append(pt.copy())
         comp_row_attrs = []
@@ -797,9 +1028,20 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     combined = _batch_merge_meshes(comp_mesh_list)
     if combined is not None:
         comp_meshes[layer_name] = combined
+        _comp_seg_dsrc[layer_name] = comp_src_list
+        _depth_combined = _build_depth_mesh(comp_mesh_list, comp_src_list)
+        if _depth_combined is not None:
+            comp_meshes_depth[layer_name] = _depth_combined
         print(f"  {layer_name:<35} {n_comp:>4} components")
 
 pick_comp_centres = np.array(pick_comp_centres) if pick_comp_centres else np.empty((0, 3))
+
+# Fold component depth sources into the overall depth-hierarchy stats so the
+# GUI legend counts reflect everything that gets recoloured.
+for _ln, _src_list in _comp_seg_dsrc.items():
+    for _src in _src_list:
+        if _src != DepthSource.NONE:
+            _depth_stats[_src] = _depth_stats.get(_src, 0) + 1
 print(f"  [timer] Component mesh building: {time.perf_counter() - _t_step:.2f}s")
 
 _t_load = time.perf_counter()
@@ -852,6 +1094,22 @@ HIGHLIGHT_GEOM   = "highlight"
 # Geometry names for utility layers
 def _line_geom_name(layer):  return f"line_{layer}"
 def _comp_geom_name(layer):  return f"comp_{layer}"
+
+# ── Depth Hierarchy state + mesh accessors ───────────────────────────────────
+# When active, layers render with their depth-source colouring instead of the
+# normal layer colour. All scene re-adds go through these accessors so every
+# toggle/opacity path stays consistent.
+_depth_hierarchy_active = [False]
+
+def _active_line_mesh(ln):
+    if _depth_hierarchy_active[0] and ln in layer_meshes_depth:
+        return layer_meshes_depth[ln]
+    return layer_meshes[ln]
+
+def _active_comp_mesh(ln):
+    if _depth_hierarchy_active[0] and ln in comp_meshes_depth:
+        return comp_meshes_depth[ln]
+    return comp_meshes[ln]
 
 class_labels_active = [False]
 
@@ -942,6 +1200,53 @@ panel.add_child(gui.Label(f"Points: {total_pts_filt:,}  |  Buffer: {BUFFER} m"))
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method_tag})"))
 panel.add_fixed(int(0.3 * em))
 
+# ── Depth Hierarchy toggle — recolours utilities by depth source ────────────
+depth_toggle_cb = gui.Checkbox("Depth Hierarchy")
+depth_toggle_cb.checked = False
+
+def _dsrc_gui_color(src):
+    """sRGB depth-source colour as gui.Color (matches viewer appearance)."""
+    r, g, b = _DSRC_COLOR_SRGB[src]
+    return gui.Color(r, g, b, 1.0)
+
+_hierarchy_display = [
+    ("1. Registered Z",    _depth_stats.get(DepthSource.REGISTERED, 0),   _dsrc_gui_color(DepthSource.REGISTERED)),
+    ("2. vejledendeDybde", _depth_stats.get(DepthSource.VEJLEDENDE, 0),   _dsrc_gui_color(DepthSource.VEJLEDENDE)),
+    ("3. Feature mean Z",  _depth_stats.get(DepthSource.FEATURE_MEAN, 0), _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
+    ("4. Layer mean Z",    _depth_stats.get(DepthSource.LAYER_MEAN, 0),   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
+    ("5. Ground plane",    _depth_stats.get(DepthSource.GROUND_PLANE, 0), _dsrc_gui_color(DepthSource.GROUND_PLANE)),
+]
+
+_depth_legend_container = gui.Vert(0)
+for _label, _count, _color in _hierarchy_display:
+    _lbl = gui.Label(f"  {_label}: {_count}")
+    _lbl.text_color = _color
+    _depth_legend_container.add_child(_lbl)
+_depth_legend_container.visible = False
+
+
+def _on_depth_toggle(checked):
+    _depth_hierarchy_active[0] = checked
+    _depth_legend_container.visible = checked
+    for ln in layer_meshes:
+        alpha = pipe_opacity_val[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
+        scene_widget.scene.remove_geometry(_line_geom_name(ln))
+        scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln),
+                                        make_mesh_material(alpha))
+    for ln in comp_meshes:
+        alpha = pipe_opacity_val[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
+        scene_widget.scene.remove_geometry(_comp_geom_name(ln))
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln),
+                                        make_mesh_material(alpha))
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+depth_toggle_cb.set_on_checked(_on_depth_toggle)
+panel.add_child(depth_toggle_cb)
+panel.add_child(_depth_legend_container)
+panel.add_fixed(int(0.3 * em))
+
 # ── Show origin axis ──────────────────────────────────────────────────────
 origin_frame_visible = [False]
 scene_widget.scene.show_geometry(FRAME_GEOM, False)
@@ -972,18 +1277,9 @@ if merged_class_labels is not None:
         if cls_id not in np.unique(merged_class_labels):
             continue
         n_pts = int((merged_class_labels == cls_id).sum())
-        col = cfg["color"]
-        sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-        row     = gui.Horiz(int(0.3 * em))
-        swatch  = gui.Button(" ")
-        swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-        swatch.toggleable = False
-        swatch.vertical_padding_em = 0.0
-        swatch.horizontal_padding_em = 0.3
-        row.add_child(swatch)
-        row.add_fixed(int(0.4 * em))
-        row.add_child(gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"))
+        row = make_legend_row(
+            cfg["color"], gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"), em
+        )
         _class_legend_container.add_child(row)
 _class_legend_container.visible = False
 
@@ -1080,12 +1376,12 @@ def _apply_opacity(val: float):
         alpha = val if _layer_visible.get(ln, True) else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
-        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     for ln in comp_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
     window.post_redraw()
 
 
@@ -1102,7 +1398,7 @@ def _make_pipe_toggle(ln):
         alpha = pipe_opacity_val[0] if checked else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
-        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
         window.post_redraw()
     return _cb
 
@@ -1113,7 +1409,7 @@ def _make_comp_toggle(ln):
         alpha = pipe_opacity_val[0] if checked else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
         window.post_redraw()
     return _cb
 
@@ -1129,7 +1425,7 @@ def _on_toggle_all_pipes(checked):
         alpha = pipe_opacity_val[0] if checked else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
-        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     window.post_redraw()
 
 _all_pipes_cb.set_on_checked(_on_toggle_all_pipes)
@@ -1141,14 +1437,6 @@ for layer_name in LINE_LAYERS:
         continue
     cfg = LINE_LAYERS[layer_name]
     n_feat, n_seg = layer_stats.get(layer_name, (0, 0))
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button(" ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
-    swatch.vertical_padding_em = 0.0
-    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_feat})")
     cb.checked = True
@@ -1156,10 +1444,7 @@ for layer_name in LINE_LAYERS:
     cb.set_on_checked(_make_pipe_toggle(layer_name))
     _pipe_checkboxes.append((layer_name, cb))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    _ler_legend_container.add_child(row)
+    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 # "Toggle all components" master checkbox
 _all_comps_cb = gui.Checkbox("All components")
@@ -1172,7 +1457,7 @@ def _on_toggle_all_comps(checked):
         alpha = pipe_opacity_val[0] if checked else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
     window.post_redraw()
 
 _all_comps_cb.set_on_checked(_on_toggle_all_comps)
@@ -1183,15 +1468,6 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     if layer_name not in comp_meshes:
         continue
     n_comp = comp_stats.get(layer_name, 0)
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button(" ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
-    swatch.vertical_padding_em = 0.0
-    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_comp})")
     cb.checked = True
@@ -1199,10 +1475,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     cb.set_on_checked(_make_comp_toggle(layer_name))
     _comp_checkboxes.append((layer_name, cb))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    _ler_legend_container.add_child(row)
+    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 
 def _on_ler_toggle(checked):
@@ -1212,12 +1485,12 @@ def _on_ler_toggle(checked):
         alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
-        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     for ln in comp_meshes:
         alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
     window.set_needs_layout()
     window.post_redraw()
 
@@ -1311,7 +1584,81 @@ def _place_highlight(centre: np.ndarray):
 # ─────────────────────────────────────────────────────────────────────────────
 PICK_RADIUS_SEG = 2.0
 PICK_RADIUS_COMP = 1.0
+PICK_RADIUS_PC_PX = 10.0    # screen-space search radius (pixels) for point picking
 _last_click = [None]
+
+
+def _site_attrs_for_index(idx):
+    """Build (centre, attrs, label) for the left panel from a merged-point index."""
+    pt = all_pts[idx].copy()
+    si = int(_site_index_per_point[idx]) if idx < len(_site_index_per_point) else -1
+    site = site_names[si] if 0 <= si < len(site_names) else f"site {si}"
+
+    attrs = [
+        ("Local X", f"{pt[0]:.3f} m"),
+        ("Local Y", f"{pt[1]:.3f} m"),
+        ("Local Z", f"{pt[2]:.3f} m"),
+        ("UTM X",   f"{pt[0] + TX:.3f}"),
+        ("UTM Y",   f"{pt[1] + TY:.3f}"),
+        ("UTM Z",   f"{pt[2] + TZ:.3f}"),
+    ]
+    if merged_class_labels is not None:
+        cid = int(merged_class_labels[idx])
+        if cid >= 0:
+            cname = CLASS_LABELS.get(cid, {}).get("name", "Unknown")
+            attrs.append(("Class", f"{cid}: {cname}"))
+        else:
+            attrs.append(("Class", "—"))
+    attrs.append(("Ground Z here", f"{_ground_z_at(pt[0], pt[1]):.3f} m"))
+    if 0 <= si < len(_site_point_counts):
+        attrs.append(("Site points", f"{_site_point_counts[si]:,}"))
+
+    return pt, attrs, f"{site} (point cloud)"
+
+
+def _pick_point_cloud_screen(sx, sy):
+    """
+    Screen-space point pick — independent of the depth buffer. Projects every
+    merged point to pixels, then returns the index of the front-most point
+    within PICK_RADIUS_PC_PX of the click (sx, sy in scene-frame pixels), or
+    None. This works even where the translucent ground surface would otherwise
+    intercept a depth-based pick.
+    """
+    if len(all_pts) == 0:
+        return None
+    cam = scene_widget.scene.camera
+    V = np.asarray(cam.get_view_matrix(), dtype=float)        # world -> eye
+    P = np.asarray(cam.get_projection_matrix(), dtype=float)  # eye  -> clip
+    W = float(scene_widget.frame.width)
+    H = float(scene_widget.frame.height)
+    if W <= 0 or H <= 0:
+        return None
+
+    homog = np.empty((len(all_pts), 4), dtype=float)
+    homog[:, :3] = all_pts
+    homog[:, 3] = 1.0
+    eye  = homog @ V.T          # (N, 4) camera space
+    clip = eye @ P.T            # (N, 4) clip space
+    w = clip[:, 3]
+    valid = np.abs(w) > 1e-9
+    ndc_x = np.where(valid, clip[:, 0] / w, 2.0)
+    ndc_y = np.where(valid, clip[:, 1] / w, 2.0)
+    ndc_z = np.where(valid, clip[:, 2] / w, 2.0)
+
+    px = (ndc_x * 0.5 + 0.5) * W
+    py = (1.0 - (ndc_y * 0.5 + 0.5)) * H
+
+    in_front = valid & (ndc_z >= -1.0) & (ndc_z <= 1.0)
+    d2 = (px - sx) ** 2 + (py - sy) ** 2
+    d2 = np.where(in_front, d2, np.inf)
+
+    near = d2 <= PICK_RADIUS_PC_PX * PICK_RADIUS_PC_PX
+    if not near.any():
+        return None
+    cand = np.where(near)[0]
+    # Front-most candidate: in eye space the camera looks down -Z, so the point
+    # nearest the camera has the greatest (least-negative) z.
+    return int(cand[int(np.argmax(eye[cand, 2]))])
 
 
 def _do_pick(depth_image):
@@ -1328,51 +1675,55 @@ def _do_pick(depth_image):
     py = int(np.clip(sy, 0, h - 1))
     depth = float(depth_arr[py, px])
 
-    if depth >= 1.0:
-        def _clear():
-            _clear_highlight()
-            _hide_left_panel()
-        gui.Application.instance.post_to_main_thread(window, _clear)
-        return
+    centre = attrs = label = None
 
-    world = scene_widget.scene.camera.unproject(
-        ex, ey, depth,
-        scene_widget.frame.width,
-        scene_widget.frame.height,
-    )
-    hit = np.array(world[:3], dtype=float)
+    # ── Utilities (segments / components) take priority — depth-based ────────
+    if depth < 1.0:
+        world = scene_widget.scene.camera.unproject(
+            ex, ey, depth,
+            scene_widget.frame.width,
+            scene_widget.frame.height,
+        )
+        hit = np.array(world[:3], dtype=float)
 
-    # Skip segments whose layer is hidden
-    best_seg_d = np.inf
-    best_seg_i = -1
-    if len(pick_seg_midpoints) > 0:
-        dists = np.linalg.norm(pick_seg_midpoints - hit, axis=1)
-        for _si, _sl in enumerate(pick_seg_layer):
-            if not _layer_visible.get(_sl, True) or not _ler_active[0]:
-                dists[_si] = np.inf
-        best_seg_i = int(np.argmin(dists))
-        best_seg_d = float(dists[best_seg_i])
+        # Skip segments whose layer is hidden
+        best_seg_d = np.inf
+        best_seg_i = -1
+        if len(pick_seg_midpoints) > 0:
+            dists = np.linalg.norm(pick_seg_midpoints - hit, axis=1)
+            for _si, _sl in enumerate(pick_seg_layer):
+                if not _layer_visible.get(_sl, True) or not _ler_active[0]:
+                    dists[_si] = np.inf
+            best_seg_i = int(np.argmin(dists))
+            best_seg_d = float(dists[best_seg_i])
 
-    # Skip components whose layer is hidden
-    best_comp_d = np.inf
-    best_comp_i = -1
-    if len(pick_comp_centres) > 0:
-        dists = np.linalg.norm(pick_comp_centres - hit, axis=1)
-        for _ci, _cl in enumerate(pick_comp_layer):
-            if not _layer_visible.get(_cl, True) or not _ler_active[0]:
-                dists[_ci] = np.inf
-        best_comp_i = int(np.argmin(dists))
-        best_comp_d = float(dists[best_comp_i])
+        # Skip components whose layer is hidden
+        best_comp_d = np.inf
+        best_comp_i = -1
+        if len(pick_comp_centres) > 0:
+            dists = np.linalg.norm(pick_comp_centres - hit, axis=1)
+            for _ci, _cl in enumerate(pick_comp_layer):
+                if not _layer_visible.get(_cl, True) or not _ler_active[0]:
+                    dists[_ci] = np.inf
+            best_comp_i = int(np.argmin(dists))
+            best_comp_d = float(dists[best_comp_i])
 
-    if best_comp_d < best_seg_d and best_comp_d < PICK_RADIUS_COMP:
-        centre = pick_comp_centres[best_comp_i].copy()
-        attrs = pick_comp_attrs[best_comp_i]
-        label = f"{pick_comp_layer[best_comp_i]} (component)"
-    elif best_seg_d < PICK_RADIUS_SEG:
-        centre = pick_seg_midpoints[best_seg_i].copy()
-        attrs = pick_seg_attrs[best_seg_i]
-        label = f"{pick_seg_layer[best_seg_i]} (pipe segment)"
-    else:
+        if best_comp_d < best_seg_d and best_comp_d < PICK_RADIUS_COMP:
+            centre = pick_comp_centres[best_comp_i].copy()
+            attrs = pick_comp_attrs[best_comp_i]
+            label = f"{pick_comp_layer[best_comp_i]} (component)"
+        elif best_seg_d < PICK_RADIUS_SEG:
+            centre = pick_seg_midpoints[best_seg_i].copy()
+            attrs = pick_seg_attrs[best_seg_i]
+            label = f"{pick_seg_layer[best_seg_i]} (pipe segment)"
+
+    # ── Fall back to a point-cloud (site) pick in screen space ───────────────
+    if centre is None:
+        idx = _pick_point_cloud_screen(sx, sy)
+        if idx is not None:
+            centre, attrs, label = _site_attrs_for_index(idx)
+
+    if centre is None:
         def _clear():
             _clear_highlight()
             _hide_left_panel()
@@ -1472,6 +1823,12 @@ def on_key(event):
         _toggle_class_labels(new_state)
         return HANDLED
 
+    if k in (ord('D'), ord('d')):
+        new_state = not _depth_hierarchy_active[0]
+        depth_toggle_cb.checked = new_state
+        _on_depth_toggle(new_state)
+        return HANDLED
+
     if k in (ord('C'), ord('c')):
         _pivot_to(cloud_centroid)
         return HANDLED
@@ -1484,13 +1841,14 @@ def on_key(event):
 
     if k in (ord('H'), ord('h')):
         print("\n-- Shortcuts ---------------------------------------------------")
-        print("  Left-click     pick pipe segment or component (show attributes)")
+        print("  Left-click     pick pipe / component / point-cloud site (show info)")
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  0              pivot to world origin (0, 0, 0)")
         print("  ]              increase all utility opacities +0.05")
         print("  [              decrease all utility opacities -0.05")
         print("  L              toggle class label colours on/off")
+        print("  D              toggle depth-hierarchy colouring on/off")
         print("  H              show this help")
         print("----------------------------------------------------------------\n")
         return HANDLED

@@ -247,3 +247,61 @@ def deviation_to_color(distances, thresholds=None, palette=None):
 
     colors[distances >= thresholds[-1]] = palette[-1]
     return colors
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLANE FITTING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fit_plane_z(points, n_robust_iters=3, reject_sigma=2.0):
+    """
+    Least-squares fit of a height plane ``z = a*x + b*y + c`` to an (N, 3)
+    array of points.
+
+    The fit is made robust by iteratively rejecting points whose residual
+    exceeds ``reject_sigma`` times the residual standard deviation and
+    re-fitting on the surviving inliers.
+
+    Parameters
+    ----------
+    points : array-like, shape (N, 3)
+        XYZ coordinates.
+    n_robust_iters : int
+        Maximum number of robust re-fit iterations (>= 1).
+    reject_sigma : float
+        Outlier rejection threshold in residual sigmas.
+
+    Returns
+    -------
+    coeffs : np.ndarray, shape (3,) | None
+        ``(a, b, c)`` such that ``z ≈ a*x + b*y + c``. ``None`` if fewer
+        than 3 points were supplied.
+    inlier_mask : np.ndarray of bool, shape (N,) | None
+        Boolean mask of points kept by the final fit. ``None`` when the
+        fit could not be performed.
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[0] < 3:
+        return None, None
+
+    mask = np.ones(len(pts), dtype=bool)
+    coeffs = None
+    for _ in range(max(1, n_robust_iters)):
+        P = pts[mask]
+        if len(P) < 3:
+            break
+        A = np.column_stack([P[:, 0], P[:, 1], np.ones(len(P))])
+        coeffs, *_ = np.linalg.lstsq(A, P[:, 2], rcond=None)
+
+        # Residuals over ALL points relative to the current plane
+        pred = pts[:, 0] * coeffs[0] + pts[:, 1] * coeffs[1] + coeffs[2]
+        resid = pts[:, 2] - pred
+        s = float(np.std(resid[mask]))
+        if s < 1e-9:
+            break
+        new_mask = np.abs(resid) <= reject_sigma * s
+        if new_mask.sum() < 3 or np.array_equal(new_mask, mask):
+            break
+        mask = new_mask
+
+    return coeffs, mask

@@ -35,6 +35,7 @@ from core.config import (
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
 )
 from core.data_loader import init_site, pick_ground_level
+from core.gui_helpers import make_legend_row
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -209,9 +210,6 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
     bad = coords[:, 2] == -99
     sources[~bad] = DepthSource.REGISTERED
 
-    # Count registered vertices
-    _depth_stats["registered"] += int((~bad).sum())
-
     if bad.any():
         # Pre-compute resolver inputs once per feature
         ind_depth_m = None
@@ -267,7 +265,6 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
                 if z is not None:
                     coords[idx, 2] = z
                     sources[idx] = level
-                    _depth_stats[_STATS_KEY[level]] += 1
                     break
 
     # Translate Z to local
@@ -475,23 +472,20 @@ pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.
 
 _t_pipes1 = time.perf_counter()
 print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments  [{_t_pipes1 - _t_pipes0:.2f}s total]")
-print(f"\n  Depth hierarchy stats (all pipe vertices):")
-print(f"    1. Registered Z:        {_depth_stats['registered']}")
-print(f"    2. vejledendeDybde:      {_depth_stats['estimated']}")
-print(f"    3. Feature mean Z:       {_depth_stats['fallback_feature_mean']}")
-print(f"    4. Layer mean Z:         {_depth_stats['fallback_layer_mean']}")
-print(f"    5. Ground plane:         {_depth_stats['fallback_global']}")
 
-# Consolidated per-vertex depth source arrays
-if all_pipe_sources:
-    _all_pipe_sources_flat = np.concatenate(all_pipe_sources)
-    for src in DepthSource:
-        if src == DepthSource.NONE:
-            continue
-        _cnt = int(np.sum(_all_pipe_sources_flat == src))
-        if _cnt > 0:
-            print(f"    [{src.name:<14}] {_cnt:>6} vertices (all, incl. outside crop)")
-    del _all_pipe_sources_flat
+# Depth hierarchy stats — count from rendered segments only
+_depth_stats = {src: 0 for src in DepthSource if src != DepthSource.NONE}
+for _ln, _src_list in _pipe_seg_dsrc.items():
+    for _src in _src_list:
+        if _src != DepthSource.NONE:
+            _depth_stats[_src] = _depth_stats.get(_src, 0) + 1
+
+print(f"\n  Depth hierarchy stats (rendered segments):")
+print(f"    1. Registered Z:        {_depth_stats.get(DepthSource.REGISTERED, 0)}")
+print(f"    2. vejledendeDybde:      {_depth_stats.get(DepthSource.VEJLEDENDE, 0)}")
+print(f"    3. Feature mean Z:       {_depth_stats.get(DepthSource.FEATURE_MEAN, 0)}")
+print(f"    4. Layer mean Z:         {_depth_stats.get(DepthSource.LAYER_MEAN, 0)}")
+print(f"    5. Ground plane:         {_depth_stats.get(DepthSource.GROUND_PLANE, 0)}")
 
 # Per-layer merged pipe meshes (used for individual visibility toggles)
 _pipe_layer_meshes = {}
@@ -886,11 +880,11 @@ def _dsrc_gui_color(src):
     return gui.Color(r, g, b, 1.0)
 
 _hierarchy_display = [
-    ("1. Registered Z",       _depth_stats["registered"],            _dsrc_gui_color(DepthSource.REGISTERED)),
-    ("2. vejledendeDybde",    _depth_stats["estimated"],             _dsrc_gui_color(DepthSource.VEJLEDENDE)),
-    ("3. Feature mean Z",     _depth_stats["fallback_feature_mean"], _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
-    ("4. Layer mean Z",       _depth_stats["fallback_layer_mean"],   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
-    ("5. Ground plane",       _depth_stats["fallback_global"],       _dsrc_gui_color(DepthSource.GROUND_PLANE)),
+    ("1. Registered Z",       _depth_stats.get(DepthSource.REGISTERED, 0),    _dsrc_gui_color(DepthSource.REGISTERED)),
+    ("2. vejledendeDybde",    _depth_stats.get(DepthSource.VEJLEDENDE, 0),    _dsrc_gui_color(DepthSource.VEJLEDENDE)),
+    ("3. Feature mean Z",     _depth_stats.get(DepthSource.FEATURE_MEAN, 0), _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
+    ("4. Layer mean Z",       _depth_stats.get(DepthSource.LAYER_MEAN, 0),   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
+    ("5. Ground plane",       _depth_stats.get(DepthSource.GROUND_PLANE, 0), _dsrc_gui_color(DepthSource.GROUND_PLANE)),
 ]
 
 _depth_legend_container = gui.Vert(0)
@@ -950,18 +944,9 @@ if class_labels is not None:
         if cls_id not in np.unique(class_labels):
             continue
         n_pts = int((class_labels == cls_id).sum())
-        col = cfg["color"]
-        sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-        row     = gui.Horiz(int(0.3 * em))
-        swatch  = gui.Button(" ")
-        swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-        swatch.toggleable = False
-        swatch.vertical_padding_em = 0.0
-        swatch.horizontal_padding_em = 0.3
-        row.add_child(swatch)
-        row.add_fixed(int(0.4 * em))
-        row.add_child(gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"))
+        row = make_legend_row(
+            cfg["color"], gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"), em
+        )
         _class_legend_container.add_child(row)
 _class_legend_container.visible = False
 
@@ -1065,24 +1050,13 @@ for layer_name in PIPE_LEGEND_UI_ORDER:
         continue
     cfg = LINE_LAYERS[layer_name]
     n_feat, _ = layer_stats.get(layer_name, (0, 0))
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button(" ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
-    swatch.vertical_padding_em = 0.0
-    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_feat})")
     cb.checked = _layer_visible.get(layer_name, True)
     cb.set_on_checked(_make_pipe_toggle(layer_name))
     _pipe_checkboxes.append((layer_name, cb))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    _ler_legend_container.add_child(row)
+    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 # "Toggle all components" master checkbox
 _all_comps_cb = gui.Checkbox("All components")
@@ -1105,15 +1079,6 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     if layer_name not in _comp_layer_meshes:
         continue
     n_comp = comp_stats.get(layer_name, 0)
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button(" ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
-    swatch.vertical_padding_em = 0.0
-    swatch.horizontal_padding_em = 0.3
 
     cb = gui.Checkbox(f"{layer_name} ({n_comp})")
     cb.checked = False
@@ -1121,10 +1086,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     cb.set_on_checked(_make_comp_toggle(layer_name))
     _comp_checkboxes.append((layer_name, cb))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    _ler_legend_container.add_child(row)
+    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 
 def _on_ler_toggle(checked):

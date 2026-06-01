@@ -17,6 +17,7 @@ import warnings
 # that imports core.config gets the filter automatically.
 warnings.filterwarnings("ignore", message="Unrecognized geometry type", category=RuntimeWarning)
 warnings.filterwarnings("ignore", message="parsed incompletely", category=RuntimeWarning)
+warnings.filterwarnings("ignore", module="pyogrio", category=RuntimeWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SITE SELECTION — change these to switch site

@@ -33,6 +33,7 @@ from core.config import (
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS, DIAMETER_COLORS,
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level
+from core.gui_helpers import make_legend_row
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, GML, and instances via core/
@@ -931,21 +932,12 @@ for layer_name, cfg in LINE_LAYERS.items():
     if layer_name not in _pipe_layer_meshes:
         continue
     n_feat, _ = layer_stats.get(layer_name, (0, 0))
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button("   ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
 
     cb = gui.Checkbox(f"{layer_name} ({n_feat})")
     cb.checked = _layer_visible.get(layer_name, True)
     cb.set_on_checked(_make_pipe_toggle(layer_name))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    panel.add_child(row)
+    panel.add_child(make_legend_row(cfg["color"], cb, em))
     panel.add_fixed(int(0.15 * em))
 
 # Component layers — only show legend entry if the layer produced actual geometry
@@ -953,22 +945,12 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     if layer_name not in _comp_layer_meshes:
         continue
     n_comp = comp_stats.get(layer_name, 0)
-    col = cfg["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-    row    = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button("   ")
-    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
-    swatch.toggleable = False
 
     cb = gui.Checkbox(f"{layer_name} ({n_comp})")
     cb.checked = _layer_visible.get(layer_name, False)
     cb.set_on_checked(_make_comp_toggle(layer_name))
 
-    row.add_child(swatch)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    panel.add_child(row)
+    panel.add_child(make_legend_row(cfg["color"], cb, em))
     panel.add_fixed(int(0.15 * em))
 
 # ── Utility Opacity ──────────────────────────────────────────────────────────
