@@ -1,117 +1,47 @@
+﻿# -*- coding: utf-8 -*-
 """
 Graveforesp Viewer — All Point Clouds + All Utilities + Toggleable Layers
 ==========================================================================
-Loads the Graveforesp polygon from the consolidated GML, applies a 2 m
-buffer, and visualises:
+Refactored to use core/ for shared configuration.
 
-  • Every PLY point cloud whose footprint overlaps the buffered polygon
-  • The Graveforesp boundary as a semi-transparent surface mesh
-  • All utility categories (pipes + components) within the buffered area
+Note: this viewer does NOT use init_site() because it loads multiple PLYs
+via polygon overlap rather than a single PLY_FILE.  Constants are still
+imported from core/config.
 
-Layer controls
---------------
-  Each utility category and the Graveforesp surface can be toggled on/off
-  with a checkbox.  Each has its own opacity slider.
-
-Ground-level picking
---------------------
-  Before the main viewer opens, a VisualizerWithEditing window lets you
-  pick ground-level points (Shift + Left-Click, then Q to close).
-
-Attribute picking
------------------
-  Ctrl + Left-Click on any pipe segment or component sphere to show all
-  its GML attribute fields in the "Selected Feature" panel.
-
-Keyboard shortcuts
-------------------
-  C   pivot to cloud centroid           P   pivot to pipe centroid
-  0   pivot to world origin
-  ]   increase global utility opacity   [   decrease global utility opacity
-  L   toggle class label colours
-  H   help                             Esc quit
+Usage: python viewers/graveforesp_viewer.py
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so `core` is importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
 import geopandas as gpd
 import numpy as np
 import matplotlib.path as mpath
 from shapely.geometry import Polygon
 from shapely.ops import unary_union
-from pathlib import Path
 import re
 import time
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-AREA_REF_GEOJSON = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
-)
-
-GML_PATH = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Ledningspakke_3383910\consolidated.gml"
-)
-
-PLY_BASE_DIR = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D"
+from core.config import (
+    GML_PATH, AREA_REF_GEOJSON, PLY_BASE_DIR, CROP_RADIUS,
+    CLASS_LABELS, DEFAULT_CLASS_COLOR,
+    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    COMPONENT_SPHERE_RADIUS, DIAMETER_COLORS,
 )
 
 # Buffer (metres) around the Graveforesp polygon
 BUFFER = 2.0
 
-# Voxel size for the fast bbox-screening pass (larger = faster but coarser)
-SCREEN_VOXEL_SIZE = 1.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLASS LABEL DEFINITIONS — OpenTrench3D semantic classes
-# ─────────────────────────────────────────────────────────────────────────────
-CLASS_LABELS = {
-    0: {"name": "Main Utility",     "color": [0.00, 0.80, 0.00]},
-    1: {"name": "Other Utility",    "color": [1.00, 1.00, 0.00]},
-    2: {"name": "Trench",           "color": [0.55, 0.27, 0.07]},
-    3: {"name": "Inactive Utility", "color": [0.00, 0.00, 0.00]},
-    4: {"name": "Misc",             "color": [0.60, 0.60, 0.60]},
-}
-_DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY LAYER DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
-LINE_LAYERS = {
-    "Vandledning":                  {"color": [0.200, 0.500, 1.000], "fallback_radius": 0.025},
-    "Afloebsledning":               {"color": [0.545, 0.271, 0.075], "fallback_radius": 0.050},
-    "Gasledning":                   {"color": [1.000, 0.800, 0.000], "fallback_radius": 0.025},
-    "Elledning":                    {"color": [0.900, 0.100, 0.100], "fallback_radius": 0.015},
-    "Telekommunikationsledning":    {"color": [0.200, 0.800, 0.200], "fallback_radius": 0.015},
-    "Foeringsroer":                 {"color": [0.500, 0.900, 0.500], "fallback_radius": 0.040},
-    "LedningUkendtForsyningsart":   {"color": [0.300, 0.800, 0.800], "fallback_radius": 0.025},
-    "Ledningstrace":                {"color": [1.000, 0.500, 0.500], "fallback_radius": 0.015},
-}
-
-COMPONENT_LAYERS = {
-    "Vandkomponent":                  {"color": [0.000, 0.900, 0.900]},
-    "Afloebskomponent":               {"color": [0.700, 0.400, 0.200]},
-    "Gaskomponent":                   {"color": [1.000, 0.900, 0.300]},
-    "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
-    "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
-}
-
-COMPONENT_SPHERE_RADIUS = 0.05
-
-DIAMETER_COLORS = {
-    0:   [0.502, 0.502, 0.502],
-    32:  [0.702, 0.851, 1.000],
-    63:  [0.400, 0.698, 1.000],
-    120: [0.102, 0.459, 1.000],
-    150: [0.000, 0.278, 0.800],
-    160: [0.000, 0.180, 0.522],
-}
+# Alias for backward compat
+_DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG VALIDATION
@@ -129,11 +59,89 @@ if _missing:
     raise SystemExit(1)
 print("Config paths OK.\n")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# VIEWER-SPECIFIC CODE — OPTIMIZED DATA LOADING PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
 _t0 = time.perf_counter()
+
+# Cylinder resolution: lower = fewer triangles (6 vs 12 = half the geometry)
+_CYL_RESOLUTION = 6
+
+# Read only every Nth point from each PLY file.
+# 10 = keep 1 in 10 points → ~10× faster I/O, ~10× fewer points.
+# Set to 1 to read all points (full resolution).
+SUBSAMPLE_EVERY = 60
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FAST PLY READER — reads only every Nth point, never loads full cloud
+# ─────────────────────────────────────────────────────────────────────────────
+import io
+
+def _fast_read_ply_subsampled(ply_path, stride=SUBSAMPLE_EVERY):
+    """
+    Read an ASCII PLY, keeping only every `stride`-th point.
+    Never loads the full point cloud into memory.
+    Returns (xyz, rgb, class_labels_or_None, n_total_points).
+    """
+    ply_path = str(ply_path)
+
+    # ── Parse header ──────────────────────────────────────────────────
+    header_lines = 0
+    n_verts = 0
+    prop_names = []
+    with open(ply_path, 'r', errors='replace') as f:
+        for line in f:
+            header_lines += 1
+            stripped = line.strip()
+            if stripped.startswith("element vertex"):
+                n_verts = int(stripped.split()[-1])
+            elif stripped.startswith("property "):
+                prop_names.append(stripped.split()[-1])
+            elif stripped == "end_header":
+                break
+
+    x_col = prop_names.index("x")
+    y_col = prop_names.index("y")
+    z_col = prop_names.index("z")
+    has_rgb = all(c in prop_names for c in ("red", "green", "blue"))
+    has_class = "class" in prop_names
+    r_col = prop_names.index("red") if has_rgb else None
+    g_col = prop_names.index("green") if has_rgb else None
+    b_col = prop_names.index("blue") if has_rgb else None
+    cls_col = prop_names.index("class") if has_class else None
+
+    # ── Read only every stride-th line (never loads full file) ────────
+    sampled_lines = []
+    with open(ply_path, 'r', errors='replace') as f:
+        # Skip header
+        for _ in range(header_lines):
+            next(f)
+        # Read every stride-th data line
+        for i, line in enumerate(f):
+            if i >= n_verts:
+                break
+            if i % stride == 0:
+                sampled_lines.append(line)
+
+    if not sampled_lines:
+        return np.empty((0, 3)), None, None, n_verts
+
+    # ── Parse subsampled lines with numpy (fast C code) ───────────────
+    data = np.loadtxt(io.StringIO(''.join(sampled_lines)))
+    if data.ndim == 1:
+        data = data.reshape(1, -1)
+
+    xyz = data[:, [x_col, y_col, z_col]]
+    rgb = data[:, [r_col, g_col, b_col]].astype(np.uint8) if has_rgb else None
+    cls = data[:, cls_col].astype(int) if has_class else None
+
+    return xyz, rgb, cls, n_verts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Load Graveforesp polygon
 # ─────────────────────────────────────────────────────────────────────────────
+_t_step = time.perf_counter()
 print("Loading Graveforesp polygon from GML ...")
 gdf_grave  = gpd.read_file(GML_PATH, layer="Graveforesp")
 grave_geom = gdf_grave.geometry.iloc[0]
@@ -147,11 +155,9 @@ buf_xy_utm     = np.array(grave_buffered.exterior.coords)[:, :2]
 print(f"  Original polygon vertices: {len(grave_xy_utm)}")
 print(f"  Buffered polygon vertices: {len(buf_xy_utm)}")
 
-# Determine which area the Graveforesp falls in by checking overlap with
-# the area reference points
+# Determine which area the Graveforesp falls in
 ref = gpd.read_file(AREA_REF_GEOJSON)
 
-# Find the centroid of the graveforesp in UTM
 grave_cx, grave_cy = grave_geom.centroid.x, grave_geom.centroid.y
 print(f"  Graveforesp centroid (UTM): {grave_cx:.1f}, {grave_cy:.1f}")
 
@@ -185,23 +191,23 @@ buf_min_y = buf_xy_utm[:, 1].min()
 buf_max_y = buf_xy_utm[:, 1].max()
 
 print(f"  Buffered bbox (local): X[{gx_min:.1f}, {gx_max:.1f}]  Y[{gy_min:.1f}, {gy_max:.1f}]")
+print(f"  [timer] Polygon loading: {time.perf_counter() - _t_step:.2f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Find all PLY folders for this area and scan for overlapping sites
+# 2.  Find PLY files + SINGLE-PASS load, screen, crop (was two passes)
 # ─────────────────────────────────────────────────────────────────────────────
+_t_step = time.perf_counter()
+
 area_num = re.search(r"\d+", AREA_NAME).group()
 ply_dirs = sorted(Path(PLY_BASE_DIR).glob(f"*Area_{area_num}*"))
 if not ply_dirs:
     ply_dirs = sorted(Path(PLY_BASE_DIR).glob(f"*Area{area_num}*"))
 
-# Collect all PLY files
 all_ply_files = []
 for d in ply_dirs:
-    # Only use the base area folder (e.g. Water_Area_5), skip Finetuning variants
     if "Finetuning" in d.name:
         continue
     plys = sorted(d.glob("Area_*_Site_*.ply"))
-    # Exclude UTM-transformed copies
     plys = [p for p in plys if "_utm" not in p.stem.lower()]
     all_ply_files.extend(plys)
     if plys:
@@ -211,92 +217,93 @@ if not all_ply_files:
     print("[ERROR] No PLY files found for area. Check PLY_BASE_DIR.")
     raise SystemExit(1)
 
-# Pass 1: fast bbox screening with downsampled clouds
-print(f"\nPass 1 — screening {len(all_ply_files)} sites against buffered Graveforesp bbox ...")
-sites_in_bbox = []
-
-for ply_path in all_ply_files:
-    pcd_down = o3d.io.read_point_cloud(str(ply_path))
-    pcd_down = pcd_down.voxel_down_sample(voxel_size=SCREEN_VOXEL_SIZE)
-    pts = np.asarray(pcd_down.points)
-    mask = (
-        (pts[:, 0] >= gx_min) & (pts[:, 0] <= gx_max) &
-        (pts[:, 1] >= gy_min) & (pts[:, 1] <= gy_max)
-    )
-    if mask.any():
-        sites_in_bbox.append(ply_path)
-        print(f"  {ply_path.stem} OK  ({mask.sum():,} / {len(pts):,} voxel pts in bbox)")
-
-print(f"\n  {len(sites_in_bbox)} sites overlap the buffered Graveforesp")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3.  Pass 2 — full-resolution crop to buffered polygon
-# ─────────────────────────────────────────────────────────────────────────────
-print("\nPass 2 — loading full-resolution clouds, cropping to buffered Graveforesp ...")
+# ── FAST SUBSAMPLED READ: never loads full cloud into memory ──────────────
+print(f"\nSubsampled load (every {SUBSAMPLE_EVERY}th point) + crop for {len(all_ply_files)} sites ...")
 all_pcd_filtered = []
+all_class_labels = []
 total_pts_raw    = 0
+total_pts_read   = 0
 total_pts_filt   = 0
 
-# Store class labels across all clouds
-all_class_labels = []
+# Per-site ground Z: list of (centroid_x_local, centroid_y_local, ground_z_local)
+_site_ground = []
 
-print(f"\n{'Site':>30}  {'Full res':>10}  {'In polygon':>10}")
-print("-" * 56)
+print(f"\n{'Site':>30}  {'Total':>10}  {'Read':>10}  {'In poly':>10}  {'Time':>6}")
+print("-" * 76)
 
-for ply_path in sites_in_bbox:
-    pcd = o3d.io.read_point_cloud(str(ply_path))
-    pts = np.asarray(pcd.points)
-    total_pts_raw += len(pts)
+for ply_path in all_ply_files:
+    _t_ply = time.perf_counter()
 
-    # Read class labels from PLY
-    site_class_labels = None
-    try:
-        with open(str(ply_path), 'r') as f:
-            property_names = []
-            for line in f:
-                line = line.strip()
-                if line.startswith("property "):
-                    property_names.append(line.split()[-1])
-                if line == "end_header":
-                    break
-            if "class" in property_names:
-                class_col_idx = property_names.index("class")
-                labels = []
-                for line in f:
-                    parts = line.split()
-                    if len(parts) > class_col_idx:
-                        labels.append(int(parts[class_col_idx]))
-                site_class_labels = np.array(labels, dtype=int)
-    except Exception:
-        pass
+    # ── Read only every Nth point (skips Open3D entirely) ─────────────
+    xyz, rgb, cls, n_total = _fast_read_ply_subsampled(ply_path, stride=SUBSAMPLE_EVERY)
+    total_pts_raw += n_total
+    n_read = len(xyz)
+    total_pts_read += n_read
 
-    # Bbox pre-filter then polygon crop
+    if n_read == 0:
+        _dt = time.perf_counter() - _t_ply
+        print(f"  {ply_path.stem:>28}  {n_total:>10,}  {n_read:>10,}  {'skip':>10}  {_dt:.2f}s")
+        continue
+
+    # ── Fast bbox pre-filter (vectorised) ─────────────────────────────
     bbox_mask = (
-        (pts[:, 0] >= gx_min) & (pts[:, 0] <= gx_max) &
-        (pts[:, 1] >= gy_min) & (pts[:, 1] <= gy_max)
+        (xyz[:, 0] >= gx_min) & (xyz[:, 0] <= gx_max) &
+        (xyz[:, 1] >= gy_min) & (xyz[:, 1] <= gy_max)
     )
-    candidates = pts[bbox_mask]
-    poly_mask = buf_path.contains_points(candidates[:, :2])
-    bbox_indices = np.where(bbox_mask)[0]
-    final_indices = bbox_indices[poly_mask]
 
-    pcd_filt = pcd.select_by_index(final_indices)
-    n_filt = len(pcd_filt.points)
+    if not bbox_mask.any():
+        _dt = time.perf_counter() - _t_ply
+        print(f"  {ply_path.stem:>28}  {n_total:>10,}  {n_read:>10,}  {'skip':>10}  {_dt:.2f}s")
+        continue
+
+    # ── Polygon crop on bbox-filtered candidates ──────────────────────
+    candidates = xyz[bbox_mask]
+    poly_mask = buf_path.contains_points(candidates[:, :2])
+    final_mask = np.zeros(n_read, dtype=bool)
+    final_mask[np.where(bbox_mask)[0][poly_mask]] = True
+
+    n_filt = final_mask.sum()
+    if n_filt == 0:
+        _dt = time.perf_counter() - _t_ply
+        print(f"  {ply_path.stem:>28}  {n_total:>10,}  {n_read:>10,}  {'0':>10}  {_dt:.2f}s")
+        continue
+
     total_pts_filt += n_filt
 
-    if n_filt > 0:
-        all_pcd_filtered.append(pcd_filt)
-        # Store corresponding class labels
-        if site_class_labels is not None and len(site_class_labels) == len(pts):
-            all_class_labels.append(site_class_labels[final_indices])
+    # ── Build Open3D PointCloud from subsampled + cropped arrays ──────
+    pcd_filt = o3d.geometry.PointCloud()
+    pcd_filt.points = o3d.utility.Vector3dVector(xyz[final_mask])
+    if rgb is not None:
+        pcd_filt.colors = o3d.utility.Vector3dVector(rgb[final_mask].astype(float) / 255.0)
+    all_pcd_filtered.append(pcd_filt)
+
+    # ── Class labels come for free from the subsampled read ───────────
+    if cls is not None:
+        all_class_labels.append(cls[final_mask])
+    else:
+        all_class_labels.append(None)
+
+    # ── Per-site ground Z from class-2 ("Trench") P95 ───────────────
+    _site_pts = xyz[final_mask]
+    _site_cx  = float(_site_pts[:, 0].mean())
+    _site_cy  = float(_site_pts[:, 1].mean())
+    if cls is not None:
+        _trench_mask = cls[final_mask] == 2
+        if _trench_mask.sum() > 0:
+            _site_gz = float(np.percentile(_site_pts[_trench_mask, 2], 95))
         else:
-            all_class_labels.append(None)
+            _site_gz = float(np.percentile(_site_pts[:, 2], 95))
+    else:
+        _site_gz = float(np.percentile(_site_pts[:, 2], 95))
+    _site_ground.append((_site_cx, _site_cy, _site_gz))
 
-    print(f"  {ply_path.stem:>28}  {len(pts):>10,}  {n_filt:>10,}")
+    _dt = time.perf_counter() - _t_ply
+    print(f"  {ply_path.stem:>28}  {n_total:>10,}  {n_read:>10,}  {n_filt:>10,}  {_dt:.2f}s")
 
-print("-" * 56)
-print(f"  {'Total':>28}  {total_pts_raw:>10,}  {total_pts_filt:>10,}  "
-      f"({len(all_pcd_filtered)} sites)\n")
+print("-" * 76)
+print(f"  {'Total':>28}  {total_pts_raw:>10,}  {total_pts_read:>10,}  {total_pts_filt:>10,}  "
+      f"({len(all_pcd_filtered)} sites)")
+print(f"  [timer] PLY subsampled load + crop: {time.perf_counter() - _t_step:.2f}s\n")
 
 if not all_pcd_filtered:
     print("[ERROR] No points fell within the buffered Graveforesp polygon.")
@@ -328,7 +335,6 @@ if has_any_labels:
     for cls_id, cfg in CLASS_LABELS.items():
         mask = merged_class_labels == cls_id
         class_colors[mask] = cfg["color"]
-    # Unknown / no-label points keep original colour
     unknown = ~np.isin(merged_class_labels, list(CLASS_LABELS.keys()))
     class_colors[unknown] = original_colors[unknown]
 else:
@@ -338,50 +344,45 @@ else:
 print(f"  Merged point cloud: {len(all_pts):,} points")
 print(f"  Cloud centroid (local): [{cloud_centroid[0]:.2f}, {cloud_centroid[1]:.2f}, {cloud_centroid[2]:.2f}]")
 
+# Z range of merged point cloud — used to clamp utility depths
+PC_Z_MIN = float(all_pts[:, 2].min())
+PC_Z_MAX = float(all_pts[:, 2].max())
+print(f"  Point cloud Z range: [{PC_Z_MIN:.2f}, {PC_Z_MAX:.2f}]")
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Pick ground-level points interactively
+# 3.  Per-site ground level from class-2 ("Trench") P95
 # ─────────────────────────────────────────────────────────────────────────────
-def pick_points(pcd):
-    print("\n" + "=" * 62)
-    print("  GROUND-LEVEL POINT PICKING")
-    print("=" * 62)
-    print("  Shift + Left-Click  to select points on the ground surface.")
-    print("  Pick one or more points that represent the ground level.")
-    print("  Press Q or close the window when finished.")
-    print("=" * 62 + "\n")
+# Each site gets its own ground Z from the P95 of its class-2 ("Trench")
+# points — the top of the trench where it meets the street surface.
+# Utilities look up the nearest site's ground Z for depth placement.
+# A global GROUND_Z (median of per-site values) is kept for the
+# Graveforesp surface mesh and as a final fallback.
 
-    vis = o3d.visualization.VisualizerWithEditing()
-    vis.create_window(
-        window_name="Pick ground-level points  (Shift+Click, then Q)",
-        width=1280, height=720,
-    )
-    vis.add_geometry(pcd)
-    vis.run()
-    vis.destroy_window()
-    return vis.get_picked_points()
+_site_ground_arr = np.array(_site_ground)  # (N, 3): cx, cy, gz
+_n_sites = len(_site_ground_arr)
+
+GROUND_Z = float(np.median(_site_ground_arr[:, 2]))
+_pick_method_tag = f"per-site auto ({_n_sites} sites, median)"
+
+print(f"\n  Per-site ground Z ({_n_sites} sites):")
+for i, (sx, sy, sgz) in enumerate(_site_ground):
+    print(f"    Site {i+1:>2}: centroid=({sx:.1f}, {sy:.1f})  ground_Z={sgz:.3f} m")
+print(f"  Global ground Z (median of sites) = {GROUND_Z:.3f} m")
 
 
-picked_indices = pick_points(merged_pcd)
-
-if len(picked_indices) == 0:
-    print("[WARNING] No points picked!  Falling back to P95 of point cloud Z.")
-    GROUND_Z = float(np.percentile(all_pts[:, 2], 95))
-else:
-    picked_pts = all_pts[picked_indices]
-    GROUND_Z = float(np.mean(picked_pts[:, 2]))
-    print(f"\n  Picked {len(picked_indices)} ground-level point(s):")
-    for i, idx in enumerate(picked_indices):
-        p = all_pts[idx]
-        print(f"    [{i+1}]  index {idx:>8,}  ->  X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
-
-print(f"\n  Ground level (local) = {GROUND_Z:.3f} m")
+def _ground_z_at(x_local, y_local):
+    """Return the ground Z of the nearest site to the given local XY."""
+    dx = _site_ground_arr[:, 0] - x_local
+    dy = _site_ground_arr[:, 1] - y_local
+    nearest = np.argmin(dx * dx + dy * dy)
+    return float(_site_ground_arr[nearest, 2])
 
 _depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  Geometry helpers
+# 4.  Geometry helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def segment_to_cylinder(p1, p2, radius, color, resolution=12):
+def segment_to_cylinder(p1, p2, radius, color, resolution=_CYL_RESOLUTION):
     vec = p2 - p1
     length = np.linalg.norm(vec)
     if length < 1e-6:
@@ -420,7 +421,8 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
     coords[:, 0] -= TX
     coords[:, 1] -= TY
 
-    bad = coords[:, 2] == -99
+    # Catch -99 and any near-sentinel values (float imprecision)
+    bad = coords[:, 2] <= -98
     if bad.any():
         ind_depth_m = None
         if vejledende_dybde_mm is not None:
@@ -434,18 +436,30 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
         good_z = coords[~bad, 2]
         feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
 
+        # Use the segment midpoint to find the nearest site's ground Z
+        _mid_x = float(coords[:, 0].mean())
+        _mid_y = float(coords[:, 1].mean())
+        _local_ground_z = _ground_z_at(_mid_x, _mid_y)
+
         for idx in np.where(bad)[0]:
             if ind_depth_m is not None:
-                coords[idx, 2] = (GROUND_Z + TZ) - ind_depth_m
+                coords[idx, 2] = (_local_ground_z + TZ) - ind_depth_m
                 _depth_stats["estimated"] += 1
             elif feature_mean_z is not None:
                 coords[idx, 2] = feature_mean_z
                 _depth_stats["fallback_feature_mean"] += 1
             else:
-                coords[idx, 2] = GROUND_Z + TZ
+                coords[idx, 2] = _local_ground_z + TZ
                 _depth_stats["fallback_global"] += 1
 
     coords[:, 2] -= TZ
+
+    # Clamp Z to the range of the actual point cloud.
+    # This catches any unresolved sentinels, bogus Z=0 values, and
+    # wildly wrong depth estimates.  For an overview viewer the utilities
+    # should sit within the point cloud's vertical extent.
+    coords[:, 2] = np.clip(coords[:, 2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
+
     return coords
 
 
@@ -494,21 +508,18 @@ def _clip_segment_to_bbox(p1, p2):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  Build Graveforesp surface mesh (triangulated polygon)
+# 5.  Build Graveforesp surface mesh (triangulated polygon)
 # ─────────────────────────────────────────────────────────────────────────────
 print("\nBuilding Graveforesp surface mesh ...")
 
-# Use the original (unbuffered) polygon for the surface
-grave_verts_2d = grave_xy_local[:-1]  # drop closing vertex (duplicate of first)
+grave_verts_2d = grave_xy_local[:-1]
 n_grave = len(grave_verts_2d)
 
-# Create 3D vertices at ground level
 grave_verts_3d = np.zeros((n_grave, 3))
 grave_verts_3d[:, 0] = grave_verts_2d[:, 0]
 grave_verts_3d[:, 1] = grave_verts_2d[:, 1]
 grave_verts_3d[:, 2] = GROUND_Z
 
-# Fan triangulation from vertex 0
 grave_triangles = []
 for i in range(1, n_grave - 1):
     grave_triangles.append([0, i, i + 1])
@@ -516,12 +527,11 @@ for i in range(1, n_grave - 1):
 grave_mesh = o3d.geometry.TriangleMesh()
 grave_mesh.vertices = o3d.utility.Vector3dVector(grave_verts_3d)
 grave_mesh.triangles = o3d.utility.Vector3iVector(np.array(grave_triangles, dtype=np.int32))
-grave_mesh.paint_uniform_color([0.9, 0.9, 0.2])  # yellow-ish
+grave_mesh.paint_uniform_color([0.9, 0.9, 0.2])
 grave_mesh.compute_vertex_normals()
 
 print(f"  {n_grave} vertices, {len(grave_triangles)} triangles")
 
-# Also build the boundary wireframe
 grave_wire_pts = np.hstack([grave_xy_local, np.full((len(grave_xy_local), 1), GROUND_Z)])
 grave_lines = [[i, i + 1] for i in range(len(grave_wire_pts) - 1)]
 grave_ls = o3d.geometry.LineSet(
@@ -531,28 +541,81 @@ grave_ls = o3d.geometry.LineSet(
 grave_ls.paint_uniform_color([1.0, 1.0, 0.0])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  Load utility lines (pipes / cables) within buffered Graveforesp
+# 6.  Load ALL GML layers ONCE (was 14 separate reads of the same file)
 # ─────────────────────────────────────────────────────────────────────────────
-print("\n--- Loading utility lines within buffered Graveforesp ---")
+_t_step = time.perf_counter()
+print("\n--- Loading all GML layers (single pass) ---")
 
-# Store meshes per layer for individual toggling
-layer_meshes = {}       # layer_name -> combined TriangleMesh
-layer_stats = {}        # layer_name -> (n_features, n_segments)
+_cached_gdfs = {}  # layer_name -> GeoDataFrame
+
+for layer_name in list(LINE_LAYERS.keys()) + list(COMPONENT_LAYERS.keys()):
+    if layer_name in _cached_gdfs:
+        continue
+    _tl = time.perf_counter()
+    try:
+        _cached_gdfs[layer_name] = gpd.read_file(GML_PATH, layer=layer_name)
+        print(f"  {layer_name:<35} {len(_cached_gdfs[layer_name]):>5} features  "
+              f"[{time.perf_counter() - _tl:.2f}s]")
+    except Exception as e:
+        print(f"  {layer_name:<35} skip ({e})")
+
+print(f"  [timer] GML loading (all layers): {time.perf_counter() - _t_step:.2f}s")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7.  Build utility line meshes from cached GML data
+# ─────────────────────────────────────────────────────────────────────────────
+_t_step = time.perf_counter()
+print("\n--- Building utility line meshes ---")
+
+layer_meshes = {}
+layer_stats = {}
 all_pipe_coords = []
 
-# Picking data
 pick_seg_midpoints = []
 pick_seg_attrs = []
 pick_seg_layer = []
 
-# Per-layer average depth for component fallback
 _layer_avg_depth_local = {}
 
+def _batch_merge_meshes(mesh_list):
+    """Merge meshes in O(n) by collecting all vertices/triangles, then building once."""
+    if not mesh_list:
+        return None
+    if len(mesh_list) == 1:
+        mesh_list[0].compute_vertex_normals()
+        return mesh_list[0]
+
+    all_verts = []
+    all_tris = []
+    all_colors = []
+    offset = 0
+    for m in mesh_list:
+        v = np.asarray(m.vertices)
+        t = np.asarray(m.triangles)
+        c = np.asarray(m.vertex_colors) if m.has_vertex_colors() else None
+        all_verts.append(v)
+        all_tris.append(t + offset)
+        if c is not None and len(c) == len(v):
+            all_colors.append(c)
+        else:
+            # Use the uniform paint color (first vertex of the mesh)
+            vc = np.asarray(m.vertex_colors)
+            if len(vc) > 0:
+                all_colors.append(vc)
+            else:
+                all_colors.append(np.tile([0.5, 0.5, 0.5], (len(v), 1)))
+        offset += len(v)
+
+    combined = o3d.geometry.TriangleMesh()
+    combined.vertices = o3d.utility.Vector3dVector(np.vstack(all_verts))
+    combined.triangles = o3d.utility.Vector3iVector(np.vstack(all_tris))
+    combined.vertex_colors = o3d.utility.Vector3dVector(np.vstack(all_colors))
+    combined.compute_vertex_normals()
+    return combined
+
 for layer_name, cfg in LINE_LAYERS.items():
-    try:
-        gdf = gpd.read_file(GML_PATH, layer=layer_name)
-    except Exception as e:
-        print(f"  {layer_name}: skip ({e})")
+    gdf = _cached_gdfs.get(layer_name)
+    if gdf is None:
         continue
 
     default_color = cfg["color"]
@@ -564,6 +627,8 @@ for layer_name, cfg in LINE_LAYERS.items():
 
     for _, row in gdf.iterrows():
         geom = row.geometry
+        if geom is None:
+            continue
 
         if geom.geom_type == "MultiLineString":
             sub_geoms = list(geom.geoms)
@@ -579,10 +644,7 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
-        if layer_name == "Vandledning" and diam_mm > 0:
-            color = DIAMETER_COLORS.get(int(diam_mm), default_color)
-        else:
-            color = default_color
+        color = default_color
 
         vejl_dybde = None
         if "vejledendeDybde" in row.index:
@@ -627,12 +689,9 @@ for layer_name, cfg in LINE_LAYERS.items():
     if _layer_z_vals:
         _layer_avg_depth_local[layer_name] = float(np.mean(_layer_z_vals))
 
-    # Merge layer meshes
-    if layer_mesh_list:
-        combined = layer_mesh_list[0]
-        for m in layer_mesh_list[1:]:
-            combined += m
-        combined.compute_vertex_normals()
+    # Batch merge (O(n) instead of O(n^2))
+    combined = _batch_merge_meshes(layer_mesh_list)
+    if combined is not None:
         layer_meshes[layer_name] = combined
         print(f"  {layer_name:<35} {n_features:>4} features  {n_segments:>5} segments")
 
@@ -642,6 +701,7 @@ print(f"\n  Total line segments: {sum(s for _, s in layer_stats.values()):,}")
 print(f"  Depth stats: estimated={_depth_stats['estimated']}, "
       f"fallback_mean={_depth_stats['fallback_feature_mean']}, "
       f"fallback_global={_depth_stats['fallback_global']}")
+print(f"  [timer] Line mesh building: {time.perf_counter() - _t_step:.2f}s")
 
 # Pipe centroid
 pipe_centroid = np.array([0.0, 0.0, 0.0])
@@ -649,18 +709,14 @@ if all_pipe_coords:
     pipe_centroid = np.vstack(all_pipe_coords).mean(axis=0)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8.  Load utility components (points) within buffered Graveforesp
+# 8.  Load utility components from cached GML data
 # ─────────────────────────────────────────────────────────────────────────────
-_COMP_TO_LINE = {
-    "Vandkomponent":               "Vandledning",
-    "Afloebskomponent":            "Afloebsledning",
-    "Gaskomponent":                "Gasledning",
-    "Elkomponent":                 "Elledning",
-    "Telekommunikationskomponent": "Telekommunikationsledning",
-}
+_t_step = time.perf_counter()
+print("\n--- Building utility component meshes ---")
 
-print("\n--- Loading utility components within buffered Graveforesp ---")
-comp_meshes = {}   # layer_name -> combined TriangleMesh
+_COMP_TO_LINE = COMP_TO_LINE
+
+comp_meshes = {}
 comp_stats = {}
 
 pick_comp_centres = []
@@ -668,9 +724,8 @@ pick_comp_attrs = []
 pick_comp_layer = []
 
 for layer_name, cfg in COMPONENT_LAYERS.items():
-    try:
-        gdf_c = gpd.read_file(GML_PATH, layer=layer_name)
-    except Exception:
+    gdf_c = _cached_gdfs.get(layer_name)
+    if gdf_c is None:
         continue
 
     color = cfg["color"]
@@ -682,21 +737,45 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
 
     for _, row in gdf_c.iterrows():
         g = row.geometry
-        if not _point_in_bbox(g.x, g.y):
+        if g is None:
             continue
 
-        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+        # Extract representative point: centroid for polygons/lines, direct coords for points
+        if g.geom_type in ("Point", "PointZ"):
+            gx, gy, gz = g.x, g.y, g.z
+        else:
+            # Polygon, MultiPolygon, LineString, etc. — use centroid
+            c = g.centroid
+            gx, gy = c.x, c.y
+            # Try to get Z from the geometry's representative coord
+            if g.has_z:
+                # Take the Z of the first coordinate
+                try:
+                    first_coord = next(iter(g.exterior.coords)) if hasattr(g, 'exterior') else next(iter(g.coords))
+                    gz = first_coord[2] if len(first_coord) > 2 else 0.0
+                except Exception:
+                    gz = 0.0
+            else:
+                gz = 0.0
+
+        if not _point_in_bbox(gx, gy):
+            continue
+
+        pt = np.array([gx - TX, gy - TY, gz - TZ], dtype=float)
         if not _pt_in_local_bbox(pt[0], pt[1]):
             continue
 
-        if g.z == -99 or pt[2] <= -98:
+        if gz <= -98 or pt[2] <= -98:
             if parent_avg_z is not None:
                 pt[2] = parent_avg_z
             else:
-                pt[2] = GROUND_Z
+                pt[2] = _ground_z_at(pt[0], pt[1])
+
+        # Clamp to point cloud Z range
+        pt[2] = np.clip(pt[2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
-            radius=COMPONENT_SPHERE_RADIUS, resolution=12
+            radius=COMPONENT_SPHERE_RADIUS, resolution=8
         )
         sphere.translate(pt)
         sphere.paint_uniform_color(color)
@@ -715,19 +794,16 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         n_comp += 1
 
     comp_stats[layer_name] = n_comp
-    if comp_mesh_list:
-        combined = comp_mesh_list[0]
-        for m in comp_mesh_list[1:]:
-            combined += m
-        combined.compute_vertex_normals()
+    combined = _batch_merge_meshes(comp_mesh_list)
+    if combined is not None:
         comp_meshes[layer_name] = combined
         print(f"  {layer_name:<35} {n_comp:>4} components")
 
 pick_comp_centres = np.array(pick_comp_centres) if pick_comp_centres else np.empty((0, 3))
+print(f"  [timer] Component mesh building: {time.perf_counter() - _t_step:.2f}s")
 
 _t_load = time.perf_counter()
 print(f"\nAll data loaded in {_t_load - _t0:.2f}s")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 9.  Coordinate frame
 # ─────────────────────────────────────────────────────────────────────────────
@@ -740,7 +816,7 @@ frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
 # ─────────────────────────────────────────────────────────────────────────────
 def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
     mat = rendering.MaterialRecord()
-    mat.shader = "defaultUnlitTransparency"
+    mat.shader = "defaultLitTransparency"
     mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
     return mat
 
@@ -791,7 +867,15 @@ em = window.theme.font_size
 
 scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
-scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
+scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
+
+# Gentle top-down sun light for subtle depth shading on utility meshes
+scene_widget.scene.scene.set_sun_light(
+    [0.0, 0.0, -1.0],        # direction: straight down
+    [1.0, 1.0, 1.0],         # white colour
+    75000,                    # intensity
+)
+scene_widget.scene.scene.enable_sun_light(True)
 
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, merged_pcd, make_point_material())
@@ -848,44 +932,75 @@ def _toggle_class_labels(show_labels: bool):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12.  Right-side control panel
+# 12.  Right-side control panel  (matches base_viewer layout)
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_WIDTH = int(22 * em)
-panel = gui.ScrollableVert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+PANEL_WIDTH = int(20 * em)
+panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
-# Title
-panel.add_child(gui.Label("--- Graveforesp Viewer ---"))
-panel.add_fixed(int(0.3 * em))
-panel.add_child(gui.Label(f"Area: {AREA_NAME}"))
-panel.add_child(gui.Label(f"Sites: {len(all_pcd_filtered)}  |  Points: {total_pts_filt:,}"))
-panel.add_child(gui.Label(f"Buffer: {BUFFER} m"))
+panel.add_child(gui.Label(f"Area: {AREA_NAME}  |  Sites: {len(all_pcd_filtered)}"))
+panel.add_child(gui.Label(f"Points: {total_pts_filt:,}  |  Buffer: {BUFFER} m"))
+panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method_tag})"))
 panel.add_fixed(int(0.3 * em))
 
-_pick_method = f"picked from {len(picked_indices)} pt(s)" if picked_indices else "fallback P95"
-panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
+# ── Show origin axis ──────────────────────────────────────────────────────
+origin_frame_visible = [False]
+scene_widget.scene.show_geometry(FRAME_GEOM, False)
+
+origin_toggle_cb = gui.Checkbox("Show origin axis")
+origin_toggle_cb.checked = False
+
+def _on_origin_toggle(checked):
+    origin_frame_visible[0] = checked
+    scene_widget.scene.show_geometry(FRAME_GEOM, checked)
+    window.post_redraw()
+
+origin_toggle_cb.set_on_checked(_on_origin_toggle)
+panel.add_child(origin_toggle_cb)
+
 panel.add_fixed(int(0.8 * em))
 
-# ── Class Label Toggle ─────────────────────────────────────────────────────
-panel.add_child(gui.Label("--- Class Labels ---"))
-panel.add_fixed(int(0.3 * em))
-
-class_toggle_cb = gui.Checkbox("Show class label colours  (L)")
+# ── Class Label Toggle ────────────────────────────────────────────────────
+class_toggle_cb = gui.Checkbox("OpenTrench3D ID Class")
 class_toggle_cb.checked = False
 if class_colors is None:
     class_toggle_cb.enabled = False
 
+_class_legend_container = gui.Vert(0)
+if merged_class_labels is not None:
+    for cls_id in sorted(CLASS_LABELS.keys()):
+        cfg = CLASS_LABELS[cls_id]
+        if cls_id not in np.unique(merged_class_labels):
+            continue
+        n_pts = int((merged_class_labels == cls_id).sum())
+        col = cfg["color"]
+        sr, sg, sb = (linear_to_srgb(c) for c in col)
+
+        row     = gui.Horiz(int(0.3 * em))
+        swatch  = gui.Button(" ")
+        swatch.background_color = gui.Color(sr, sg, sb, 1.0)
+        swatch.toggleable = False
+        swatch.vertical_padding_em = 0.0
+        swatch.horizontal_padding_em = 0.3
+        row.add_child(swatch)
+        row.add_fixed(int(0.4 * em))
+        row.add_child(gui.Label(f"{cls_id}: {cfg['name']} ({n_pts:,})"))
+        _class_legend_container.add_child(row)
+_class_legend_container.visible = False
+
+
 def _on_class_toggle(checked):
     _toggle_class_labels(checked)
+    _class_legend_container.visible = checked
+    window.set_needs_layout()
 
 class_toggle_cb.set_on_checked(_on_class_toggle)
 panel.add_child(class_toggle_cb)
+panel.add_child(_class_legend_container)
+
 panel.add_fixed(int(0.8 * em))
 
-# ── Graveforesp Surface Controls ───────────────────────────────────────────
-panel.add_child(gui.Label("--- Graveforesp Surface ---"))
-panel.add_fixed(int(0.3 * em))
-
-grave_visible_cb = gui.Checkbox("Show surface")
+# ── Graveforesp Surface ──────────────────────────────────────────────────
+grave_visible_cb = gui.Checkbox("Graveforesp surface")
 grave_visible_cb.checked = True
 
 def _on_grave_toggle(checked):
@@ -899,9 +1014,9 @@ panel.add_fixed(int(0.2 * em))
 grave_opacity_label = gui.Label(f"{grave_opacity[0]:.2f}")
 grave_opacity_row = gui.Horiz(int(0.25 * em))
 grave_opacity_row.add_child(gui.Label("Opacity"))
-grave_opacity_row.add_stretch()
-grave_opacity_row.add_child(grave_opacity_label)
-panel.add_child(grave_opacity_row)
+grave_opacity_row.add_child(gui.Slider(gui.Slider.DOUBLE))
+grave_opacity_row = gui.Horiz(int(0.25 * em))
+grave_opacity_row.add_child(gui.Label("Opacity"))
 
 grave_slider = gui.Slider(gui.Slider.DOUBLE)
 grave_slider.set_limits(0.0, 1.0)
@@ -921,162 +1036,232 @@ def _apply_grave_opacity(val):
 
 
 grave_slider.set_on_value_changed(lambda v: _apply_grave_opacity(v))
-panel.add_child(grave_slider)
+
+grave_slider_row = gui.Horiz(int(0.25 * em))
+grave_slider_row.add_child(gui.Label("Opacity"))
+grave_slider_row.add_child(grave_slider)
+panel.add_child(grave_slider_row)
+
 panel.add_fixed(int(0.8 * em))
 
-# ── Per-Category Utility Controls ──────────────────────────────────────────
-panel.add_child(gui.Label("--- Utility Layers ---"))
-panel.add_fixed(int(0.3 * em))
+# ── Utility Legend (with per-layer visibility toggles) ────────────────────
+_gml_folder = Path(GML_PATH).parent.name
+_ler_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _gml_folder, re.IGNORECASE)
+_ler_label = f"{_ler_match.group(1)} {_ler_match.group(2)}" if _ler_match else _gml_folder
 
-# Build a unified list of all layers that have geometry
-all_layer_names = []
-for ln in LINE_LAYERS:
-    if ln in layer_meshes:
-        all_layer_names.append(ln)
-for ln in COMPONENT_LAYERS:
-    if ln in comp_meshes:
-        all_layer_names.append(ln)
+_ler_active = [True]
+pipe_opacity_val = [1.0]
+_layer_visible = {}
 
-# Store UI widgets for each layer
-_layer_sliders = {}
-_layer_checkboxes = {}
+ler_toggle_cb = gui.Checkbox(_ler_label)
+ler_toggle_cb.checked = True
+
+_ler_legend_container = gui.Vert(int(0.3 * em))
+
+# Global opacity slider
+opacity_value_label = gui.Label("1.00")
+opacity_slider = gui.Slider(gui.Slider.DOUBLE)
+opacity_slider.set_limits(0.0, 1.0)
+opacity_slider.double_value = 1.0
+
+slider_row = gui.Horiz(int(0.25 * em))
+slider_row.add_child(gui.Label("Opacity"))
+slider_row.add_child(opacity_slider)
 
 
-def _make_layer_toggle(layer_name):
-    """Create a checkbox + opacity slider for one utility layer."""
-    is_line = layer_name in LINE_LAYERS
-    is_comp = layer_name in COMPONENT_LAYERS
-    cfg = LINE_LAYERS.get(layer_name) or COMPONENT_LAYERS.get(layer_name)
+def _apply_opacity(val: float):
+    val = max(0.0, min(1.0, val))
+    pipe_opacity_val[0] = val
+    opacity_slider.double_value = val
+    opacity_value_label.text = f"{val:.2f}"
+    for ln in layer_opacity:
+        layer_opacity[ln][0] = val
+    for ln in layer_meshes:
+        alpha = val if _layer_visible.get(ln, True) else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_line_geom_name(ln))
+        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+    for ln in comp_meshes:
+        alpha = val if _layer_visible.get(ln, True) else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_comp_geom_name(ln))
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+    window.post_redraw()
+
+
+opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
+_ler_legend_container.add_child(slider_row)
+
+_pipe_checkboxes = []
+_comp_checkboxes = []
+
+
+def _make_pipe_toggle(ln):
+    def _cb(checked):
+        _layer_visible[ln] = checked
+        alpha = pipe_opacity_val[0] if checked else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_line_geom_name(ln))
+        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+        window.post_redraw()
+    return _cb
+
+
+def _make_comp_toggle(ln):
+    def _cb(checked):
+        _layer_visible[ln] = checked
+        alpha = pipe_opacity_val[0] if checked else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_comp_geom_name(ln))
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+        window.post_redraw()
+    return _cb
+
+
+# "Toggle all segments" master checkbox
+_all_pipes_cb = gui.Checkbox("All segments")
+_all_pipes_cb.checked = True
+
+def _on_toggle_all_pipes(checked):
+    for ln, cb in _pipe_checkboxes:
+        cb.checked = checked
+        _layer_visible[ln] = checked
+        alpha = pipe_opacity_val[0] if checked else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_line_geom_name(ln))
+        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+    window.post_redraw()
+
+_all_pipes_cb.set_on_checked(_on_toggle_all_pipes)
+_ler_legend_container.add_child(_all_pipes_cb)
+
+# Line layers
+for layer_name in LINE_LAYERS:
+    if layer_name not in layer_meshes:
+        continue
+    cfg = LINE_LAYERS[layer_name]
+    n_feat, n_seg = layer_stats.get(layer_name, (0, 0))
+    col = cfg["color"]
+    sr, sg, sb = (linear_to_srgb(c) for c in col)
+    row    = gui.Horiz(int(0.3 * em))
+    swatch = gui.Button(" ")
+    swatch.background_color = gui.Color(sr, sg, sb, 1.0)
+    swatch.toggleable = False
+    swatch.vertical_padding_em = 0.0
+    swatch.horizontal_padding_em = 0.3
+
+    cb = gui.Checkbox(f"{layer_name} ({n_feat})")
+    cb.checked = True
+    _layer_visible[layer_name] = True
+    cb.set_on_checked(_make_pipe_toggle(layer_name))
+    _pipe_checkboxes.append((layer_name, cb))
+
+    row.add_child(swatch)
+    row.add_fixed(int(0.4 * em))
+    row.add_child(cb)
+    _ler_legend_container.add_child(row)
+
+# "Toggle all components" master checkbox
+_all_comps_cb = gui.Checkbox("All components")
+_all_comps_cb.checked = True
+
+def _on_toggle_all_comps(checked):
+    for ln, cb in _comp_checkboxes:
+        cb.checked = checked
+        _layer_visible[ln] = checked
+        alpha = pipe_opacity_val[0] if checked else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_comp_geom_name(ln))
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+    window.post_redraw()
+
+_all_comps_cb.set_on_checked(_on_toggle_all_comps)
+_ler_legend_container.add_child(_all_comps_cb)
+
+# Component layers
+for layer_name, cfg in COMPONENT_LAYERS.items():
+    if layer_name not in comp_meshes:
+        continue
+    n_comp = comp_stats.get(layer_name, 0)
     col = cfg["color"]
     sr, sg, sb = (linear_to_srgb(c) for c in col)
 
-    n_feat, n_seg = layer_stats.get(layer_name, (0, 0))
-    n_comp_count = comp_stats.get(layer_name, 0)
-
-    # Swatch + checkbox row
-    row = gui.Horiz(int(0.3 * em))
-    swatch = gui.Button("    ")
+    row    = gui.Horiz(int(0.3 * em))
+    swatch = gui.Button(" ")
     swatch.background_color = gui.Color(sr, sg, sb, 1.0)
     swatch.toggleable = False
-    row.add_child(swatch)
-    row.add_fixed(int(0.3 * em))
+    swatch.vertical_padding_em = 0.0
+    swatch.horizontal_padding_em = 0.3
 
-    if is_line and layer_name in layer_meshes:
-        label_text = f"{layer_name} ({n_feat}f/{n_seg}s)"
-    elif is_comp:
-        label_text = f"{layer_name} ({n_comp_count})"
-    else:
-        label_text = layer_name
-
-    cb = gui.Checkbox(label_text)
+    cb = gui.Checkbox(f"{layer_name} ({n_comp})")
     cb.checked = True
+    _layer_visible[layer_name] = True
+    cb.set_on_checked(_make_comp_toggle(layer_name))
+    _comp_checkboxes.append((layer_name, cb))
+
+    row.add_child(swatch)
+    row.add_fixed(int(0.4 * em))
     row.add_child(cb)
-    panel.add_child(row)
-
-    # Opacity slider
-    opacity_lbl = gui.Label("1.00")
-    slider_row = gui.Horiz(int(0.25 * em))
-    slider_row.add_child(gui.Label("  Opacity"))
-    slider_row.add_stretch()
-    slider_row.add_child(opacity_lbl)
-    panel.add_child(slider_row)
-
-    slider = gui.Slider(gui.Slider.DOUBLE)
-    slider.set_limits(0.0, 1.0)
-    slider.double_value = 1.0
-    panel.add_child(slider)
-    panel.add_fixed(int(0.3 * em))
-
-    _layer_sliders[layer_name] = (slider, opacity_lbl)
-    _layer_checkboxes[layer_name] = cb
-
-    def _apply(val, _ln=layer_name):
-        val = max(0.0, min(1.0, val))
-        layer_opacity[_ln][0] = val
-        _layer_sliders[_ln][0].double_value = val
-        _layer_sliders[_ln][1].text = f"{val:.2f}"
-        mat = make_mesh_material(val)
-        if _ln in layer_meshes:
-            gn = _line_geom_name(_ln)
-            scene_widget.scene.remove_geometry(gn)
-            scene_widget.scene.add_geometry(gn, layer_meshes[_ln], mat)
-            if not _layer_checkboxes[_ln].checked:
-                scene_widget.scene.show_geometry(gn, False)
-        if _ln in comp_meshes:
-            gn = _comp_geom_name(_ln)
-            scene_widget.scene.remove_geometry(gn)
-            scene_widget.scene.add_geometry(gn, comp_meshes[_ln], mat)
-            if not _layer_checkboxes[_ln].checked:
-                scene_widget.scene.show_geometry(gn, False)
-        window.post_redraw()
-
-    slider.set_on_value_changed(lambda v, _ln=layer_name: _apply(v, _ln))
-
-    def _toggle(checked, _ln=layer_name):
-        if _ln in layer_meshes:
-            scene_widget.scene.show_geometry(_line_geom_name(_ln), checked)
-        if _ln in comp_meshes:
-            scene_widget.scene.show_geometry(_comp_geom_name(_ln), checked)
-        window.post_redraw()
-
-    cb.set_on_checked(lambda c, _ln=layer_name: _toggle(c, _ln))
+    _ler_legend_container.add_child(row)
 
 
-# Group line layers, then component layers
-# First: line layers
-has_line_content = any(ln in layer_meshes for ln in LINE_LAYERS)
-if has_line_content:
-    panel.add_child(gui.Label("Pipes / Cables:"))
-    panel.add_fixed(int(0.2 * em))
-    for ln in LINE_LAYERS:
-        if ln in layer_meshes:
-            _make_layer_toggle(ln)
+def _on_ler_toggle(checked):
+    _ler_active[0] = checked
+    _ler_legend_container.visible = checked
+    for ln in layer_meshes:
+        alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_line_geom_name(ln))
+        scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
+    for ln in comp_meshes:
+        alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
+        mat = make_mesh_material(alpha)
+        scene_widget.scene.remove_geometry(_comp_geom_name(ln))
+        scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
+    window.set_needs_layout()
+    window.post_redraw()
 
-has_comp_content = any(ln in comp_meshes for ln in COMPONENT_LAYERS)
-if has_comp_content:
-    panel.add_fixed(int(0.3 * em))
-    panel.add_child(gui.Label("Components:"))
-    panel.add_fixed(int(0.2 * em))
-    for ln in COMPONENT_LAYERS:
-        if ln in comp_meshes:
-            _make_layer_toggle(ln)
 
-panel.add_fixed(int(0.8 * em))
+ler_toggle_cb.set_on_checked(_on_ler_toggle)
+panel.add_child(ler_toggle_cb)
+panel.add_child(_ler_legend_container)
 
-# ── Selected Feature panel ────────────────────────────────────────────────
-panel.add_child(gui.Label("--- Selected Feature ---"))
-panel.add_fixed(int(0.3 * em))
+panel.add_stretch()
 
-info_hint = gui.Label("Ctrl+click a pipe or component")
-info_hint.text_color = gui.Color(0.55, 0.55, 0.55, 1.0)
-panel.add_child(info_hint)
-panel.add_fixed(int(0.3 * em))
-
-info_scroll = gui.ScrollableVert(int(0.2 * em), gui.Margins(0, 0, 0, 0))
-panel.add_child(info_scroll)
+# ── Left-side info panel (shown only when a feature is selected) ──────────
+LEFT_PANEL_WIDTH = int(22 * em)
+left_panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+left_panel.background_color = gui.Color(0.15, 0.15, 0.15, 1.0)
 
 _info_type_lbl = gui.Label("")
 _info_type_lbl.text_color = gui.Color(0.85, 0.85, 0.20, 1.0)
-info_scroll.add_child(_info_type_lbl)
-info_scroll.add_fixed(int(0.25 * em))
+left_panel.add_child(_info_type_lbl)
+left_panel.add_fixed(int(0.4 * em))
+
+info_scroll = gui.ScrollableVert(int(0.3 * em),
+                                  gui.Margins(int(0.5 * em), 0, int(0.5 * em), 0))
+left_panel.add_child(info_scroll)
 
 _MAX_ATTRS = 30
 _attr_rows = []
 for _ in range(_MAX_ATTRS):
-    row_h = gui.Horiz(int(0.15 * em))
+    row_h = gui.Horiz(int(0.3 * em))
     k_lbl = gui.Label("")
     v_lbl = gui.Label("")
     k_lbl.text_color = gui.Color(0.65, 0.75, 1.00, 1.0)
     v_lbl.text_color = gui.Color(0.90, 0.90, 0.90, 1.0)
     row_h.add_child(k_lbl)
-    row_h.add_fixed(int(0.3 * em))
+    row_h.add_fixed(int(0.5 * em))
     row_h.add_child(v_lbl)
     info_scroll.add_child(row_h)
     _attr_rows.append((k_lbl, v_lbl))
 
+left_panel.add_stretch()
+_left_panel_visible = [False]
+
 
 def _show_feature_attrs(feature_type: str, attrs: list):
-    info_hint.visible = False
+    """Populate the left-side Selected Feature panel with attribute key-value pairs."""
     _info_type_lbl.text = feature_type
     for i, (k_lbl, v_lbl) in enumerate(_attr_rows):
         if i < len(attrs):
@@ -1088,6 +1273,18 @@ def _show_feature_attrs(feature_type: str, attrs: list):
         else:
             k_lbl.visible = False
             v_lbl.visible = False
+    _left_panel_visible[0] = True
+    window.set_needs_layout()
+    window.post_redraw()
+
+
+def _hide_left_panel():
+    """Hide the left-side info panel when no feature is selected."""
+    _left_panel_visible[0] = False
+    _info_type_lbl.text = ""
+    for k_lbl, v_lbl in _attr_rows:
+        k_lbl.visible = False
+        v_lbl.visible = False
     window.set_needs_layout()
     window.post_redraw()
 
@@ -1134,12 +1331,7 @@ def _do_pick(depth_image):
     if depth >= 1.0:
         def _clear():
             _clear_highlight()
-            info_hint.visible = True
-            _info_type_lbl.text = ""
-            for k_lbl, v_lbl in _attr_rows:
-                k_lbl.visible = False
-                v_lbl.visible = False
-            window.post_redraw()
+            _hide_left_panel()
         gui.Application.instance.post_to_main_thread(window, _clear)
         return
 
@@ -1175,12 +1367,7 @@ def _do_pick(depth_image):
     else:
         def _clear():
             _clear_highlight()
-            info_hint.visible = True
-            _info_type_lbl.text = ""
-            for k_lbl, v_lbl in _attr_rows:
-                k_lbl.visible = False
-                v_lbl.visible = False
-            window.post_redraw()
+            _hide_left_panel()
         gui.Application.instance.post_to_main_thread(window, _clear)
         return
 
@@ -1192,17 +1379,46 @@ def _do_pick(depth_image):
     gui.Application.instance.post_to_main_thread(window, _update)
 
 
+# Distinguish a click from a drag-to-orbit.
+DRAG_THRESHOLD = 8   # pixels — below this the release is treated as a click
+_mouse_down_pos = [None]
+_mouse_moved    = [False]
+_left_was_down  = [False]
+
+
 def on_mouse(event):
-    if event.type != gui.MouseEvent.Type.BUTTON_DOWN:
-        return gui.Widget.EventCallbackResult.IGNORED
-    if not (int(event.buttons) & int(gui.MouseButton.LEFT)):
-        return gui.Widget.EventCallbackResult.IGNORED
-    if not event.is_modifier_down(gui.KeyModifier.CTRL):
+    if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
+        if int(event.buttons) & int(gui.MouseButton.LEFT):
+            _mouse_down_pos[0] = (event.x, event.y)
+            _mouse_moved[0]    = False
+            _left_was_down[0]  = True
         return gui.Widget.EventCallbackResult.IGNORED
 
-    _last_click[0] = (event.x, event.y)
-    scene_widget.scene.scene.render_to_depth_image(_do_pick)
-    return gui.Widget.EventCallbackResult.HANDLED
+    if event.type == gui.MouseEvent.Type.MOVE:
+        if _left_was_down[0] and _mouse_down_pos[0] is not None:
+            dx = event.x - _mouse_down_pos[0][0]
+            dy = event.y - _mouse_down_pos[0][1]
+            if (dx * dx + dy * dy) > DRAG_THRESHOLD * DRAG_THRESHOLD:
+                _mouse_moved[0] = True
+        return gui.Widget.EventCallbackResult.IGNORED
+
+    if event.type == gui.MouseEvent.Type.BUTTON_UP:
+        if not _left_was_down[0]:
+            return gui.Widget.EventCallbackResult.IGNORED
+        _left_was_down[0] = False
+
+        if _mouse_moved[0] or _mouse_down_pos[0] is None:
+            _mouse_down_pos[0] = None
+            return gui.Widget.EventCallbackResult.IGNORED
+
+        # Genuine left-click — fire the pick
+        click_pos = _mouse_down_pos[0]
+        _mouse_down_pos[0] = None
+        _last_click[0] = click_pos
+        scene_widget.scene.scene.render_to_depth_image(_do_pick)
+        return gui.Widget.EventCallbackResult.HANDLED
+
+    return gui.Widget.EventCallbackResult.IGNORED
 
 
 scene_widget.set_on_mouse(on_mouse)
@@ -1235,38 +1451,11 @@ def on_key(event):
     k = event.key
 
     if k == ord(']'):
-        # Increase all utility layer opacities by 0.05
-        for ln in layer_opacity:
-            new_val = min(1.0, layer_opacity[ln][0] + 0.05)
-            if ln in _layer_sliders:
-                _layer_sliders[ln][0].double_value = new_val
-                _layer_sliders[ln][1].text = f"{new_val:.2f}"
-            layer_opacity[ln][0] = new_val
-            mat = make_mesh_material(new_val)
-            if ln in layer_meshes:
-                scene_widget.scene.remove_geometry(_line_geom_name(ln))
-                scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
-            if ln in comp_meshes:
-                scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-                scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
-        window.post_redraw()
+        _apply_opacity(min(1.0, pipe_opacity_val[0] + 0.05))
         return HANDLED
 
     if k == ord('['):
-        for ln in layer_opacity:
-            new_val = max(0.0, layer_opacity[ln][0] - 0.05)
-            if ln in _layer_sliders:
-                _layer_sliders[ln][0].double_value = new_val
-                _layer_sliders[ln][1].text = f"{new_val:.2f}"
-            layer_opacity[ln][0] = new_val
-            mat = make_mesh_material(new_val)
-            if ln in layer_meshes:
-                scene_widget.scene.remove_geometry(_line_geom_name(ln))
-                scene_widget.scene.add_geometry(_line_geom_name(ln), layer_meshes[ln], mat)
-            if ln in comp_meshes:
-                scene_widget.scene.remove_geometry(_comp_geom_name(ln))
-                scene_widget.scene.add_geometry(_comp_geom_name(ln), comp_meshes[ln], mat)
-        window.post_redraw()
+        _apply_opacity(max(0.0, pipe_opacity_val[0] - 0.05))
         return HANDLED
 
     if k in (ord('L'), ord('l')):
@@ -1287,7 +1476,7 @@ def on_key(event):
 
     if k in (ord('H'), ord('h')):
         print("\n-- Shortcuts ---------------------------------------------------")
-        print("  Ctrl+click     pick pipe segment or component (show attributes)")
+        print("  Left-click     pick pipe segment or component (show attributes)")
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  0              pivot to world origin (0, 0, 0)")
@@ -1308,11 +1497,18 @@ scene_widget.set_on_key(on_key)
 # ─────────────────────────────────────────────────────────────────────────────
 def on_layout(layout_ctx):
     r = window.content_rect
-    scene_widget.frame = gui.Rect(r.x, r.y, r.width - PANEL_WIDTH, r.height)
+    if _left_panel_visible[0]:
+        left_w = LEFT_PANEL_WIDTH
+        left_panel.frame = gui.Rect(r.x, r.y, left_w, r.height)
+    else:
+        left_w = 0
+        left_panel.frame = gui.Rect(-LEFT_PANEL_WIDTH, r.y, 0, r.height)
+    scene_widget.frame = gui.Rect(r.x + left_w, r.y, r.width - PANEL_WIDTH - left_w, r.height)
     panel.frame = gui.Rect(r.x + r.width - PANEL_WIDTH, r.y, PANEL_WIDTH, r.height)
 
 
 window.set_on_layout(on_layout)
+window.add_child(left_panel)
 window.add_child(scene_widget)
 window.add_child(panel)
 

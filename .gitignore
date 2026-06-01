@@ -1,11 +1,12 @@
 # ── Data files (large / binary) ──────────────────────────────────
 Data/
-Developing/Ouput/
+
+# ── Archive (old code, pre-restructure) ─────────────────────────
+_archive/
+
+# ── Legacy folders (kept for reference, gitignored) ─────────────
+Developing/
 Testing/
-Developing/QML_Distributor/
-Developing/PLY_to_LAS/
-Developing/DBScan/
-Developing/HDBScan/
 
 # ── Common data formats ─────────────────────────────────────────
 *.ply

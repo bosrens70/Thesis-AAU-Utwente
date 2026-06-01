@@ -1,263 +1,73 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-Single Point Cloud Viewer with Surrounding Utilities — Indicative Depth
-+ Class Label Colour Toggle  +  Left-Click Segment Picking
-========================================================================
-Visualises one PLY point cloud together with all utility infrastructure
-(pipes, cables, components) that falls within a buffer
-around the point cloud's bounding box.
+Single Point Cloud Viewer with Instance Labels + Surrounding Utilities
+======================================================================
+Refactored to use core/ for shared configuration and data loading.
 
-Class Label Toggle
-------------------
-  Press  L  or use the checkbox in the panel to toggle between the
-  original RGB colours and per-class semantic colours.
-
-  OpenTrench3D class mapping:
-      0  Background   (grey)
-      1  Pipe         (red)
-      2  Trench       (blue)
-      3  Backfill     (green)
-
-Depth handling for Z = -99  (no reliable measurement)
-------------------------------------------------------
-  Before loading utilities, a VisualizerWithEditing window opens so you
-  can manually pick one or more points on the ground surface:
-
-      Shift + Left-Click   to select a ground-level vertex
-      Q  or close window   when finished picking
-
-  The average Z of the picked points becomes the ground level reference.
-  For each utility vertex with Z = -99, depth is then estimated as:
-
-      Z_estimated  =  ground_level  -  vejledendeDybde / 1000
-
-  where vejledendeDybde is the indicative (suggested) depth below ground
-  level stored as an attribute on the utility feature, in millimetres.
-
-  If vejledendeDybde is not available the vertex falls back to the mean
-  of valid Z values on the same feature, or the picked ground level.
-
-  Components (Vandkomponent, etc.) do not carry vejledendeDybde.  For those
-  the script uses the average depth of the corresponding pipe layer, or
-  falls back to the picked ground level.
-
-Usage
------
-  Set PLY_FILE below to any individual .ply site file, then run.
-
-Picking
--------
-  Left-Click  on any pipe segment or component sphere to show all its
-  GML attribute fields in the "Selected Feature" panel.  The nearest
-  segment / sphere centre is highlighted in yellow.
-
-  Picking uses true point-to-segment distance for accuracy.
-
-Keyboard shortcuts
-------------------
-  C   pivot to cloud centroid           P   pivot to pipe centroid
-  0   pivot to world origin
-  ]   increase opacity +0.05           [   decrease opacity -0.05
-  L   toggle class label colours
-  H   help                             Esc quit
+Usage: python viewers/label_viewer.py
+  Change the site by editing PLY_FILE in core/config.py.
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so `core` is importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 import geopandas as gpd
 import numpy as np
-from pathlib import Path
 import re
 import time
 import glob as _globmod
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
+from core.config import (
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    CLASS_LABELS, DEFAULT_CLASS_COLOR,
+    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
+    INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS, DIAMETER_COLORS,
 )
-
-AREA_REF_GEOJSON = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
-)
-
-GML_PATH = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Ledningspakke_3383910\consolidated.gml"
-)
-
-# Circular crop radius (metres) around the point cloud centroid (XY).
-# The scene (point cloud + utilities) is clipped to a disc of this radius.
-# Recommended maximum: 2.0 m — larger values show too much surrounding context.
-CROP_RADIUS = 2.0
-
-_ply_stem = Path(PLY_FILE).stem
-_ply_parent = Path(PLY_FILE).parent
-_instance_candidates = sorted(
-    _ply_parent.glob(f"{_ply_stem}_instances_*"),
-    key=lambda p: p.name,
-    reverse=True,
-)
-INSTANCE_DIR = str(_instance_candidates[0]) if _instance_candidates else ""
+from core.data_loader import init_site, discover_instances
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITY LAYER DEFINITIONS — colour per LER 2.0 / project convention
+# INITIALISE — load area offset, point cloud, GML, and instances via core/
 # ─────────────────────────────────────────────────────────────────────────────
-LINE_LAYERS = {
-    "Vandledning":                  {"color": [0.200, 0.500, 1.000], "fallback_radius": 0.005},
-    "Afloebsledning":               {"color": [0.545, 0.271, 0.075], "fallback_radius": 0.005},
-    "Gasledning":                   {"color": [1.000, 0.800, 0.000], "fallback_radius": 0.005},
-    "Elledning":                    {"color": [0.900, 0.100, 0.100], "fallback_radius": 0.005},
-    "Telekommunikationsledning":    {"color": [0.200, 0.800, 0.200], "fallback_radius": 0.005},
-    "Foeringsroer":                 {"color": [0.500, 0.900, 0.500], "fallback_radius": 0.005},
-    "LedningUkendtForsyningsart":   {"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},
-    "Ledningstrace":                {"color": [1.000, 0.500, 0.500], "fallback_radius": 0.005},
-}
+site = init_site(load_instances=True)
 
-COMPONENT_LAYERS = {
-    "Vandkomponent":                  {"color": [0.000, 0.900, 0.900]},
-    "Afloebskomponent":               {"color": [0.700, 0.400, 0.200]},
-    "Gaskomponent":                   {"color": [1.000, 0.900, 0.300]},
-    "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
-    "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
-}
+# Unpack area info
+TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
+AREA_NUMBER = site.area.area_number
+AREA_NAME   = site.area.area_name
 
-COMPONENT_SPHERE_RADIUS = 0.05
+# Unpack point cloud data
+pcd             = site.pc.pcd
+pts             = site.pc.pts
+original_colors = site.pc.original_colors
+class_labels    = site.pc.class_labels
+cloud_centroid  = site.pc.cloud_centroid
+cloud_centroid_full = site.pc.cloud_centroid_full
+pc_min          = site.pc.pc_min
+pc_max          = site.pc.pc_max
 
-# Vandledning diameter → colour mapping
-DIAMETER_COLORS = {
-    0:   [0.502, 0.502, 0.502],
-    32:  [0.702, 0.851, 1.000],
-    63:  [0.400, 0.698, 1.000],
-    120: [0.102, 0.459, 1.000],
-    150: [0.000, 0.278, 0.800],
-    160: [0.000, 0.180, 0.522],
-}
+_crop_cx_local = site.pc.crop_center_local[0]
+_crop_cy_local = site.pc.crop_center_local[1]
+_crop_cx_utm   = site.pc.crop_center_utm[0]
+_crop_cy_utm   = site.pc.crop_center_utm[1]
+_crop_r2       = CROP_RADIUS * CROP_RADIUS
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG VALIDATION
-# ─────────────────────────────────────────────────────────────────────────────
-_required = {"PLY_FILE": PLY_FILE, "AREA_REF_GEOJSON": AREA_REF_GEOJSON, "GML_PATH": GML_PATH}
-_missing = [(n, p) for n, p in _required.items() if not Path(p).exists()]
-if _missing:
-    print("\n[CONFIG ERROR] Missing paths:")
-    for n, p in _missing:
-        print(f"  {n:<20} = {p}")
-    raise SystemExit(1)
-
-print("Config paths OK.\n")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Auto-detect area from the PLY path
-# ─────────────────────────────────────────────────────────────────────────────
 _ply_path = Path(PLY_FILE)
-_area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.parent.name, re.IGNORECASE)
-if not _area_match:
-    _area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.name, re.IGNORECASE)
-if not _area_match:
-    print("[ERROR] Cannot determine area number from PLY path.")
-    raise SystemExit(1)
 
-AREA_NUMBER = int(_area_match.group(1))
-AREA_NAME   = f"Area{AREA_NUMBER}"
-print(f"Detected area: {AREA_NAME}  (from path)")
-
-ref   = gpd.read_file(AREA_REF_GEOJSON)
-area  = ref[ref["name"] == AREA_NAME]
-if area.empty:
-    print(f"[ERROR] No origin for '{AREA_NAME}' in {AREA_REF_GEOJSON}")
-    raise SystemExit(1)
-
-area_row = area.iloc[0]
-TX, TY, TZ = area_row.geometry.x, area_row.geometry.y, area_row.geometry.z
-print(f"Origin -> TX={TX:.3f}  TY={TY:.3f}  TZ={TZ:.3f}")
+# Instance directory from core discovery
+INSTANCE_DIR = str(site.instance_dir) if site.instance_dir else ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Load the single point cloud + class labels
+# VIEWER-SPECIFIC CODE BELOW (instances, ground picking, mesh creation, GUI)
 # ─────────────────────────────────────────────────────────────────────────────
-_t0 = time.perf_counter()
-print(f"\nLoading point cloud: {_ply_path.name} ...")
-pcd = o3d.io.read_point_cloud(str(PLY_FILE))
-pts = np.asarray(pcd.points)
-print(f"  {len(pts):,} points loaded")
-
-# Read class labels directly from the ASCII PLY (no plyfile dependency)
-print("  Reading class labels from PLY ...")
-class_labels = None
-with open(str(PLY_FILE), 'r') as f:
-    header_lines = []
-    property_names = []
-    for line in f:
-        line = line.strip()
-        header_lines.append(line)
-        if line.startswith("property "):
-            # e.g. "property uchar class" → "class"
-            property_names.append(line.split()[-1])
-        if line == "end_header":
-            break
-
-    if "class" in property_names:
-        class_col_idx = property_names.index("class")
-        # Read remaining lines as data
-        labels = []
-        for line in f:
-            parts = line.split()
-            if len(parts) > class_col_idx:
-                labels.append(int(parts[class_col_idx]))
-        class_labels = np.array(labels, dtype=int)
-        unique_classes = np.unique(class_labels)
-        print(f"  Class labels found: {len(class_labels):,} values, "
-              f"unique classes: {sorted(unique_classes.tolist())}")
-    else:
-        print(f"  [WARNING] No 'class' property in PLY (found: {property_names})"
-              " — class colouring disabled")
-
-# Store original RGB colours
-original_colors = np.asarray(pcd.colors).copy()
-
-cloud_centroid_full = pts.mean(axis=0)
-
-# ── Circular crop of the point cloud around its XY centroid ────────────────
-_crop_cx_local = float(cloud_centroid_full[0])
-_crop_cy_local = float(cloud_centroid_full[1])
-_dxy2 = ((pts[:, 0] - _crop_cx_local) ** 2 +
-         (pts[:, 1] - _crop_cy_local) ** 2)
-_crop_mask = _dxy2 <= (CROP_RADIUS ** 2)
-
-n_full = len(pts)
-pts = pts[_crop_mask]
-
-# Rebuild the PointCloud so the viewer only sees the cropped disc
-pcd = o3d.geometry.PointCloud()
-pcd.points = o3d.utility.Vector3dVector(pts)
-original_colors = original_colors[_crop_mask]
-pcd.colors = o3d.utility.Vector3dVector(original_colors)
-if class_labels is not None:
-    class_labels = class_labels[_crop_mask]
-
-print(f"  Circular crop (r={CROP_RADIUS} m): {n_full:,} -> {len(pts):,} points")
-
-cloud_centroid = pts.mean(axis=0) if len(pts) > 0 else cloud_centroid_full
-
-# Bounding box of the cropped cloud (local coordinates)
-pc_min = pts.min(axis=0)
-pc_max = pts.max(axis=0)
-
-# Circular crop center in UTM (used when filtering utilities from the GML)
-_crop_cx_utm = _crop_cx_local + TX
-_crop_cy_utm = _crop_cy_local + TY
-_crop_r2     = CROP_RADIUS * CROP_RADIUS
-
-print(f"  Local bbox:  X[{pc_min[0]:.1f}, {pc_max[0]:.1f}]  "
-      f"Y[{pc_min[1]:.1f}, {pc_max[1]:.1f}]  "
-      f"Z[{pc_min[2]:.1f}, {pc_max[2]:.1f}]")
-print(f"  Crop center (UTM): ({_crop_cx_utm:.1f}, {_crop_cy_utm:.1f})  "
-      f"r = {CROP_RADIUS} m")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 2b. Load instance PLY files and compute bounding boxes
 # ─────────────────────────────────────────────────────────────────────────────
@@ -616,6 +426,8 @@ for layer_name, cfg in LINE_LAYERS.items():
 
     for _, row in gdf.iterrows():
         geom = row.geometry
+        if geom is None:
+            continue
 
         # Handle MultiLineString (e.g. Ledningstrace) by extracting sub-lines
         if geom.geom_type == "MultiLineString":
@@ -755,6 +567,7 @@ _COMP_TO_LINE = {
     "Gaskomponent":                "Gasledning",
     "Elkomponent":                 "Elledning",
     "Telekommunikationskomponent": "Telekommunikationsledning",
+    "TermiskKomponent":            "TermiskLedning",
 }
 
 print("\n--- Loading utility components within bbox ---")
@@ -783,6 +596,11 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
 
     for _, row in gdf_c.iterrows():
         g = row.geometry
+        if g is None:
+            continue
+        # Components are usually Points; skip non-point geometries (e.g. Polygon)
+        if g.geom_type not in ("Point", "PointZ"):
+            continue
         if not _point_in_bbox(g.x, g.y):
             continue
 
@@ -1122,8 +940,8 @@ origin_toggle_cb.set_on_checked(_on_origin_toggle)
 panel.add_child(origin_toggle_cb)
 panel.add_fixed(int(0.5 * em))
 
-# ── Utility Legend (Ledningspakke_3383910) ───────────────────────────────────
-ler_toggle_cb = gui.Checkbox("Ledningspakke_3383910")
+# ── Utility Legend (Ledningspakke_2803288) ───────────────────────────────────
+ler_toggle_cb = gui.Checkbox("Ledningspakke_2803288")
 ler_toggle_cb.checked = True
 
 

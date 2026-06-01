@@ -1,333 +1,78 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 Single Point Cloud Viewer with Surrounding Utilities — Indicative Depth
 + Class Label Colour Toggle  +  Left-Click Segment Picking
 ========================================================================
-Visualises one PLY point cloud together with all utility infrastructure
-(pipes, cables, components) that falls within a buffer
-around the point cloud's bounding box.
+Refactored to use core/ for shared configuration and data loading.
 
-Class Label Toggle
-------------------
-  Press  L  or use the checkbox in the panel to toggle between the
-  original RGB colours and per-class semantic colours.
-
-  OpenTrench3D class mapping:
-      0  Background   (grey)
-      1  Pipe         (red)
-      2  Trench       (blue)
-      3  Backfill     (green)
-
-Depth handling for Z = -99  (no reliable measurement)
-------------------------------------------------------
-  Before loading utilities, a VisualizerWithEditing window opens so you
-  can manually pick one or more points on the ground surface:
-
-      Shift + Left-Click   to select a ground-level vertex
-      Q  or close window   when finished picking
-
-  Depth is resolved through a configurable hierarchy (DepthSource enum).
-
-  Pipes — PIPE_DEPTH_CONFIG (in priority order):
-      1  REGISTERED    Direct Z measurement (not -99)
-      2  VEJLEDENDE    Z = ground_level(XY) - vejledendeDybde / 1000
-      3  FEATURE_MEAN  Mean of valid Z on the same GML feature
-      5  GROUND_PLANE  Fitted ground plane at this XY (surface level)
-
-  Components — COMPONENT_DEPTH_CONFIG:
-      1  REGISTERED    Direct Z measurement (not -99)
-      4  LAYER_MEAN    Average depth of corresponding pipe layer
-      5  GROUND_PLANE  Fitted ground plane at this XY (surface level)
-
-  Each level can be toggled on/off via DepthConfig.enabled_levels.
-  Per-vertex provenance is tracked in a sources array (DepthSource int8).
-
-Usage
------
-  Set PLY_FILE below to any individual .ply site file, then run.
-
-Picking
--------
-  Left-Click  on any pipe segment or component sphere to show all its
-  GML attribute fields in the "Selected Feature" panel.  The nearest
-  segment / sphere centre is highlighted in yellow.
-
-  Picking uses true point-to-segment distance for accuracy.
-
-Keyboard shortcuts
-------------------
-  C   pivot to cloud centroid           P   pivot to pipe centroid
-  0   pivot to world origin
-  L   toggle class label colours
-  H   help                             Esc quit
+Usage: python viewers/base_viewer.py
+  Change the site by editing PLY_FILE in core/config.py.
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so `core` is importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
+o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
 import geopandas as gpd
 import numpy as np
-from pathlib import Path
-from enum import IntEnum
-from dataclasses import dataclass
 import re
 import time
 import copy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# DEPTH HIERARCHY — enum, config, resolvers
-# ─────────────────────────────────────────────────────────────────────────────
-class DepthSource(IntEnum):
-    REGISTERED   = 1
-    VEJLEDENDE   = 2
-    FEATURE_MEAN = 3   # pipes only
-    LAYER_MEAN   = 4   # components only (parent pipe layer average)
-    GROUND_PLANE = 5
-    NONE         = 99
-
-
-@dataclass(frozen=True)
-class DepthConfig:
-    enabled_levels: frozenset
-    track_per_vertex: bool = True
-
-
-PIPE_DEPTH_CONFIG = DepthConfig(
-    enabled_levels=frozenset({
-        DepthSource.REGISTERED,
-        DepthSource.VEJLEDENDE,
-        DepthSource.FEATURE_MEAN,
-        DepthSource.GROUND_PLANE,
-    })
+from core.config import (
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    CLASS_LABELS, DEFAULT_CLASS_COLOR,
+    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
+    DepthSource, DepthConfig,
+    PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
 )
-
-COMPONENT_DEPTH_CONFIG = DepthConfig(
-    enabled_levels=frozenset({
-        DepthSource.REGISTERED,
-        DepthSource.LAYER_MEAN,
-        DepthSource.GROUND_PLANE,
-    })
-)
-
-_STATS_KEY = {
-    DepthSource.VEJLEDENDE:   "estimated",
-    DepthSource.FEATURE_MEAN: "fallback_feature_mean",
-    DepthSource.LAYER_MEAN:   "fallback_layer_mean",
-    DepthSource.GROUND_PLANE: "fallback_global",
-}
+from core.data_loader import init_site
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# INITIALISE — load area offset, point cloud, and GML via core/
 # ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
-)
-
-AREA_REF_GEOJSON = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
-)
-
-GML_PATH = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Ledningspakke_3383910\consolidated.gml"
-)
-
-# Circular crop radius (metres) around the point cloud centroid (XY).
-# The scene (point cloud + utilities) is clipped to a disc of this radius.
-# Recommended maximum: 2.0 m — larger values show too much surrounding context.
-CROP_RADIUS = 2.0
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLASS LABEL DEFINITIONS — OpenTrench3D semantic classes
-# ─────────────────────────────────────────────────────────────────────────────
-CLASS_LABELS = {
-    0: {"name": "Main Utility",     "color": [0.00, 0.80, 0.00]},
-    1: {"name": "Other Utility",    "color": [1.00, 1.00, 0.00]},
-    2: {"name": "Trench",           "color": [0.55, 0.27, 0.07]},
-    3: {"name": "Inactive Utility", "color": [0.00, 0.00, 0.00]},
-    4: {"name": "Misc",             "color": [0.60, 0.60, 0.60]},
-}
-
-# Fallback colour for unknown class IDs
-_DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]  # magenta
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY LAYER DEFINITIONS — colour per LER 2.0 / project convention
-# ─────────────────────────────────────────────────────────────────────────────
-LINE_LAYERS = {
-    "Vandledning":                  {"color": [0.200, 0.500, 1.000], "fallback_radius": 0.005},
-    "Afloebsledning":               {"color": [0.545, 0.271, 0.075], "fallback_radius": 0.005},
-    "Gasledning":                   {"color": [1.000, 0.800, 0.000], "fallback_radius": 0.005},
-    "Elledning":                    {"color": [0.900, 0.100, 0.100], "fallback_radius": 0.005},
-    "Telekommunikationsledning":    {"color": [0.200, 0.800, 0.200], "fallback_radius": 0.005},
-    "Foeringsroer":                 {"color": [0.500, 0.900, 0.500], "fallback_radius": 0.005},
-    "LedningUkendtForsyningsart":   {"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},
-    "Ledningstrace":                {"color": [1.000, 0.500, 0.500], "fallback_radius": 0.005},
-}
-
-# Right-panel legend order: keep Ledningstrace last (dense / low-priority visually)
-PIPE_LEGEND_UI_ORDER = [ln for ln in LINE_LAYERS if ln != "Ledningstrace"]
-if "Ledningstrace" in LINE_LAYERS:
-    PIPE_LEGEND_UI_ORDER.append("Ledningstrace")
-
-COMPONENT_LAYERS = {
-    "Vandkomponent":                  {"color": [0.000, 0.900, 0.900]},
-    "Afloebskomponent":               {"color": [0.700, 0.400, 0.200]},
-    "Gaskomponent":                   {"color": [1.000, 0.900, 0.300]},
-    "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
-    "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
-}
-
-COMPONENT_SPHERE_RADIUS = 0.05
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG VALIDATION
-# ─────────────────────────────────────────────────────────────────────────────
-_required = {"PLY_FILE": PLY_FILE, "AREA_REF_GEOJSON": AREA_REF_GEOJSON, "GML_PATH": GML_PATH}
-_missing = [(n, p) for n, p in _required.items() if not Path(p).exists()]
-if _missing:
-    print("\n[CONFIG ERROR] Missing paths:")
-    for n, p in _missing:
-        print(f"  {n:<20} = {p}")
-    raise SystemExit(1)
-
-print("Config paths OK.\n")
+site = init_site(load_instances=False)
 
 _t_script_start = time.perf_counter()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Auto-detect area from the PLY path
-# ─────────────────────────────────────────────────────────────────────────────
+# Unpack area info
+TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
+AREA_NUMBER = site.area.area_number
+AREA_NAME   = site.area.area_name
+
+# Unpack point cloud data
+pcd             = site.pc.pcd
+pts             = site.pc.pts
+original_colors = site.pc.original_colors
+class_labels    = site.pc.class_labels
+class_colors    = site.pc.class_colors
+cloud_centroid  = site.pc.cloud_centroid
+cloud_centroid_full = site.pc.cloud_centroid_full
+pc_min          = site.pc.pc_min
+pc_max          = site.pc.pc_max
+
+_crop_cx_local = site.pc.crop_center_local[0]
+_crop_cy_local = site.pc.crop_center_local[1]
+_crop_cx_utm   = site.pc.crop_center_utm[0]
+_crop_cy_utm   = site.pc.crop_center_utm[1]
+_crop_r2       = CROP_RADIUS * CROP_RADIUS
+
 _ply_path = Path(PLY_FILE)
-_area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.parent.name, re.IGNORECASE)
-if not _area_match:
-    _area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.name, re.IGNORECASE)
-if not _area_match:
-    print("[ERROR] Cannot determine area number from PLY path.")
-    raise SystemExit(1)
 
-AREA_NUMBER = int(_area_match.group(1))
-AREA_NAME   = f"Area{AREA_NUMBER}"
-print(f"Detected area: {AREA_NAME}  (from path)")
-
-_t1 = time.perf_counter()
-ref   = gpd.read_file(AREA_REF_GEOJSON)
-_t1b = time.perf_counter()
-print(f"  [timer] Read area GeoJSON: {_t1b - _t1:.3f}s")
-area  = ref[ref["name"] == AREA_NAME]
-if area.empty:
-    print(f"[ERROR] No origin for '{AREA_NAME}' in {AREA_REF_GEOJSON}")
-    raise SystemExit(1)
-
-area_row = area.iloc[0]
-TX, TY, TZ = area_row.geometry.x, area_row.geometry.y, area_row.geometry.z
-print(f"Origin -> TX={TX:.3f}  TY={TY:.3f}  TZ={TZ:.3f}")
+# Alias for backward compat
+_DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2.  Load the single point cloud + class labels
+# VIEWER-SPECIFIC CODE BELOW (ground picking, mesh creation, GUI)
 # ─────────────────────────────────────────────────────────────────────────────
-print(f"\nLoading point cloud: {_ply_path.name} ...")
-_t_ply0 = time.perf_counter()
-pcd = o3d.io.read_point_cloud(str(PLY_FILE))
-pts = np.asarray(pcd.points)
-_t_ply1 = time.perf_counter()
-print(f"  {len(pts):,} points loaded  [{_t_ply1 - _t_ply0:.3f}s]")
-
-# Read class labels from ASCII PLY header + numpy bulk read
-print("  Reading class labels from PLY ...")
-class_labels = None
-_t_cls0 = time.perf_counter()
-
-# Parse header only (tiny) to find column index and header line count
-_ply_header_lines = 0
-_ply_property_names = []
-with open(str(PLY_FILE), 'r') as f:
-    for line in f:
-        _ply_header_lines += 1
-        stripped = line.strip()
-        if stripped.startswith("property "):
-            _ply_property_names.append(stripped.split()[-1])
-        if stripped == "end_header":
-            break
-
-if "class" in _ply_property_names:
-    _class_col = _ply_property_names.index("class")
-    class_labels = np.loadtxt(
-        str(PLY_FILE), dtype=int,
-        skiprows=_ply_header_lines, usecols=_class_col,
-    )
-    unique_classes = np.unique(class_labels)
-    print(f"  Class labels found: {len(class_labels):,} values, "
-          f"unique classes: {sorted(unique_classes.tolist())}")
-else:
-    print(f"  [WARNING] No 'class' property in PLY (found: {_ply_property_names})"
-          " — class colouring disabled")
-
-_t_cls1 = time.perf_counter()
-print(f"  [timer] Class label parsing: {_t_cls1 - _t_cls0:.3f}s")
-
-# Store original RGB colours
-original_colors = np.asarray(pcd.colors).copy()
-
-# Build class-label colour array
-if class_labels is not None:
-    class_colors = np.zeros_like(original_colors)
-    for cls_id, cfg in CLASS_LABELS.items():
-        mask = class_labels == cls_id
-        class_colors[mask] = cfg["color"]
-    # Handle any unknown class IDs
-    known_mask = np.isin(class_labels, list(CLASS_LABELS.keys()))
-    if not known_mask.all():
-        class_colors[~known_mask] = _DEFAULT_CLASS_COLOR
-        n_unknown = (~known_mask).sum()
-        print(f"  [WARNING] {n_unknown} points with unknown class IDs")
-else:
-    class_colors = None
-
-cloud_centroid_full = pts.mean(axis=0)
-
-# ── Circular crop of the point cloud around its XY centroid ────────────────
-_crop_cx_local = float(cloud_centroid_full[0])
-_crop_cy_local = float(cloud_centroid_full[1])
-_dxy2 = ((pts[:, 0] - _crop_cx_local) ** 2 +
-         (pts[:, 1] - _crop_cy_local) ** 2)
-_crop_mask = _dxy2 <= (CROP_RADIUS ** 2)
-
-n_full = len(pts)
-pts = pts[_crop_mask]
-
-# Rebuild the PointCloud so the viewer only sees the cropped disc
-pcd = o3d.geometry.PointCloud()
-pcd.points = o3d.utility.Vector3dVector(pts)
-original_colors = original_colors[_crop_mask]
-pcd.colors = o3d.utility.Vector3dVector(original_colors)
-if class_labels is not None:
-    class_labels = class_labels[_crop_mask]
-    class_colors = class_colors[_crop_mask]
-
-print(f"  Circular crop (r={CROP_RADIUS} m): {n_full:,} -> {len(pts):,} points")
-
-cloud_centroid = pts.mean(axis=0) if len(pts) > 0 else cloud_centroid_full
-
-# Bounding box of the cropped cloud (local coordinates)
-pc_min = pts.min(axis=0)
-pc_max = pts.max(axis=0)
-
-# Circular crop center in UTM (used when filtering utilities from the GML)
-_crop_cx_utm = _crop_cx_local + TX
-_crop_cy_utm = _crop_cy_local + TY
-_crop_r2     = CROP_RADIUS * CROP_RADIUS
-
-print(f"  Local bbox:  X[{pc_min[0]:.1f}, {pc_max[0]:.1f}]  "
-      f"Y[{pc_min[1]:.1f}, {pc_max[1]:.1f}]  "
-      f"Z[{pc_min[2]:.1f}, {pc_max[2]:.1f}]")
-print(f"  Crop center (UTM): ({_crop_cx_utm:.1f}, {_crop_cy_utm:.1f})  "
-      f"r = {CROP_RADIUS} m")
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Pick ground-level points interactively
 # ─────────────────────────────────────────────────────────────────────────────
@@ -685,6 +430,8 @@ for layer_name, cfg in LINE_LAYERS.items():
 
     for _, row in gdf.iterrows():
         geom = row.geometry
+        if geom is None:
+            continue
 
         # Handle MultiLineString (e.g. Ledningstrace) by extracting sub-lines
         if geom.geom_type == "MultiLineString":
@@ -856,6 +603,10 @@ for layer_name, comp_cfg in COMPONENT_LAYERS.items():
 
     for _, row in gdf_c.iterrows():
         g = row.geometry
+        if g is None:
+            continue
+        if g.geom_type not in ("Point", "PointZ"):
+            continue
         if not _point_in_bbox(g.x, g.y):
             continue
 
@@ -1695,7 +1446,8 @@ def on_mouse(event):
         print(f"[pick] Left-click at {click_pos}")
         _last_click[0] = click_pos
         scene_widget.scene.scene.render_to_depth_image(_do_pick)
-        return gui.Widget.EventCallbackResult.IGNORED
+        # Return HANDLED so Open3D does not also pan/translate the view
+        return gui.Widget.EventCallbackResult.HANDLED
 
     return gui.Widget.EventCallbackResult.IGNORED
 

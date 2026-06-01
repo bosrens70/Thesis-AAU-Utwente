@@ -1,370 +1,155 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
-Geometric Deviation Viewer -Instances vs LER Utility Registry
+Geometric Deviation Viewer — Instances vs LER Utility Registry
 ===============================================================
-Compares segmented point-cloud instances (from the Label Viewer)
-against the official LER pipe / cable geometry (GML).
+Refactored to use core/ for shared configuration and data loading.
 
-For each instance point the script computes the minimum 3D distance
-to the nearest LER line segment, producing a per-point deviation
-heatmap.  Statistics are reported per utility class.
-
-Workflow
---------
-1.  Load the original site PLY (background context).
-2.  Auto-discover labeled instance PLY files (utility_type property).
-3.  Load LER utility lines from the consolidated GML.
-4.  Translate GML coordinates UTM -> local using the area reference.
-5.  For each instance, compute point-to-segment distances to all
-    LER line segments that fall within the crop radius.
-6.  Visualise as a deviation heatmap in an Open3D GUI.
-
-Usage
------
-  Set PLY_FILE below, then run.  The script expects the same
-  GML / GeoJSON paths used by the Base Viewer.
-
-Keyboard shortcuts
-------------------
-  C   pivot to cloud centroid       H   help
+Usage: python viewers/deviation_viewer.py
+  Change the site by editing PLY_FILE in core/config.py.
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so `core` is importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 import geopandas as gpd
 import numpy as np
-from pathlib import Path
 import re
 import time
 import json
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_11.ply"
+from core.config import (
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    LINE_LAYERS, COMPONENT_LAYERS,
+    UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
+    DEVIATION_THRESHOLDS, DEVIATION_COLORS,
+    FORSYNINGSART_COLOR_HINTS,
+    forsyningsart_color as _forsyningsart_color,
+)
+from core.data_loader import (
+    init_site, read_ply_with_utility_type, utility_type_from_filename,
+)
+from core.geometry import (
+    batch_point_to_segments, deviation_to_color, linear_to_srgb,
+    segment_to_cylinder, segment_to_plane,
 )
 
-AREA_REF_GEOJSON = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
-)
-
-GML_PATH = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Ledningspakke_2803288_Area_4_and_5\consolidated.gml"
-)
-
-CROP_RADIUS = 2.0
-
 # ─────────────────────────────────────────────────────────────────────────────
-# DEVIATION HEATMAP
+# INITIALISE — load area offset, point cloud, and GML via core/
 # ─────────────────────────────────────────────────────────────────────────────
-# LER accuracy classes (DS/EN 17609:2022)
-DEVIATION_THRESHOLDS = [0.00, 0.25, 0.50, 1.00, 2.00]
-DEVIATION_COLORS = [
-    [0.0, 0.7, 0.2],   # Class 1: <= 0.25 m  - green
-    [0.6, 0.9, 0.0],   # Class 2: <= 0.50 m  - yellow-green
-    [1.0, 0.8, 0.0],   # Class 3: <= 1.00 m  - yellow
-    [1.0, 0.4, 0.0],   # Class 4: <= 2.00 m  - orange
-    [0.8, 0.0, 0.0],   # Class 5: >  2.00 m  - red
-]
-DEVIATION_CLASS_LABELS = [
-    "Class 1:  ≤ 250 mm",
-    "Class 2:  ≤ 500 mm",
-    "Class 3:  ≤ 1000 mm",
-    "Class 4:  ≤ 2000 mm",
-    "Class 5:  > 2000 mm",
-]
+site = init_site(load_instances=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY DEFINITIONS
-# ─────────────────────────────────────────────────────────────────────────────
-# Instance utility_type ID -> label
-UTILITY_TYPE_LABELS = {
-    0: "Unlabeled", 1: "PowerLine", 2: "DrainageLine", 3: "OilPipeLine",
-    4: "GasLine", 5: "ThermalLine", 6: "Conduit", 7: "WaterLine",
-    8: "TelecomunicationLine", 9: "OtherLine", 10: "LineUnknownServiceType",
-}
+# Unpack area info
+TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
+AREA_NUMBER = site.area.area_number
+AREA_NAME   = site.area.area_name
 
-# DLF-recommended colours (RGB 0-1), using the primary sub-type per utility
-UTILITY_TYPE_COLORS = {
-    0: [0.50, 0.50, 0.50],   # Unlabeled          - grey
-    1: [1.00, 0.00, 0.00],   # PowerLine (EL MV)   - DLF red 255:0:0
-    2: [1.00, 0.00, 0.00],   # DrainageLine         - DLF spildevand red 255:0:0
-    3: [0.46, 0.46, 0.46],   # OilPipeLine          - DLF grey 118:118:118
-    4: [1.00, 0.60, 0.00],   # GasLine              - DLF orange 255:153:0
-    5: [1.00, 0.00, 1.00],   # ThermalLine          - DLF violet 255:0:255
-    6: [0.88, 0.88, 0.88],   # Conduit              - DLF beskyttelsesroer grey 225:225:225
-    7: [0.00, 0.00, 1.00],   # WaterLine            - DLF blue 0:0:255
-    8: [0.98, 0.59, 0.27],   # TelecomunicationLine - DLF orange 250:150:70
-    9: [0.80, 0.80, 0.80],   # OtherLine            - grey
-    10: [0.30, 0.80, 0.80],  # LineUnknownServiceType
-}
+# Unpack point cloud data (DEV1 uses pcd_orig / pts_orig naming)
+pcd_orig        = site.pc.pcd
+pts_orig        = site.pc.pts
+original_colors = site.pc.original_colors
+cloud_centroid  = site.pc.cloud_centroid
+cloud_centroid_full = site.pc.cloud_centroid_full
+pc_min          = site.pc.pc_min
+pc_max          = site.pc.pc_max
 
-# LER GML layer definitions - DLF-recommended colours (RGB 0-1)
-LINE_LAYERS = {
-    "Vandledning":               {"color": [0.000, 0.000, 1.000], "fallback_radius": 0.005},  # DLF blue 0:0:255
-    "Afloebsledning":            {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.005},  # DLF red 255:0:0
-    "Gasledning":                {"color": [1.000, 0.600, 0.000], "fallback_radius": 0.005},  # DLF orange 255:153:0
-    "Elledning":                 {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.005},  # DLF red 255:0:0
-    "Telekommunikationsledning": {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.005},  # DLF orange 250:150:70
-    "Foeringsroer":              {"color": [0.882, 0.882, 0.882], "fallback_radius": 0.005},  # DLF grey 225:225:225
-    "LedningUkendtForsyningsart":{"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},  # not in DLF, keep cyan
-    "Ledningstrace":             {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.005},  # DLF trace orange 250:150:70
-}
+_cx = site.pc.crop_center_local[0]
+_cy = site.pc.crop_center_local[1]
+_cx_utm = site.pc.crop_center_utm[0]
+_cy_utm = site.pc.crop_center_utm[1]
+_crop_r2 = CROP_RADIUS ** 2
 
-# forsyningsart keyword -> colour for Ledningstrace sub-groups.
-# Matches are substring-based so e.g. "telekommunikation" matches "tele".
-# Unknown values fall back to the default Ledningstrace colour.
-# DLF-recommended colours (RGB 0-1)
-FORSYNINGSART_COLOR_HINTS = [
-    ("vand",   [0.000, 0.000, 1.000]),   # DLF vand blue 0:0:255
-    ("afloeb", [1.000, 0.000, 0.000]),   # DLF spildevand red 255:0:0
-    ("spilde", [1.000, 0.000, 0.000]),   # DLF spildevand red 255:0:0
-    ("gas",    [1.000, 0.600, 0.000]),   # DLF gas orange 255:153:0
-    ("el",     [1.000, 0.000, 0.000]),   # DLF el red 255:0:0
-    ("tele",   [0.980, 0.588, 0.275]),   # DLF tele orange 250:150:70
-    ("kommu",  [0.980, 0.588, 0.275]),   # DLF kommunikation orange 250:150:70
-    ("varme",  [1.000, 0.000, 1.000]),   # DLF varme violet 255:0:255
-    ("fjern",  [1.000, 0.000, 1.000]),   # DLF fjernvarme violet 255:0:255
-    ("olie",   [0.463, 0.463, 0.463]),   # DLF olie grey 118:118:118
-]
-
-
-def _forsyningsart_color(fa_value, fallback):
-    """Return a colour for a forsyningsart value by substring matching."""
-    fa_lower = fa_value.lower()
-    for keyword, color in FORSYNINGSART_COLOR_HINTS:
-        if keyword in fa_lower:
-            return color
-    return fallback
-
-
-# Mapping: instance utility_type ID -> matching LER layer names
-# Also includes keywords to match Ledningstrace sub-groups (by forsyningsart)
-UTILITY_TO_LER_MATCH = {
-    1:  {"layers": ["Elledning"],                   "trace_kw": ["el"]},
-    2:  {"layers": ["Afloebsledning"],              "trace_kw": ["afloeb", "spilde"]},
-    3:  {"layers": [],                              "trace_kw": ["olie"]},
-    4:  {"layers": ["Gasledning"],                  "trace_kw": ["gas"]},
-    5:  {"layers": [],                              "trace_kw": ["varme", "fjern"]},
-    6:  {"layers": ["Foeringsroer"],                "trace_kw": []},
-    7:  {"layers": ["Vandledning"],                 "trace_kw": ["vand"]},
-    8:  {"layers": ["Telekommunikationsledning"],   "trace_kw": ["tele", "kommu"]},
-    9:  {"layers": [],                              "trace_kw": []},
-    10: {"layers": ["LedningUkendtForsyningsart"],  "trace_kw": []},
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PLY READER (ASCII + binary, with utility_type)
-# ─────────────────────────────────────────────────────────────────────────────
-_PLY_TYPE_MAP = {
-    "float": np.float32, "float32": np.float32,
-    "double": np.float64, "float64": np.float64,
-    "int": np.int32, "int32": np.int32,
-    "uint": np.uint32, "uint32": np.uint32,
-    "short": np.int16, "int16": np.int16,
-    "ushort": np.uint16, "uint16": np.uint16,
-    "char": np.int8, "int8": np.int8,
-    "uchar": np.uint8, "uint8": np.uint8,
-}
-
-
-def read_ply_with_utility_type(filepath):
-    filepath = str(filepath)
-    prop_defs = []  # (name, ply_type_str)
-    n_verts = 0
-    ply_format = "ascii"
-
-    with open(filepath, "rb") as f:
-        while True:
-            line = f.readline().decode("utf-8", errors="replace").strip()
-            if line.startswith("format "):
-                ply_format = line.split()[1]
-            if line.startswith("element vertex"):
-                n_verts = int(line.split()[-1])
-            if line.startswith("property "):
-                parts = line.split()
-                prop_defs.append((parts[-1], parts[1]))
-            if line == "end_header":
-                header_end = f.tell()
-                break
-
-    names = [p[0] for p in prop_defs]
-    x_col, y_col, z_col = names.index("x"), names.index("y"), names.index("z")
-    has_rgb = all(c in names for c in ("red", "green", "blue"))
-    has_ut = "utility_type" in names
-    r_col = names.index("red") if has_rgb else None
-    g_col = names.index("green") if has_rgb else None
-    b_col = names.index("blue") if has_rgb else None
-    ut_col = names.index("utility_type") if has_ut else None
-
-    if ply_format == "ascii":
-        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
-            while f.readline().strip() != "end_header":
-                pass
-            data = np.loadtxt(f, max_rows=n_verts)
-    else:
-        bo = "<" if "little" in ply_format else ">"
-        dt = np.dtype([(name, bo + np.dtype(_PLY_TYPE_MAP[ptype]).str[1:])
-                        for name, ptype in prop_defs])
-        with open(filepath, "rb") as f:
-            f.seek(header_end)
-            raw = np.frombuffer(f.read(n_verts * dt.itemsize), dtype=dt)
-        data = np.column_stack([raw[name].astype(np.float64) for name, _ in prop_defs])
-
-    points = data[:, [x_col, y_col, z_col]]
-    colors = data[:, [r_col, g_col, b_col]].astype(np.uint8) if has_rgb else None
-    ut = data[:, ut_col].astype(int) if has_ut else np.zeros(len(points), dtype=int)
-    return points, colors, ut
-
-
-def utility_type_from_filename(filename):
-    """Fallback: parse utility label from filename like '..._type_WaterLine.ply'."""
-    m = re.search(r"_type_(\w+)\.ply$", filename)
-    if m:
-        label = m.group(1)
-        for uid, name in UTILITY_TYPE_LABELS.items():
-            if name == label:
-                return uid
-    return 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GEOMETRY: vectorised point-to-segment distance
-# ─────────────────────────────────────────────────────────────────────────────
-def batch_point_to_segments(pts, seg_p1, seg_p2):
-    """
-    For each point in pts (N, 3), find the minimum distance to any of the
-    M segments defined by seg_p1 (M, 3) -> seg_p2 (M, 3).
-    Returns dists (N,).  Processes in batches to limit memory.
-    """
-    N = len(pts)
-    M = len(seg_p1)
-    if M == 0:
-        return np.full(N, np.inf)
-
-    BATCH = 2000
-    min_dists = np.full(N, np.inf)
-
-    d = seg_p2 - seg_p1                          # (M, 3)
-    seg_len2 = np.einsum('ij,ij->i', d, d)       # (M,)
-    safe = seg_len2 > 1e-12
-
-    for start in range(0, N, BATCH):
-        end = min(start + BATCH, N)
-        p = pts[start:end]                        # (B, 3)
-        B = len(p)
-
-        v = p[:, None, :] - seg_p1[None, :, :]   # (B, M, 3)
-        dot_vd = np.einsum('ijk,jk->ij', v, d)   # (B, M)
-
-        t = np.zeros((B, M), dtype=float)
-        t[:, safe] = np.clip(dot_vd[:, safe] / seg_len2[None, safe], 0.0, 1.0)
-
-        closest = seg_p1[None, :, :] + t[:, :, None] * d[None, :, :]  # (B, M, 3)
-        diff = p[:, None, :] - closest                                  # (B, M, 3)
-        dists2 = np.einsum('ijk,ijk->ij', diff, diff)                  # (B, M)
-        min_dists[start:end] = np.sqrt(dists2.min(axis=1))
-
-    return min_dists
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HEATMAP COLOUR
-# ─────────────────────────────────────────────────────────────────────────────
-def deviation_to_color(distances):
-    colors = np.zeros((len(distances), 3), dtype=float)
-    thresholds = np.array(DEVIATION_THRESHOLDS)
-    palette = np.array(DEVIATION_COLORS)
-
-    for i in range(len(thresholds) - 1):
-        lo, hi = thresholds[i], thresholds[i + 1]
-        mask = (distances >= lo) & (distances < hi)
-        if mask.any():
-            t = (distances[mask] - lo) / (hi - lo)
-            colors[mask] = palette[i] * (1.0 - t[:, None]) + palette[i + 1] * t[:, None]
-
-    colors[distances >= thresholds[-1]] = palette[-1]
-    return colors
-
-
-def linear_to_srgb(c):
-    if c <= 0.0031308:
-        return 12.92 * c
-    return 1.055 * (c ** (1.0 / 2.4)) - 0.055
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG VALIDATION
-# ─────────────────────────────────────────────────────────────────────────────
-_required = {"PLY_FILE": PLY_FILE, "AREA_REF_GEOJSON": AREA_REF_GEOJSON, "GML_PATH": GML_PATH}
-_missing = [(n, p) for n, p in _required.items() if not Path(p).exists()]
-if _missing:
-    for n, p in _missing:
-        print(f"  [MISSING] {n} = {p}")
-    raise SystemExit(1)
-
-print("Config paths OK.\n")
-_t0 = time.perf_counter()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  Auto-detect area + coordinate translation
-# ─────────────────────────────────────────────────────────────────────────────
 _ply_path = Path(PLY_FILE)
-_area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.parent.name, re.IGNORECASE)
-if not _area_match:
-    _area_match = re.search(r"Area[_\s]*(\d+)", _ply_path.name, re.IGNORECASE)
-if not _area_match:
-    raise SystemExit("[ERROR] Cannot determine area number from PLY path.")
 
-AREA_NUMBER = int(_area_match.group(1))
-AREA_NAME = f"Area{AREA_NUMBER}"
-
-ref = gpd.read_file(AREA_REF_GEOJSON)
-area = ref[ref["name"] == AREA_NAME]
-if area.empty:
-    raise SystemExit(f"[ERROR] No origin for '{AREA_NAME}' in GeoJSON")
-
-area_row = area.iloc[0]
-TX, TY, TZ = area_row.geometry.x, area_row.geometry.y, area_row.geometry.z
-print(f"Area: {AREA_NAME}  |  Origin TX={TX:.3f} TY={TY:.3f} TZ={TZ:.3f}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  Load original point cloud (background context)
-# ─────────────────────────────────────────────────────────────────────────────
-print(f"\nLoading point cloud: {_ply_path.name} ...")
-pcd_orig = o3d.io.read_point_cloud(str(PLY_FILE))
-pts_orig = np.asarray(pcd_orig.points)
-original_colors = np.asarray(pcd_orig.colors).copy()
-cloud_centroid_full = pts_orig.mean(axis=0)
-
-_cx, _cy = float(cloud_centroid_full[0]), float(cloud_centroid_full[1])
-_dxy2 = (pts_orig[:, 0] - _cx) ** 2 + (pts_orig[:, 1] - _cy) ** 2
-_crop_mask = _dxy2 <= (CROP_RADIUS ** 2)
-
-pts_orig = pts_orig[_crop_mask]
-original_colors = original_colors[_crop_mask]
-
-pcd_orig = o3d.geometry.PointCloud()
-pcd_orig.points = o3d.utility.Vector3dVector(pts_orig)
-pcd_orig.colors = o3d.utility.Vector3dVector(original_colors)
-
-print(f"  {len(pts_orig):,} points (after crop r={CROP_RADIUS} m)")
-cloud_centroid = pts_orig.mean(axis=0) if len(pts_orig) > 0 else cloud_centroid_full
-pc_min, pc_max = pts_orig.min(axis=0), pts_orig.max(axis=0)
-
-# Ground level estimate (P95 of Z)
+# Ground level estimate (P95 of Z) — DEV1 does not use interactive picking
 GROUND_Z = float(np.percentile(pts_orig[:, 2], 95))
 print(f"  Ground Z estimate (P95): {GROUND_Z:.3f} m")
 
-# Crop centre in UTM
-_cx_utm, _cy_utm = _cx + TX, _cy + TY
-_crop_r2 = CROP_RADIUS ** 2
+# ─────────────────────────────────────────────────────────────────────────────
+# VIEWER-SPECIFIC HELPERS (depend on viewer state: GROUND_Z, TX, TY, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
 
+def _in_crop_utm(coords):
+    """Conservative check: any part of the polyline within the circular crop (UTM)."""
+    dx = coords[:, 0] - _cx_utm
+    dy = coords[:, 1] - _cy_utm
+    if (dx * dx + dy * dy <= _crop_r2).any():
+        return True
+    xs, ys = coords[:, 0], coords[:, 1]
+    if xs.max() < _cx_utm - CROP_RADIUS: return False
+    if xs.min() > _cx_utm + CROP_RADIUS: return False
+    if ys.max() < _cy_utm - CROP_RADIUS: return False
+    if ys.min() > _cy_utm + CROP_RADIUS: return False
+    return True
+
+
+def _to_local(coords_utm, vejl_dybde_mm=None):
+    c = coords_utm.copy().astype(float)
+    if c.shape[1] == 2:
+        c = np.hstack([c, np.zeros((len(c), 1))])
+    c[:, 0] -= TX
+    c[:, 1] -= TY
+    bad = c[:, 2] == -99
+    if bad.any():
+        ind_m = None
+        if vejl_dybde_mm is not None:
+            try:
+                d = float(vejl_dybde_mm)
+                if d > 0:
+                    ind_m = d / 1000.0
+            except (ValueError, TypeError):
+                pass
+        good_z = c[~bad, 2]
+        feat_mean = float(good_z.mean()) if len(good_z) > 0 else None
+        for idx in np.where(bad)[0]:
+            if ind_m is not None:
+                c[idx, 2] = (GROUND_Z + TZ) - ind_m
+            elif feat_mean is not None:
+                c[idx, 2] = feat_mean
+            else:
+                c[idx, 2] = GROUND_Z + TZ
+    c[:, 2] -= TZ
+    return c
+
+
+def _clip_segment_to_crop(p1, p2):
+    """Clip a 3D segment to the circular crop disc in XY."""
+    x1 = p1[0] - _cx
+    y1 = p1[1] - _cy
+    x2 = p2[0] - _cx
+    y2 = p2[1] - _cy
+    dx = x2 - x1
+    dy = y2 - y1
+    a = dx * dx + dy * dy
+    if a < 1e-12:
+        if x1 * x1 + y1 * y1 <= _crop_r2:
+            return p1, p2
+        return None
+    b = 2.0 * (x1 * dx + y1 * dy)
+    c = x1 * x1 + y1 * y1 - _crop_r2
+    disc = b * b - 4.0 * a * c
+    if disc < 0:
+        return None
+    sq = np.sqrt(disc)
+    t_enter = (-b - sq) / (2.0 * a)
+    t_exit = (-b + sq) / (2.0 * a)
+    t0 = max(0.0, t_enter)
+    t1 = min(1.0, t_exit)
+    if t0 > t1:
+        return None
+    return p1 + t0 * (p2 - p1), p1 + t1 * (p2 - p1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LER LOADING + DEVIATION COMPUTATION + GUI (from original DEV1)
+# ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Load LER utility line segments from GML
 # ─────────────────────────────────────────────────────────────────────────────

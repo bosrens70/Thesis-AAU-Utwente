@@ -1,17 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-HDBSCAN Instance Segmentation — Area 5 Site 05, Class 1 (Other Utility)
-=======================================================================
+HDBSCAN Instance Segmentation Viewer
+=====================================
 Opens an Open3D viewer with live MIN_CLUSTER_SIZE / MIN_SAMPLES controls
 and a Re-run button so you can tune without restarting the script.
 
-Key parameters:
-    MIN_CLUSTER_SIZE —  HDBSCAN parameter: minimum number of points to form a cluster.
-    MIN_SAMPLES      — Optional HDBSCAN parameter: ontrols how conservative the algorithm is about core point density. 
-    A point is considered a "core point" only if it has at least min_samples neighbors within its local neighborhood. 
-    Higher values mean the algorithm requires denser regions before it considers them part of a cluster, which makes it more resistant to noise but can also break up sparser clusters. 
-    MIN_INSTANCE_POINTS — instances smaller than this become noise. This is a post-processing step that filters out small clusters to reduce noise.
+Refactored to use core/ for configuration.  Data loading is minimal
+(PLY only — no GML needed).
 """
+
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so `core` is importable
+_project_root = Path(__file__).resolve().parent.parent
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
 
 import numpy as np
 from sklearn.cluster import HDBSCAN, DBSCAN
@@ -20,34 +24,18 @@ from sklearn.neighbors import KDTree
 import open3d as o3d
 import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
-from pathlib import Path
 import time
 import matplotlib.colors as mcolors
 from datetime import datetime
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
+from core.config import (
+    PLY_FILE, PLY_HEADER_ROWS, CLASS_COLUMN, TARGET_CLASS,
+    VOXEL_SIZE, MIN_CLUSTER_SIZE, MIN_SAMPLES, POINT_SIZE,
+    MIN_INSTANCE_POINTS,
 )
 
-PLY_HEADER_ROWS = 11
-CLASS_COLUMN    = 6
-TARGET_CLASS    = 1       # "Other Utility" (third-party utilities)
-
-VOXEL_SIZE  = 0.01        # metres — downsample before clustering
-
-# Initial HDBSCAN parameters (editable in the GUI)
-MIN_CLUSTER_SIZE = 100
-MIN_SAMPLES      = 5
-
-POINT_SIZE          = 2.0
-MIN_INSTANCE_POINTS = 250   # instances smaller than this become noise
-
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. LOAD PLY
+# 1. LOAD PLY (lightweight — no GML, no area offset needed)
 # ─────────────────────────────────────────────────────────────────────────────
 ply_path = Path(PLY_FILE)
 if not ply_path.exists():
@@ -77,7 +65,7 @@ _pcd1 = o3d.geometry.PointCloud()
 _pcd1.points = o3d.utility.Vector3dVector(pts1)
 _pcd1_ds = _pcd1.voxel_down_sample(voxel_size=VOXEL_SIZE)
 pts1_ds = np.asarray(_pcd1_ds.points)
-print(f"  Voxel downsample ({VOXEL_SIZE} m): {len(pts1):,} → {len(pts1_ds):,} points\n")
+print(f"  Voxel downsample ({VOXEL_SIZE} m): {len(pts1):,} -> {len(pts1_ds):,} points\n")
 
 # KDTree built once — reused for every re-run
 _tree_ds = KDTree(pts1_ds)
@@ -91,24 +79,18 @@ def run_hdbscan(min_cluster_size, min_samples, min_instance_points):
     ds_lbl = hdb.fit_predict(pts1_ds)
     print(f"  HDBSCAN done in {time.perf_counter() - t:.1f}s")
 
-    # Transfer cluster labels from downsampled points back to original points
-    # using nearest-neighbor lookup in the downsampled cloud.
     nn_idx = _tree_ds.query(pts1, k=1, return_distance=False).ravel()
     labels = ds_lbl[nn_idx]
 
-    # Drop instances smaller than min_instance_points → noise
     uniq, cnts = np.unique(labels, return_counts=True)
     for u, c in zip(uniq, cnts):
         if u >= 0 and c < min_instance_points:
             labels[labels == u] = -1
 
-    # Reorder instance IDs by descending point count (0 = largest)
     uniq, cnts = np.unique(labels, return_counts=True)
     inst_ids  = uniq[uniq >= 0]
     inst_cnts = cnts[uniq >= 0]
     order     = np.argsort(inst_cnts)[::-1]
-    # Make IDs deterministic and easier to read in the legend:
-    # instance 0 is always the largest cluster.
     remap     = {int(old): new for new, old in enumerate(inst_ids[order])}
     new_labels = np.full_like(labels, -1)
     for old_id, new_id in remap.items():
@@ -128,10 +110,8 @@ def run_hdbscan(min_cluster_size, min_samples, min_instance_points):
 def make_colors(labels, unique, n_instances):
     rng = np.random.default_rng(42)
     if n_instances > 0:
-        # Use evenly spaced hues for good visual separation between instances.
         hues = np.linspace(0.0, 1.0, n_instances, endpoint=False)
         rng.shuffle(hues)
-        # Plain Python float lists so gui.Color receives the exact same values
         palette = {int(uid): [float(c) for c in mcolors.hsv_to_rgb([h, 0.85, 0.95])]
                    for uid, h in zip(sorted(unique[unique >= 0]), hues)}
     else:
@@ -142,10 +122,8 @@ def make_colors(labels, unique, n_instances):
         colors[labels == uid] = col
     return colors, palette
 
+
 def split_parallel_pipes(labels, eps_2d, min_pts_2d, min_split_size, target_instance):
-    """Re-cluster a specific instance on its 2D cross-section (via PCA)
-    to separate parallel pipes that density-based 3D clustering merged.
-    Sub-clusters smaller than min_split_size become noise."""
     new_labels = labels.copy()
     next_id = int(labels.max()) + 1 if labels.max() >= 0 else 0
 
@@ -162,7 +140,6 @@ def split_parallel_pipes(labels, eps_2d, min_pts_2d, min_split_size, target_inst
         db = DBSCAN(eps=eps_2d, min_samples=min_pts_2d)
         sub_labels = db.fit_predict(cross_section)
 
-        # Drop sub-clusters smaller than min_split_size
         for sid in set(sub_labels) - {-1}:
             if (sub_labels == sid).sum() < min_split_size:
                 sub_labels[sub_labels == sid] = -1
@@ -187,7 +164,6 @@ def split_parallel_pipes(labels, eps_2d, min_pts_2d, min_split_size, target_inst
 
 
 def _renumber_labels(labels):
-    """Renumber instance labels 0..N-1 by descending size, return (labels, uniq, n_inst, n_noise)."""
     uniq, cnts = np.unique(labels, return_counts=True)
     inst_ids  = uniq[uniq >= 0]
     inst_cnts = cnts[uniq >= 0]
@@ -220,7 +196,6 @@ pcd_instances.points = o3d.utility.Vector3dVector(pts1)
 pcd_instances.colors = o3d.utility.Vector3dVector(init_colors)
 
 pts_bg = all_xyz[~mask1]
-# Dim background RGB so highlighted target-class instances stand out.
 rgb_bg = data[~mask1, 3:6] / 255.0 * 0.25
 pcd_bg = o3d.geometry.PointCloud()
 pcd_bg.points = o3d.utility.Vector3dVector(pts_bg)
@@ -390,7 +365,6 @@ class InstanceViewer:
         print(f"\nRe-running HDBSCAN (min_cluster_size={mcs}, "
               f"min_samples={ms}, min_instance_points={mip}) ...")
 
-        # Recompute labels/colors in memory; no need to reload the PLY.
         labels, uniq, n_inst, n_noise = run_hdbscan(mcs, ms, mip)
         colors, pal = make_colors(labels, uniq, n_inst)
 
@@ -400,7 +374,6 @@ class InstanceViewer:
         self._cur_n_inst  = n_inst
         self._cur_n_noise = n_noise
 
-        # Re-register geometry so the scene immediately reflects the new colors.
         pcd_instances.colors = o3d.utility.Vector3dVector(colors)
         self.scene.scene.remove_geometry("instances")
         self.scene.scene.add_geometry("instances", pcd_instances, self._mat)
@@ -451,7 +424,6 @@ class InstanceViewer:
             print("\nNo instances to save.")
             return
 
-        # Original class labels and RGB for the class-1 subset (index-aligned with pts1)
         cls1 = all_classes[mask1]
         rgb1 = all_rgb[mask1]
 
@@ -480,7 +452,7 @@ class InstanceViewer:
                             f"{inst_pts[i, 2]:.6f} {inst_rgb[i, 0]} "
                             f"{inst_rgb[i, 1]} {inst_rgb[i, 2]} {inst_cls[i]}\n")
 
-        print(f"\nSaved {len(instance_ids)} instance PLY files → {out_dir}")
+        print(f"\nSaved {len(instance_ids)} instance PLY files -> {out_dir}")
         print(f"  (min_cluster_size={mcs}  min_samples={ms}  "
               f"min_instance_points={mip})")
 
