@@ -1342,17 +1342,25 @@ def _do_pick(depth_image):
     )
     hit = np.array(world[:3], dtype=float)
 
+    # Skip segments whose layer is hidden
     best_seg_d = np.inf
     best_seg_i = -1
     if len(pick_seg_midpoints) > 0:
         dists = np.linalg.norm(pick_seg_midpoints - hit, axis=1)
+        for _si, _sl in enumerate(pick_seg_layer):
+            if not _layer_visible.get(_sl, True) or not _ler_active[0]:
+                dists[_si] = np.inf
         best_seg_i = int(np.argmin(dists))
         best_seg_d = float(dists[best_seg_i])
 
+    # Skip components whose layer is hidden
     best_comp_d = np.inf
     best_comp_i = -1
     if len(pick_comp_centres) > 0:
         dists = np.linalg.norm(pick_comp_centres - hit, axis=1)
+        for _ci, _cl in enumerate(pick_comp_layer):
+            if not _layer_visible.get(_cl, True) or not _ler_active[0]:
+                dists[_ci] = np.inf
         best_comp_i = int(np.argmin(dists))
         best_comp_d = float(dists[best_comp_i])
 

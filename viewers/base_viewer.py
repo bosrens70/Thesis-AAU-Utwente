@@ -209,10 +209,8 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
     bad = coords[:, 2] == -99
     sources[~bad] = DepthSource.REGISTERED
 
-    # Count registered vertices inside crop disc
-    for idx in np.where(~bad)[0]:
-        if _pt_in_local_bbox(coords[idx, 0], coords[idx, 1]):
-            _depth_stats["registered"] += 1
+    # Count registered vertices
+    _depth_stats["registered"] += int((~bad).sum())
 
     if bad.any():
         # Pre-compute resolver inputs once per feature
@@ -261,7 +259,6 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
         )
 
         for idx in np.where(bad)[0]:
-            _inside_crop = _pt_in_local_bbox(coords[idx, 0], coords[idx, 1])
             for level in ordered_levels:
                 resolver = _RESOLVERS.get(level)
                 if resolver is None:
@@ -270,8 +267,7 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
                 if z is not None:
                     coords[idx, 2] = z
                     sources[idx] = level
-                    if _inside_crop:
-                        _depth_stats[_STATS_KEY[level]] += 1
+                    _depth_stats[_STATS_KEY[level]] += 1
                     break
 
     # Translate Z to local
@@ -479,7 +475,7 @@ pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.
 
 _t_pipes1 = time.perf_counter()
 print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments  [{_t_pipes1 - _t_pipes0:.2f}s total]")
-print(f"\n  Depth hierarchy stats (pipe verts inside crop disc, r={CROP_RADIUS} m):")
+print(f"\n  Depth hierarchy stats (all pipe vertices):")
 print(f"    1. Registered Z:        {_depth_stats['registered']}")
 print(f"    2. vejledendeDybde:      {_depth_stats['estimated']}")
 print(f"    3. Feature mean Z:       {_depth_stats['fallback_feature_mean']}")
@@ -1306,18 +1302,26 @@ def _do_pick(depth_image):
     hit = np.array(world[:3], dtype=float)
 
     # ── Find nearest pipe segment using true point-to-segment distance ────────
+    # Skip segments whose layer is hidden
     best_seg_d = np.inf
     best_seg_i = -1
     if len(pick_seg_p1) > 0:
-        seg_dists  = _batch_point_to_segment_dists(hit, pick_seg_p1, pick_seg_p2)
+        seg_dists = _batch_point_to_segment_dists(hit, pick_seg_p1, pick_seg_p2)
+        for _si, _sl in enumerate(pick_seg_layer):
+            if not _layer_visible.get(_sl, True) or not _ler_active[0]:
+                seg_dists[_si] = np.inf
         best_seg_i = int(np.argmin(seg_dists))
         best_seg_d = float(seg_dists[best_seg_i])
 
     # ── Find nearest component sphere centre ──────────────────────────────────
+    # Skip components whose layer is hidden
     best_comp_d = np.inf
     best_comp_i = -1
     if len(pick_comp_centres) > 0:
         dists = np.linalg.norm(pick_comp_centres - hit, axis=1)
+        for _ci, _cl in enumerate(pick_comp_layer):
+            if not _layer_visible.get(_cl, True) or not _ler_active[0]:
+                dists[_ci] = np.inf
         best_comp_i = int(np.argmin(dists))
         best_comp_d = float(dists[best_comp_i])
 
