@@ -53,6 +53,8 @@ class PointCloudData:
     crop_center_local: tuple     # (cx, cy)
     crop_center_utm: tuple       # (cx, cy) — in UTM
     crop_radius: float
+    ground_z: float = None       # ground level (local), set by pick_ground_level()
+    ground_z_method: str = ""    # how ground_z was determined
 
 
 @dataclass
@@ -521,3 +523,58 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
         instance_dir=inst_dir, instance_files=inst_files,
         load_time=t_end - t_start,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GROUND-LEVEL ESTIMATION
+# ─────────────────────────────────────────────────────────────────────────────
+def pick_ground_level(pc: PointCloudData) -> float:
+    """
+    Determine ground level for a loaded point cloud.
+
+    Opens a VisualizerWithEditing window so the user can pick ground-level
+    points with  Shift + Left-Click.  Close the window (Q or X) when done.
+
+    If no points are picked, falls back to P95 of point cloud Z.
+
+    Sets ``pc.ground_z`` and ``pc.ground_z_method`` in place and returns
+    the ground Z value.
+    """
+    print("\n" + "=" * 62)
+    print("  GROUND-LEVEL POINT PICKING")
+    print("=" * 62)
+    print("  Shift + Left-Click  to select points on the ground surface.")
+    print("  Pick one or more points that represent the ground level.")
+    print("  Press Q or close the window when finished.")
+    print("=" * 62 + "\n")
+
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window(
+        window_name="Pick ground-level points  (Shift+Click, then Q to finish)",
+        width=1280, height=720,
+    )
+    vis.add_geometry(pc.pcd)
+    vis.run()
+    picked_indices = vis.get_picked_points()
+    vis.destroy_window()
+
+    if len(picked_indices) == 0:
+        ground_z = float(np.percentile(pc.pts[:, 2], 95))
+        method = "fallback P95"
+        print(f"[WARNING] No points picked!  Falling back to P95 = {ground_z:.3f} m")
+    else:
+        picked_pts = pc.pts[picked_indices]
+        ground_z = float(np.mean(picked_pts[:, 2]))
+        method = f"picked from {len(picked_indices)} point(s)"
+        print(f"\n  Picked {len(picked_indices)} ground-level point(s):")
+        for i, idx in enumerate(picked_indices):
+            p = pc.pts[idx]
+            print(f"    [{i+1}]  index {idx:>8,}  ->  "
+                  f"X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
+
+    pc.ground_z = ground_z
+    pc.ground_z_method = method
+
+    print(f"\n  Ground level (local) = {ground_z:.3f} m")
+
+    return ground_z

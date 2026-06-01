@@ -34,7 +34,7 @@ from core.config import (
     DepthSource, DepthConfig,
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
 )
-from core.data_loader import init_site
+from core.data_loader import init_site, pick_ground_level
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -74,68 +74,19 @@ _DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 # VIEWER-SPECIFIC CODE BELOW (ground picking, mesh creation, GUI)
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Pick ground-level points interactively
+# 3.  Pick ground-level points (shared function from core/)
 # ─────────────────────────────────────────────────────────────────────────────
-def pick_points(pcd):
-    """
-    Open a VisualizerWithEditing window so the user can pick ground-level
-    vertices with  Shift + Left-Click.
+GROUND_Z = pick_ground_level(site.pc)
+_pick_method = site.pc.ground_z_method
+print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 
-    Close the window (press Q or the X button) when done picking.
-    Returns a list of picked point indices.
-    """
-    print("\n" + "=" * 62)
-    print("  GROUND-LEVEL POINT PICKING")
-    print("=" * 62)
-    print("  Shift + Left-Click  to select points on the ground surface.")
-    print("  Pick one or more points that represent the ground level.")
-    print("  Press Q or close the window when finished.")
-    print("=" * 62 + "\n")
-
-    vis = o3d.visualization.VisualizerWithEditing()
-    vis.create_window(window_name="Pick ground-level points  (Shift+Click, then Q to finish)",
-                      width=1280, height=720)
-    vis.add_geometry(pcd)
-    vis.run()   # blocks until user closes window
-    vis.destroy_window()
-
-    picked = vis.get_picked_points()
-    return picked
-
-
-picked_indices = pick_points(pcd) 
-
-if len(picked_indices) == 0:
-    print("[WARNING] No points picked!  Falling back to P95 of point cloud Z.") # if no points picked, use the 95th percentile of the point cloud Z
-    GROUND_Z = float(np.percentile(pts[:, 2], 95)) 
-    # Flat fallback plane: z = GROUND_Z
-    _ground_a, _ground_b, _ground_c = 0.0, 0.0, GROUND_Z
-else:
-    picked_pts = pts[picked_indices] # if points picked, use the mean of the picked points Z
-    # Fit a local ground plane z = a*x + b*y + c from picked points.
-    # If fewer than 3 points are picked, fall back to a flat plane.
-    if len(picked_pts) >= 3:
-        _A = np.c_[picked_pts[:, 0], picked_pts[:, 1], np.ones(len(picked_pts))]
-        _coef, *_ = np.linalg.lstsq(_A, picked_pts[:, 2], rcond=None)
-        _ground_a, _ground_b, _ground_c = (float(_coef[0]), float(_coef[1]), float(_coef[2]))
-    else:
-        _ground_a, _ground_b, _ground_c = 0.0, 0.0, float(np.mean(picked_pts[:, 2]))
-    # Keep GROUND_Z as the ground level at crop center for UI/readability.
-    GROUND_Z = float(_ground_a * _crop_cx_local + _ground_b * _crop_cy_local + _ground_c)
-    print(f"\n  Picked {len(picked_indices)} ground-level point(s):") # print the number of points picked
-    for i, idx in enumerate(picked_indices):
-        p = pts[idx] # print the X, Y, Z coordinates of the point
-        print(f"    [{i+1}]  index {idx:>8,}  ->  "
-              f"X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
+# Flat ground plane (a*x + b*y + c) — within a 2 m crop radius the tilt is negligible.
+_ground_a, _ground_b, _ground_c = 0.0, 0.0, GROUND_Z
 
 
 def _ground_level_local(x: float, y: float) -> float:
     """Evaluate fitted (or flat fallback) ground plane in local coordinates."""
     return (_ground_a * float(x)) + (_ground_b * float(y)) + _ground_c
-
-
-print(f"\n  Ground level (local) = {GROUND_Z:.3f} m") # print the ground level (local)
-print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m") # print the ground level (UTM)
 
 # Depth estimation counters (incremented only inside crop disc XY)
 _depth_stats = {"registered": 0, "estimated": 0, "fallback_feature_mean": 0, "fallback_layer_mean": 0, "fallback_global": 0}
@@ -924,7 +875,6 @@ panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Points: {len(pts):,}"))
 panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
-_pick_method = f"picked from {len(picked_indices)} point(s)" if picked_indices else "fallback P95"
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
 panel.add_fixed(int(0.3 * em))
 

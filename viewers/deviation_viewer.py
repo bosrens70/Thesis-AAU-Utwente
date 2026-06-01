@@ -29,12 +29,13 @@ from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
     LINE_LAYERS, COMPONENT_LAYERS,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
-    DEVIATION_THRESHOLDS, DEVIATION_COLORS,
+    DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
     FORSYNINGSART_COLOR_HINTS,
     forsyningsart_color as _forsyningsart_color,
 )
 from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
+    pick_ground_level,
 )
 from core.geometry import (
     batch_point_to_segments, deviation_to_color, linear_to_srgb,
@@ -68,87 +69,11 @@ _crop_r2 = CROP_RADIUS ** 2
 
 _ply_path = Path(PLY_FILE)
 
-# Ground level estimate (P95 of Z) — DEV1 does not use interactive picking
-GROUND_Z = float(np.percentile(pts_orig[:, 2], 95))
-print(f"  Ground Z estimate (P95): {GROUND_Z:.3f} m")
+# Ground level — interactive picking (shared from core/)
+GROUND_Z = pick_ground_level(site.pc)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VIEWER-SPECIFIC HELPERS (depend on viewer state: GROUND_Z, TX, TY, etc.)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _in_crop_utm(coords):
-    """Conservative check: any part of the polyline within the circular crop (UTM)."""
-    dx = coords[:, 0] - _cx_utm
-    dy = coords[:, 1] - _cy_utm
-    if (dx * dx + dy * dy <= _crop_r2).any():
-        return True
-    xs, ys = coords[:, 0], coords[:, 1]
-    if xs.max() < _cx_utm - CROP_RADIUS: return False
-    if xs.min() > _cx_utm + CROP_RADIUS: return False
-    if ys.max() < _cy_utm - CROP_RADIUS: return False
-    if ys.min() > _cy_utm + CROP_RADIUS: return False
-    return True
-
-
-def _to_local(coords_utm, vejl_dybde_mm=None):
-    c = coords_utm.copy().astype(float)
-    if c.shape[1] == 2:
-        c = np.hstack([c, np.zeros((len(c), 1))])
-    c[:, 0] -= TX
-    c[:, 1] -= TY
-    bad = c[:, 2] == -99
-    if bad.any():
-        ind_m = None
-        if vejl_dybde_mm is not None:
-            try:
-                d = float(vejl_dybde_mm)
-                if d > 0:
-                    ind_m = d / 1000.0
-            except (ValueError, TypeError):
-                pass
-        good_z = c[~bad, 2]
-        feat_mean = float(good_z.mean()) if len(good_z) > 0 else None
-        for idx in np.where(bad)[0]:
-            if ind_m is not None:
-                c[idx, 2] = (GROUND_Z + TZ) - ind_m
-            elif feat_mean is not None:
-                c[idx, 2] = feat_mean
-            else:
-                c[idx, 2] = GROUND_Z + TZ
-    c[:, 2] -= TZ
-    return c
-
-
-def _clip_segment_to_crop(p1, p2):
-    """Clip a 3D segment to the circular crop disc in XY."""
-    x1 = p1[0] - _cx
-    y1 = p1[1] - _cy
-    x2 = p2[0] - _cx
-    y2 = p2[1] - _cy
-    dx = x2 - x1
-    dy = y2 - y1
-    a = dx * dx + dy * dy
-    if a < 1e-12:
-        if x1 * x1 + y1 * y1 <= _crop_r2:
-            return p1, p2
-        return None
-    b = 2.0 * (x1 * dx + y1 * dy)
-    c = x1 * x1 + y1 * y1 - _crop_r2
-    disc = b * b - 4.0 * a * c
-    if disc < 0:
-        return None
-    sq = np.sqrt(disc)
-    t_enter = (-b - sq) / (2.0 * a)
-    t_exit = (-b + sq) / (2.0 * a)
-    t0 = max(0.0, t_enter)
-    t1 = min(1.0, t_exit)
-    if t0 > t1:
-        return None
-    return p1 + t0 * (p2 - p1), p1 + t1 * (p2 - p1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# LER LOADING + DEVIATION COMPUTATION + GUI (from original DEV1)
+# LER LOADING + DEVIATION COMPUTATION + GUI
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Load LER utility line segments from GML
@@ -252,55 +177,6 @@ def _clip_segment_to_crop(p1, p2):
         return None
 
     return p1 + t0 * (p2 - p1), p1 + t1 * (p2 - p1)
-
-
-def segment_to_plane(p1, p2, width, color):
-    vec = p2 - p1
-    length = np.linalg.norm(vec)
-    if length < 1e-6:
-        return None
-    fwd = vec / length
-    up = np.array([0.0, 0.0, 1.0])
-    side = np.cross(fwd, up)
-    side_len = np.linalg.norm(side)
-    if side_len < 1e-6:
-        side = np.array([1.0, 0.0, 0.0])
-    else:
-        side = side / side_len
-    offset = side * (width / 2.0)
-    verts = np.array([p1 - offset, p1 + offset, p2 + offset, p2 - offset], dtype=float)
-    tris = np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)
-    mesh = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(verts),
-        o3d.utility.Vector3iVector(tris),
-    )
-    mesh.paint_uniform_color(color)
-    return mesh
-
-
-def segment_to_cylinder(p1, p2, radius, color, resolution=12):
-    vec = p2 - p1
-    length = np.linalg.norm(vec)
-    if length < 1e-6:
-        return None
-    cyl = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=radius, height=length, resolution=resolution, split=1)
-    z_axis = np.array([0.0, 0.0, 1.0])
-    direction = vec / length
-    cross = np.cross(z_axis, direction)
-    cross_norm = np.linalg.norm(cross)
-    dot = np.dot(z_axis, direction)
-    if cross_norm > 1e-6:
-        axis = cross / cross_norm
-        angle = np.arctan2(cross_norm, dot)
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle)
-        cyl.rotate(R, center=[0, 0, 0])
-    elif dot < 0:
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(np.array([1, 0, 0]) * np.pi)
-        cyl.rotate(R, center=[0, 0, 0])
-    cyl.translate((p1 + p2) / 2.0)
-    cyl.paint_uniform_color(color)
-    return cyl
 
 
 for layer_name, cfg in list(LINE_LAYERS.items()):
@@ -737,7 +613,6 @@ except Exception:
     pass
 
 _t_load = time.perf_counter()
-print(f"\nTotal load + compute: {_t_load - _t0:.1f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  GUI
@@ -1097,6 +972,6 @@ window.set_on_layout(on_layout)
 window.add_child(scene_widget)
 window.add_child(panel)
 
-print(f"\nStartup: {time.perf_counter() - _t0:.1f}s  - Launching viewer ...\n")
+print(f"\nLaunching viewer ...\n")
 app.run()
 print("Viewer closed.")

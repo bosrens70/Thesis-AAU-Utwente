@@ -32,7 +32,7 @@ from core.config import (
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS, DIAMETER_COLORS,
 )
-from core.data_loader import init_site, discover_instances
+from core.data_loader import init_site, discover_instances, pick_ground_level
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, GML, and instances via core/
@@ -134,82 +134,18 @@ _instance_labels = {}
 _current_inst_idx = [0]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Pick ground-level points interactively
+# 3.  Pick ground-level points (shared function from core/)
 # ─────────────────────────────────────────────────────────────────────────────
-def pick_points(pcd):
-    """
-    Open a VisualizerWithEditing window so the user can pick ground-level
-    vertices with  Shift + Left-Click.
+GROUND_Z = pick_ground_level(site.pc)
+print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 
-    Close the window (press Q or the X button) when done picking.
-    Returns a list of picked point indices.
-    """
-    print("\n" + "=" * 62)
-    print("  GROUND-LEVEL POINT PICKING")
-    print("=" * 62)
-    print("  Shift + Left-Click  to select points on the ground surface.")
-    print("  Pick one or more points that represent the ground level.")
-    print("  Press Q or close the window when finished.")
-    print("=" * 62 + "\n")
-
-    vis = o3d.visualization.VisualizerWithEditing()
-    vis.create_window(window_name="Pick ground-level points  (Shift+Click, then Q to finish)",
-                      width=1280, height=720)
-    vis.add_geometry(pcd)
-    vis.run()   # blocks until user closes window
-    vis.destroy_window()
-
-    picked = vis.get_picked_points()
-    return picked
-
-
-picked_indices = pick_points(pcd) 
-
-if len(picked_indices) == 0:
-    print("[WARNING] No points picked!  Falling back to P95 of point cloud Z.")
-    GROUND_Z = float(np.percentile(pts[:, 2], 95))
-    _ground_normal = np.array([0.0, 0.0, 1.0])
-else:
-    picked_pts = pts[picked_indices]
-    GROUND_Z   = float(np.mean(picked_pts[:, 2]))
-    print(f"\n  Picked {len(picked_indices)} ground-level point(s):")
-    for i, idx in enumerate(picked_indices):
-        p = pts[idx]
-        print(f"    [{i+1}]  index {idx:>8,}  ->  "
-              f"X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
-    if len(picked_pts) >= 3:
-        _v1 = picked_pts[1] - picked_pts[0]
-        _v2 = picked_pts[2] - picked_pts[0]
-        _ground_normal = np.cross(_v1, _v2)
-        _gn_len = np.linalg.norm(_ground_normal)
-        if _gn_len > 1e-9:
-            _ground_normal /= _gn_len
-            if _ground_normal[2] < 0:
-                _ground_normal = -_ground_normal
-        else:
-            _ground_normal = np.array([0.0, 0.0, 1.0])
-    else:
-        _ground_normal = np.array([0.0, 0.0, 1.0])
-
+_ground_normal = np.array([0.0, 0.0, 1.0])
 _ground_center = np.array([_crop_cx_local, _crop_cy_local, GROUND_Z])
 
-print(f"\n  Ground level (local) = {GROUND_Z:.3f} m")
-print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
-print(f"  Ground normal        = [{_ground_normal[0]:.4f}, {_ground_normal[1]:.4f}, {_ground_normal[2]:.4f}]")
 
-# Ground plane equation: n . (P - _ground_center) = 0
-# Solve for Z at any local (x, y):
-#   n[0]*(x - cx) + n[1]*(y - cy) + n[2]*(z - cz) = 0
-#   z = cz - (n[0]*(x - cx) + n[1]*(y - cy)) / n[2]
 def _ground_z_at(x_local, y_local):
-    if abs(_ground_normal[2]) < 1e-9:
-        return GROUND_Z
-    return float(
-        _ground_center[2]
-        - (_ground_normal[0] * (x_local - _ground_center[0])
-           + _ground_normal[1] * (y_local - _ground_center[1]))
-        / _ground_normal[2]
-    )
+    """Return ground Z at a local XY position (flat plane)."""
+    return GROUND_Z
 
 # Depth estimation counters
 _depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
@@ -664,7 +600,6 @@ for _ln, _spheres in _comp_layer_spheres.items():
     _comp_layer_meshes[_ln] = _m
 
 _t_load = time.perf_counter()
-print(f"\nData loaded in {_t_load - _t0:.2f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Coordinate frame + circular crop wireframe + point cloud normals
