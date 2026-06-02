@@ -34,6 +34,7 @@ from core.config import (
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level
 from core.gui_helpers import make_legend_row
+from core.geometry import segment_to_plane
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, GML, and instances via core/
@@ -382,6 +383,18 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
+        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
+        bredde_m = None
+        if layer_name == "Ledningstrace":
+            bredde_m = 0.25  # fallback: 25 cm
+            if "bredde" in row.index:
+                try:
+                    b = float(row["bredde"] or 0)
+                    if b > 0:
+                        bredde_m = b / 1000.0
+                except (ValueError, TypeError):
+                    pass
+
         if layer_name == "Vandledning" and diam_mm > 0:
             color = DIAMETER_COLORS.get(int(diam_mm), default_color)
         else:
@@ -416,10 +429,14 @@ for layer_name, cfg in LINE_LAYERS.items():
                 clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
                 if clipped is None:
                     continue
-                cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
-                if cyl is not None:
-                    all_pipe_meshes.append(cyl)
-                    _pipe_layer_cyls.setdefault(layer_name, []).append(cyl)
+                # Use planes for Ledningstrace (with width from bredde_m), cylinders for other utility lines
+                if bredde_m is not None:
+                    mesh = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
+                else:
+                    mesh = segment_to_cylinder(clipped[0], clipped[1], radius, color)
+                if mesh is not None:
+                    all_pipe_meshes.append(mesh)
+                    _pipe_layer_cyls.setdefault(layer_name, []).append(mesh)
                     if layer_name not in _pipe_layer_seg_pts:
                         _pipe_layer_seg_pts[layer_name] = ([], [])
                     _pipe_layer_seg_pts[layer_name][0].append(clipped[0].copy())

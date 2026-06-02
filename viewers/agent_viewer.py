@@ -35,7 +35,7 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
 )
 from core.data_loader import init_site, pick_ground_level
-from core.geometry import segment_to_cylinder, linear_to_srgb
+from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Load site data + ground picking
@@ -136,6 +136,17 @@ for layer_name, gdf in gdfs.items():
         geom = row.geometry
         if geom is None:
             continue
+        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
+        bredde_m = None
+        if layer_name == "Ledningstrace":
+            bredde_m = 0.25
+            if "bredde" in row.index:
+                try:
+                    b = float(row["bredde"] or 0)
+                    if b > 0:
+                        bredde_m = b / 1000.0
+                except (ValueError, TypeError):
+                    pass
         sub_geoms = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
         for sg in sub_geoms:
             coords = np.array(sg.coords, dtype=float)
@@ -148,9 +159,12 @@ for layer_name, gdf in gdfs.items():
                 p1, p2 = coords[i], coords[i + 1]
                 if not _seg_in_local_bbox(p1, p2):
                     continue
-                cyl = segment_to_cylinder(p1, p2, radius, color)
-                if cyl is not None:
-                    cyls.append(cyl)
+                if bredde_m is not None:
+                    mesh = segment_to_plane(p1, p2, bredde_m, color)
+                else:
+                    mesh = segment_to_cylinder(p1, p2, radius, color)
+                if mesh is not None:
+                    cyls.append(mesh)
     if cyls:
         merged = cyls[0]
         for c in cyls[1:]:
@@ -488,6 +502,15 @@ def highlight_features(gdf_subset, color=None, radius=0.02):
             s.compute_vertex_normals()
             spheres.append(s)
         else:
+            # Check for bredde attribute for plane rendering (used by Ledningstrace)
+            bredde_m = None
+            if "bredde" in row.index:
+                try:
+                    b = float(row["bredde"] or 0)
+                    if b > 0:
+                        bredde_m = b / 1000.0
+                except (ValueError, TypeError):
+                    pass
             sub_geoms = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
             for sg in sub_geoms:
                 coords = np.array(sg.coords, dtype=float)
@@ -500,10 +523,13 @@ def highlight_features(gdf_subset, color=None, radius=0.02):
                     p1, p2 = coords[i], coords[i + 1]
                     if not _seg_in_local_bbox(p1, p2):
                         continue
-                    cyl = segment_to_cylinder(p1, p2, radius, color)
-                    if cyl is not None:
-                        cyl.compute_vertex_normals()
-                        cyls.append(cyl)
+                    if bredde_m is not None:
+                        mesh = segment_to_plane(p1, p2, bredde_m, color)
+                    else:
+                        mesh = segment_to_cylinder(p1, p2, radius, color)
+                    if mesh is not None:
+                        mesh.compute_vertex_normals()
+                        cyls.append(mesh)
 
     all_meshes = cyls + spheres
     if not all_meshes:
