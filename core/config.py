@@ -103,15 +103,17 @@ COMP_TO_LINE = {
 # FORSYNINGSART keyword -> colour for Ledningstrace sub-groups
 # ─────────────────────────────────────────────────────────────────────────────
 FORSYNINGSART_COLOR_HINTS = [
-    ("vand",   [0.000, 0.000, 1.000]),   # DLF vand blue
-    ("afloeb", [1.000, 0.000, 0.000]),   # DLF spildevand red
-    ("spilde", [1.000, 0.000, 0.000]),   # DLF spildevand red
-    ("gas",    [1.000, 0.600, 0.000]),   # DLF gas orange
-    ("el",     [1.000, 0.000, 0.000]),   # DLF el red
+    # Check longer/more specific keywords first to avoid substring conflicts
+    # (e.g., "tele" must come before "el" since "telekommunikation" contains "el")
+    ("fjern",  [1.000, 0.000, 1.000]),   # DLF fjernvarme violet
+    ("varme",  [1.000, 0.000, 1.000]),   # DLF varme violet
     ("tele",   [0.980, 0.588, 0.275]),   # DLF tele orange
     ("kommu",  [0.980, 0.588, 0.275]),   # DLF kommunikation orange
-    ("varme",  [1.000, 0.000, 1.000]),   # DLF varme violet
-    ("fjern",  [1.000, 0.000, 1.000]),   # DLF fjernvarme violet
+    ("afloeb", [1.000, 0.000, 0.000]),   # DLF spildevand red
+    ("spilde", [1.000, 0.000, 0.000]),   # DLF spildevand red
+    ("vand",   [0.000, 0.000, 1.000]),   # DLF vand blue
+    ("gas",    [1.000, 0.600, 0.000]),   # DLF gas orange
+    ("el",     [1.000, 0.000, 0.000]),   # DLF el red (checked last to avoid matching "tele")
     ("olie",   [0.463, 0.463, 0.463]),   # DLF olie grey
 ]
 
