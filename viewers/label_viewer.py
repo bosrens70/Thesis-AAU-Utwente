@@ -30,11 +30,13 @@ from core.config import (
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
-    INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS, DIAMETER_COLORS,
+    INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
+    forsyningsart_color,
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level
-from core.gui_helpers import make_legend_row
+from core.gui_helpers import make_legend_row, make_master_pipe_toggle, make_master_comp_toggle
 from core.geometry import segment_to_plane
+from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, GML, and instances via core/
@@ -349,6 +351,12 @@ pick_seg_layer     = []   # layer name per segment
 # Store per-utility-type average depth for component fallback
 _layer_avg_depth_local = {}
 
+# Track Ledningstrace forsyningsart variants for GUI legend
+_ledningstrace_variants = {}  # forsyningsart -> color mapping
+
+# Track colors for all storage keys (including compound keys for Ledningstrace variants)
+_storage_key_colors = {}  # storage_key -> color
+
 for layer_name, cfg in LINE_LAYERS.items():
     try:
         gdf = gpd.read_file(GML_PATH, layer=layer_name)
@@ -383,22 +391,14 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
-        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
-        bredde_m = None
-        if layer_name == "Ledningstrace":
-            bredde_m = 0.25  # fallback: 25 cm
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
+        # Get Ledningstrace display info (color, forsyningsart) and width
+        is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
+        if is_trace and display_fa and display_fa not in _ledningstrace_variants:
+            _ledningstrace_variants[display_fa] = color
 
-        if layer_name == "Vandledning" and diam_mm > 0:
-            color = DIAMETER_COLORS.get(int(diam_mm), default_color)
-        else:
-            color = default_color
+        bredde_m = get_bredde_width(row)
+        if is_trace and bredde_m is None:
+            bredde_m = 0.25  # fallback: 25 cm
 
         # Get indicative depth for this feature
         vejl_dybde = None
@@ -436,17 +436,21 @@ for layer_name, cfg in LINE_LAYERS.items():
                     mesh = segment_to_cylinder(clipped[0], clipped[1], radius, color)
                 if mesh is not None:
                     all_pipe_meshes.append(mesh)
-                    _pipe_layer_cyls.setdefault(layer_name, []).append(mesh)
-                    if layer_name not in _pipe_layer_seg_pts:
-                        _pipe_layer_seg_pts[layer_name] = ([], [])
-                    _pipe_layer_seg_pts[layer_name][0].append(clipped[0].copy())
-                    _pipe_layer_seg_pts[layer_name][1].append(clipped[1].copy())
+                    storage_key = get_storage_key(layer_name, display_fa)
+                    _pipe_layer_cyls.setdefault(storage_key, []).append(mesh)
+                    # Track color for this storage key
+                    if storage_key not in _storage_key_colors:
+                        _storage_key_colors[storage_key] = color
+                    if storage_key not in _pipe_layer_seg_pts:
+                        _pipe_layer_seg_pts[storage_key] = ([], [])
+                    _pipe_layer_seg_pts[storage_key][0].append(clipped[0].copy())
+                    _pipe_layer_seg_pts[storage_key][1].append(clipped[1].copy())
                     midpt = (clipped[0] + clipped[1]) / 2.0
                     pick_seg_p1.append(clipped[0].copy())
                     pick_seg_p2.append(clipped[1].copy())
                     pick_seg_midpoints.append(midpt)
                     pick_seg_attrs.append(row_attrs)
-                    pick_seg_layer.append(layer_name)
+                    pick_seg_layer.append(storage_key)
                     n_segments += 1
 
         if feature_hit:
@@ -490,7 +494,9 @@ for _ln, (p1s, p2s) in _pipe_layer_seg_pts.items():
         points=o3d.utility.Vector3dVector(np.array(_cl_pts)),
         lines=o3d.utility.Vector2iVector(_cl_lines),
     )
-    _cl_ls.paint_uniform_color(LINE_LAYERS[_ln]["color"])
+    # Use tracked color for this storage key (works for both regular and Ledningstrace variants)
+    _color = _storage_key_colors.get(_ln, [1.0, 1.0, 1.0])
+    _cl_ls.paint_uniform_color(_color)
     _pipe_layer_centerlines[_ln] = _cl_ls
 
 # Combined wireframe (all layers) for the wireframe overlay toggle.
@@ -944,8 +950,24 @@ def _make_comp_toggle(ln):
     return _cb
 
 
+# Track checkboxes for master toggles
+_pipe_checkboxes = []
+_comp_checkboxes = []
+
+# "Toggle all segments" master checkbox
+_all_pipes_cb = gui.Checkbox("All segments")
+_all_pipes_cb.checked = True
+_all_pipes_cb.set_on_checked(make_master_pipe_toggle(_pipe_checkboxes, _layer_visible,
+                                                      _pipe_layer_meshes, scene_widget,
+                                                      _pipe_gn, make_mesh_material,
+                                                      pipe_opacity, window))
+panel.add_child(_all_pipes_cb)
+
 # Line layers — only show legend entry if the layer produced actual geometry
 for layer_name, cfg in LINE_LAYERS.items():
+    # Skip Ledningstrace here; we'll handle variants below
+    if layer_name == "Ledningstrace":
+        continue
     if layer_name not in _pipe_layer_meshes:
         continue
     n_feat, _ = layer_stats.get(layer_name, (0, 0))
@@ -953,9 +975,30 @@ for layer_name, cfg in LINE_LAYERS.items():
     cb = gui.Checkbox(f"{layer_name} ({n_feat})")
     cb.checked = _layer_visible.get(layer_name, True)
     cb.set_on_checked(_make_pipe_toggle(layer_name))
+    _pipe_checkboxes.append((layer_name, cb))
 
     panel.add_child(make_legend_row(cfg["color"], cb, em))
-    panel.add_fixed(int(0.15 * em))
+
+# Ledningstrace variants — create separate entry for each forsyningsart
+if _ledningstrace_variants:
+    for fa, fa_color in sorted(_ledningstrace_variants.items()):
+        variant_key = f"Ledningstrace ({fa})"
+        if variant_key not in _pipe_layer_meshes:
+            continue
+        cb = gui.Checkbox(f"Ledningstrace ({fa})")
+        cb.checked = _layer_visible.get(variant_key, True)
+        cb.set_on_checked(_make_pipe_toggle(variant_key))
+        _pipe_checkboxes.append((variant_key, cb))
+        panel.add_child(make_legend_row(fa_color, cb, em))
+
+# "Toggle all components" master checkbox
+_all_comps_cb = gui.Checkbox("All components")
+_all_comps_cb.checked = False
+_all_comps_cb.set_on_checked(make_master_comp_toggle(_comp_checkboxes, _layer_visible,
+                                                      _comp_layer_meshes, scene_widget,
+                                                      _comp_gn, make_mesh_material,
+                                                      pipe_opacity, window))
+panel.add_child(_all_comps_cb)
 
 # Component layers — only show legend entry if the layer produced actual geometry
 for layer_name, cfg in COMPONENT_LAYERS.items():
@@ -964,11 +1007,12 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     n_comp = comp_stats.get(layer_name, 0)
 
     cb = gui.Checkbox(f"{layer_name} ({n_comp})")
-    cb.checked = _layer_visible.get(layer_name, False)
+    cb.checked = False
+    _layer_visible[layer_name] = False
     cb.set_on_checked(_make_comp_toggle(layer_name))
+    _comp_checkboxes.append((layer_name, cb))
 
     panel.add_child(make_legend_row(cfg["color"], cb, em))
-    panel.add_fixed(int(0.15 * em))
 
 # ── Utility Opacity ──────────────────────────────────────────────────────────
 panel.add_fixed(int(0.8 * em))
