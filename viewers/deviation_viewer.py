@@ -41,6 +41,7 @@ from core.geometry import (
     batch_point_to_segments, deviation_to_color, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
 )
+from core.ledningstrace import get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -219,16 +220,9 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 pass
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_r
 
-        bredde_m = None
-        if is_trace:
+        bredde_m = get_bredde_width(row)
+        if is_trace and bredde_m is None:
             bredde_m = 0.25
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
 
         # Resolve display name and colour for Ledningstrace via forsyningsart
         if is_trace and "forsyningsart" in row.index:

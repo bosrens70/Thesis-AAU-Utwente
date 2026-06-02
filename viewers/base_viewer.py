@@ -33,9 +33,11 @@ from core.config import (
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     DepthSource, DepthConfig,
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
+    forsyningsart_color,
 )
 from core.data_loader import init_site, pick_ground_level
 from core.gui_helpers import make_legend_row
+from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -357,6 +359,12 @@ pick_seg_layer     = []   # layer name per segment
 # Store per-utility-type average depth for component fallback
 _layer_avg_depth_local = {}
 
+# Track Ledningstrace forsyningsart variants for GUI legend
+_ledningstrace_variants = {}  # forsyningsart -> color mapping
+
+# Track colors for all storage keys (including compound keys for Ledningstrace variants)
+_storage_key_colors = {}  # storage_key -> color
+
 for layer_name, cfg in LINE_LAYERS.items():
     _t_layer0 = time.perf_counter()
     try:
@@ -393,19 +401,14 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
-        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
-        bredde_m = None
-        if layer_name == "Ledningstrace":
-            bredde_m = 0.25  # fallback: 25 cm
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
+        # Get Ledningstrace display info (color, forsyningsart) and width
+        is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
+        if is_trace and display_fa and display_fa not in _ledningstrace_variants:
+            _ledningstrace_variants[display_fa] = color
 
-        color = default_color
+        bredde_m = get_bredde_width(row)
+        if is_trace and bredde_m is None:
+            bredde_m = 0.25  # fallback: 25 cm
 
         # Get indicative depth for this feature
         vejl_dybde = None
@@ -443,16 +446,20 @@ for layer_name, cfg in LINE_LAYERS.items():
                     cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
                 if cyl is not None:
                     all_pipe_meshes.append(cyl)
-                    _pipe_layer_cyls.setdefault(layer_name, []).append(cyl)
+                    storage_key = get_storage_key(layer_name, display_fa)
+                    _pipe_layer_cyls.setdefault(storage_key, []).append(cyl)
+                    # Track color for this storage key
+                    if storage_key not in _storage_key_colors:
+                        _storage_key_colors[storage_key] = color
                     # Store dominant (worst) depth source for this segment
                     _seg_src = DepthSource(max(int(seg_sources[i]), int(seg_sources[i + 1])))
-                    _pipe_seg_dsrc.setdefault(layer_name, []).append(_seg_src)
+                    _pipe_seg_dsrc.setdefault(storage_key, []).append(_seg_src)
                     midpt = (clipped[0] + clipped[1]) / 2.0
                     pick_seg_p1.append(clipped[0].copy())
                     pick_seg_p2.append(clipped[1].copy())
                     pick_seg_midpoints.append(midpt)
                     pick_seg_attrs.append(row_attrs)
-                    pick_seg_layer.append(layer_name)
+                    pick_seg_layer.append(storage_key)
                     n_segments += 1
 
         if feature_hit:
@@ -1046,6 +1053,9 @@ _ler_legend_container.add_child(_all_pipes_cb)
 
 # Line layers — only show legend entry if the layer produced actual geometry
 for layer_name in PIPE_LEGEND_UI_ORDER:
+    # Skip Ledningstrace here; we'll handle variants below
+    if layer_name == "Ledningstrace":
+        continue
     if layer_name not in _pipe_layer_meshes:
         continue
     cfg = LINE_LAYERS[layer_name]
@@ -1057,6 +1067,19 @@ for layer_name in PIPE_LEGEND_UI_ORDER:
     _pipe_checkboxes.append((layer_name, cb))
 
     _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
+
+# Ledningstrace variants — create separate entry for each forsyningsart
+if _ledningstrace_variants:
+    n_trace_feat, _ = layer_stats.get("Ledningstrace", (0, 0))
+    for fa, fa_color in sorted(_ledningstrace_variants.items()):
+        variant_key = f"Ledningstrace ({fa})"
+        if variant_key not in _pipe_layer_meshes:
+            continue
+        cb = gui.Checkbox(f"Ledningstrace ({fa})")
+        cb.checked = _layer_visible.get(variant_key, True)
+        cb.set_on_checked(_make_pipe_toggle(variant_key))
+        _pipe_checkboxes.append((variant_key, cb))
+        _ler_legend_container.add_child(make_legend_row(fa_color, cb, em))
 
 # "Toggle all components" master checkbox
 _all_comps_cb = gui.Checkbox("All components")

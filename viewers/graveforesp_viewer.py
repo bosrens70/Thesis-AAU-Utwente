@@ -36,9 +36,11 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
     DepthSource, DepthConfig, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
+    forsyningsart_color,
 )
 from core.gui_helpers import make_legend_row
 from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear
+from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # Buffer (metres) around the Graveforesp polygon
 BUFFER = 2.0
@@ -800,6 +802,9 @@ def _build_depth_mesh(mesh_list, src_list):
     combined.compute_vertex_normals()
     return combined
 
+# Track Ledningstrace forsyningsart variants
+_ledningstrace_variants = {}
+
 for layer_name, cfg in LINE_LAYERS.items():
     gdf = _cached_gdfs.get(layer_name)
     if gdf is None:
@@ -832,20 +837,14 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         radius = diam_mm / 2000.0 if diam_mm > 0 else fallback_radius
 
-        # Ledningstrace: render as a flat horizontal plane of width 'bredde'
-        # (matches base_viewer), instead of a cylinder.
-        bredde_m = None
-        if layer_name == "Ledningstrace":
-            bredde_m = 0.25  # fallback: 25 cm
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
+        # Get Ledningstrace display info and width
+        is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
+        if is_trace and display_fa and display_fa not in _ledningstrace_variants:
+            _ledningstrace_variants[display_fa] = color
 
-        color = default_color
+        bredde_m = get_bredde_width(row)
+        if is_trace and bredde_m is None:
+            bredde_m = 0.25  # fallback: 25 cm
 
         vejl_dybde = None
         if "vejledendeDybde" in row.index:
@@ -879,6 +878,8 @@ for layer_name, cfg in LINE_LAYERS.items():
                 else:
                     cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
                 if cyl is not None:
+                    # Store with compound key for Ledningstrace variants
+                    storage_key = get_storage_key(layer_name, display_fa)
                     # Dominant (worst) depth source of the segment's endpoints
                     _seg_src = DepthSource(max(int(seg_sources[i]),
                                                int(seg_sources[i + 1])))

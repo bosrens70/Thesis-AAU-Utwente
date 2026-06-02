@@ -33,9 +33,11 @@ from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    forsyningsart_color,
 )
 from core.data_loader import init_site, pick_ground_level
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
+from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Load site data + ground picking
@@ -124,29 +126,29 @@ def _seg_in_local_bbox(p1, p2):
                 sy_max < _ly_min or sy_min > _ly_max)
 
 
+# Track Ledningstrace forsyningsart variants
+_ledningstrace_variants = {}
+
 _util_meshes = {}
 for layer_name, gdf in gdfs.items():
     if layer_name not in LINE_LAYERS:
         continue
     cfg = LINE_LAYERS[layer_name]
-    color = cfg["color"]
+    default_color = cfg["color"]
     radius = cfg["fallback_radius"]
     cyls = []
     for _, row in gdf.iterrows():
         geom = row.geometry
         if geom is None:
             continue
-        # Ledningstrace: read 'bredde' (width in mm) for flat plane rendering
-        bredde_m = None
-        if layer_name == "Ledningstrace":
+        # Get Ledningstrace display info and width
+        is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
+        if is_trace and display_fa and display_fa not in _ledningstrace_variants:
+            _ledningstrace_variants[display_fa] = color
+
+        bredde_m = get_bredde_width(row)
+        if is_trace and bredde_m is None:
             bredde_m = 0.25
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
         sub_geoms = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
         for sg in sub_geoms:
             coords = np.array(sg.coords, dtype=float)
@@ -502,15 +504,13 @@ def highlight_features(gdf_subset, color=None, radius=0.02):
             s.compute_vertex_normals()
             spheres.append(s)
         else:
-            # Check for bredde attribute for plane rendering (used by Ledningstrace)
-            bredde_m = None
-            if "bredde" in row.index:
-                try:
-                    b = float(row["bredde"] or 0)
-                    if b > 0:
-                        bredde_m = b / 1000.0
-                except (ValueError, TypeError):
-                    pass
+            # Check for bledde and get Ledningstrace display info if applicable
+            bredde_m = get_bredde_width(row)
+            highlight_color = color  # use provided highlight color
+            # Detect if this is Ledningstrace and get its forsyningsart color
+            is_trace, display_fa, trace_color = get_ledningstrace_display_info(None, row, color)
+            if bredde_m is not None and display_fa:
+                highlight_color = trace_color
             sub_geoms = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
             for sg in sub_geoms:
                 coords = np.array(sg.coords, dtype=float)
@@ -524,9 +524,9 @@ def highlight_features(gdf_subset, color=None, radius=0.02):
                     if not _seg_in_local_bbox(p1, p2):
                         continue
                     if bredde_m is not None:
-                        mesh = segment_to_plane(p1, p2, bredde_m, color)
+                        mesh = segment_to_plane(p1, p2, bredde_m, highlight_color)
                     else:
-                        mesh = segment_to_cylinder(p1, p2, radius, color)
+                        mesh = segment_to_cylinder(p1, p2, radius, highlight_color)
                     if mesh is not None:
                         mesh.compute_vertex_normals()
                         cyls.append(mesh)
