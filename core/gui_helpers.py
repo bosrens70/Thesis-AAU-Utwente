@@ -9,7 +9,7 @@ renders the legend identically.
 
 Usage
 -----
-    from core.gui_helpers import make_color_swatch, make_legend_row
+    from core.gui_helpers import make_color_swatch, make_legend_row, make_master_pipe_toggle
 
     # Toggleable layer row (swatch + checkbox):
     cb  = gui.Checkbox(f"{layer_name} ({n_feat})")
@@ -18,6 +18,14 @@ Usage
 
     # Static legend row (swatch + label):
     row = make_legend_row(cfg["color"], gui.Label(f"{cls_id}: {name}"), em)
+
+    # Master toggle for "All segments":
+    all_pipes_cb = gui.Checkbox("All segments")
+    callback = make_master_pipe_toggle(pipe_checkboxes, layer_visible,
+                                       pipe_layer_meshes, scene_widget,
+                                       pipe_gn, make_mesh_material,
+                                       pipe_opacity, window)
+    all_pipes_cb.set_on_checked(callback)
 """
 
 import open3d.visualization.gui as gui
@@ -86,3 +94,93 @@ def make_legend_row(color, widget, em, *, srgb_convert=True):
     row.add_fixed(int(ROW_GAP_EM * em))
     row.add_child(widget)
     return row
+
+
+# ── Master toggle helpers for "All segments" / "All components" ───────────────
+
+def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
+                             scene_widget, pipe_gn, make_mesh_material,
+                             pipe_opacity, window):
+    """
+    Create a callback for the "All segments" master checkbox.
+
+    Toggles all pipe layer checkboxes and their visibility in the scene.
+
+    Parameters
+    ----------
+    pipe_checkboxes : list of (str, gui.Checkbox)
+        List of (layer_key, checkbox) tuples for all pipe layers.
+    layer_visible : dict
+        Shared visibility state dict for all layers.
+    pipe_layer_meshes : dict
+        Shared mesh dict for all pipe layers (layer_key -> mesh).
+    scene_widget : gui.SceneWidget
+        The 3D view to update.
+    pipe_gn : callable
+        Function to generate geometry names from layer keys.
+    make_mesh_material : callable
+        Function to create mesh materials given an alpha value.
+    pipe_opacity : list of float
+        List containing current pipe opacity [alpha].
+    window : gui.Window
+        The window to trigger redraws.
+
+    Returns
+    -------
+    callable
+        Callback suitable for checkbox.set_on_checked().
+    """
+    def _on_toggle_all_pipes(checked):
+        for ln, cb in pipe_checkboxes:
+            cb.checked = checked
+            layer_visible[ln] = checked
+            if ln in pipe_layer_meshes:
+                alpha = pipe_opacity[0] if checked else 0.0
+                scene_widget.scene.modify_geometry_material(pipe_gn(ln),
+                                                             make_mesh_material(alpha))
+        window.post_redraw()
+    return _on_toggle_all_pipes
+
+
+def make_master_comp_toggle(comp_checkboxes, layer_visible, comp_layer_meshes,
+                             scene_widget, comp_gn, make_mesh_material,
+                             pipe_opacity, window):
+    """
+    Create a callback for the "All components" master checkbox.
+
+    Toggles all component layer checkboxes and their visibility in the scene.
+
+    Parameters
+    ----------
+    comp_checkboxes : list of (str, gui.Checkbox)
+        List of (layer_name, checkbox) tuples for all component layers.
+    layer_visible : dict
+        Shared visibility state dict for all layers.
+    comp_layer_meshes : dict
+        Shared mesh dict for all component layers (layer_name -> mesh).
+    scene_widget : gui.SceneWidget
+        The 3D view to update.
+    comp_gn : callable
+        Function to generate geometry names from layer names.
+    make_mesh_material : callable
+        Function to create mesh materials given an alpha value.
+    pipe_opacity : list of float
+        List containing current pipe opacity [alpha].
+    window : gui.Window
+        The window to trigger redraws.
+
+    Returns
+    -------
+    callable
+        Callback suitable for checkbox.set_on_checked().
+    """
+    def _on_toggle_all_comps(checked):
+        for ln, cb in comp_checkboxes:
+            cb.checked = checked
+            layer_visible[ln] = checked
+            if ln in comp_layer_meshes:
+                alpha = pipe_opacity[0] if checked else 0.0
+                scene_widget.scene.modify_geometry_material(comp_gn(ln),
+                                                             make_mesh_material(alpha))
+        window.post_redraw()
+    return _on_toggle_all_comps
