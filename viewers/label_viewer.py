@@ -24,6 +24,7 @@ import numpy as np
 import re
 import time
 import glob as _globmod
+from datetime import datetime
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
@@ -31,6 +32,7 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
+    TARGET_CLASS,
     forsyningsart_color,
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level
@@ -89,7 +91,7 @@ INSTANCE_COLORS = [
 ]
 
 _instance_dir = Path(INSTANCE_DIR)
-_instance_files = sorted(_instance_dir.glob("*.ply")) if _instance_dir.is_dir() else []
+_instance_files = site.instance_files if site.instance_files else []
 
 instance_data = []
 for _i, _inst_path in enumerate(_instance_files):
@@ -1092,7 +1094,8 @@ if instance_data:
     left_panel.add_child(gui.Label("Assign label (or press 1-0):"))
     left_panel.add_fixed(int(0.2 * em))
 
-_labeled_output_dir = Path(INSTANCE_DIR) / "labeled" if instance_data else None
+_label_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+_labeled_output_dir = _instance_dir / f"labeled_{_label_stamp}" if instance_data else None
 if _labeled_output_dir and not _labeled_output_dir.exists():
     _labeled_output_dir.mkdir(parents=True)
 
@@ -1113,7 +1116,7 @@ def _save_instance_ply(idx, label_name):
     n = len(pts)
     label_id = _LABEL_TO_ID.get(label_name, 0)
 
-    fname = f"{_ply_path.stem}_instance_{idx}_type_{label_name}.ply"
+    fname = f"{TARGET_CLASS}_instance_{idx}_type_{label_id}.ply"
     out_path = _labeled_output_dir / fname
 
     with open(str(out_path), "w", encoding="utf-8") as f:
