@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", module="pyogrio", category=RuntimeWarning)
 # ─────────────────────────────────────────────────────────────────────────────
 PLY_FILE = (
     r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_11.ply"
+    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
 )
 
 AREA_REF_GEOJSON = (
@@ -71,6 +71,8 @@ LINE_LAYERS = {
     "LedningUkendtForsyningsart":{"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},  # cyan
     "Ledningstrace":             {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.005},  # DLF trace orange
     "TermiskLedning":            {"color": [1.000, 0.000, 1.000], "fallback_radius": 0.005},  # DLF violet
+    "Olieledning":               {"color": [0.463, 0.463, 0.463], "fallback_radius": 0.005},  # DLF grey
+    "AndenLedning":              {"color": [0.800, 0.800, 0.800], "fallback_radius": 0.005},  # grey
 }
 
 # Right-panel legend order: keep Ledningstrace last (dense / low-priority visually)
@@ -85,6 +87,8 @@ COMPONENT_LAYERS = {
     "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
     "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
     "TermiskKomponent":               {"color": [1.000, 0.500, 0.900]},
+    "Oliekomponent":                  {"color": [0.463, 0.463, 0.463]},
+    "AndenKomponent":                 {"color": [0.800, 0.800, 0.800]},
 }
 
 COMPONENT_SPHERE_RADIUS = 0.05
@@ -97,6 +101,8 @@ COMP_TO_LINE = {
     "Elkomponent":                 "Elledning",
     "Telekommunikationskomponent": "Telekommunikationsledning",
     "TermiskKomponent":            "TermiskLedning",
+    "Oliekomponent":               "Olieledning",
+    "AndenKomponent":              "AndenLedning",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,10 +117,13 @@ FORSYNINGSART_COLOR_HINTS = [
     ("kommu",  [0.980, 0.588, 0.275]),   # DLF kommunikation orange
     ("afloeb", [1.000, 0.000, 0.000]),   # DLF spildevand red
     ("spilde", [1.000, 0.000, 0.000]),   # DLF spildevand red
+    ("vejafv", [1.000, 0.000, 0.000]),   # DLF vejafvanding red
     ("vand",   [0.000, 0.000, 1.000]),   # DLF vand blue
     ("gas",    [1.000, 0.600, 0.000]),   # DLF gas orange
     ("el",     [1.000, 0.000, 0.000]),   # DLF el red (checked last to avoid matching "tele")
     ("olie",   [0.463, 0.463, 0.463]),   # DLF olie grey
+    ("anden",  [0.800, 0.800, 0.800]),   # anden/andet grey
+    ("andet",  [0.800, 0.800, 0.800]),   # anden/andet grey
 ]
 
 
@@ -125,6 +134,26 @@ def forsyningsart_color(fa_value, fallback):
         if keyword in fa_lower:
             return color
     return fallback
+
+
+# Direct mapping: forsyningsart value -> corresponding line layer name
+# LER 2025 datamodel: forsyningsart value -> line layer
+FORSYNINGSART_TO_LINE = {
+    "vand":                "Vandledning",
+    "afloeb":              "Afloebsledning",
+    "spildevand":          "Afloebsledning",
+    "vejafvanding":        "Afloebsledning",
+    "gas":                 "Gasledning",
+    "el":                  "Elledning",
+    "telekommunikation":   "Telekommunikationsledning",
+    "fjernvarme":          "TermiskLedning",
+    "fjernkoeling":        "TermiskLedning",
+    "varme":               "TermiskLedning",
+    "termisk":             "TermiskLedning",
+    "olie":                "Olieledning",
+    "anden":               "AndenLedning",
+    "andet":               "AndenLedning",
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,10 +229,10 @@ DEVIATION_COLORS = [
 ]
 
 DEVIATION_CLASS_LABELS = [
-    "Class 1:  ≤ 250 mm",
-    "Class 2:  ≤ 500 mm",
-    "Class 3:  ≤ 1000 mm",
-    "Class 4:  ≤ 2000 mm",
+    "Class 1:  <= 250 mm",
+    "Class 2:  <= 500 mm",
+    "Class 3:  <= 1000 mm",
+    "Class 4:  <= 2000 mm",
     "Class 5:  > 2000 mm",
 ]
 
@@ -265,14 +294,14 @@ MIN_INSTANCE_POINTS = 250
 # UTILITY-TO-LER MATCHING (for deviation viewer)
 # ─────────────────────────────────────────────────────────────────────────────
 UTILITY_TO_LER_MATCH = {
-    1: {"layers": {"Elledning"},                                   "trace_kw": ["el"]},
-    2: {"layers": {"Afloebsledning"},                              "trace_kw": ["afloeb", "spilde"]},
-    3: {"layers": set(),                                           "trace_kw": ["olie"]},
-    4: {"layers": {"Gasledning"},                                  "trace_kw": ["gas"]},
-    5: {"layers": {"TermiskLedning"},                              "trace_kw": ["varme", "fjern"]},
-    6: {"layers": {"Foeringsroer"},                                "trace_kw": []},
-    7: {"layers": {"Vandledning"},                                 "trace_kw": ["vand"]},
-    8: {"layers": {"Telekommunikationsledning"},                   "trace_kw": ["tele", "kommu"]},
-    9: {"layers": set(),                                           "trace_kw": []},
-    10: {"layers": {"LedningUkendtForsyningsart"},                 "trace_kw": []},
+    1: {"layers": {"Elledning"}},
+    2: {"layers": {"Afloebsledning"}},
+    3: {"layers": {"Olieledning"}},
+    4: {"layers": {"Gasledning"}},
+    5: {"layers": {"TermiskLedning"}},
+    6: {"layers": {"Foeringsroer"}},
+    7: {"layers": {"Vandledning"}},
+    8: {"layers": {"Telekommunikationsledning"}},
+    9: {"layers": {"AndenLedning"}},
+    10: {"layers": {"LedningUkendtForsyningsart"}},
 }
