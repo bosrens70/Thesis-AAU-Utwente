@@ -302,27 +302,99 @@ def load_gml_layers(gml_path, line_layers=None, component_layers=None):
 # 4. INSTANCE DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
+def instance_base_name(ply_path):
+    """
+    Derive the base name used for a PLY's instance directory.
+
+    Strips a redundant leading ``Area_N_`` prefix from the PLY stem, since the
+    instance directory already lives inside the ``Water_Area_N`` folder (e.g.
+    ``Area_5_Site_11`` -> ``Site_11``). PLY stems without that prefix are
+    returned unchanged.
+    """
+    return re.sub(r"^Area_\d+_", "", Path(ply_path).stem)
+
+
 def discover_instances(ply_path):
     """
-    Auto-discover the most recent instance directory for a PLY file.
-    Returns (instance_dir: Path | None, instance_files: list[Path]).
+    Auto-discover the permanent instance directory for a PLY file.
+
+    Directory layout::
+
+        Water_Area_N/
+          Site_XX_Instances/              <- permanent dir (returned as instance_dir)
+            0_instance_0_type_7.ply       <- water instance from conversion script
+            20260526_144758/              <- segment-viewer run (timestamp subfolder)
+              1_instance_0.ply
+              ...
+            labeled_20260526_150000/      <- label-viewer session (timestamped)
+              1_instance_0_type_4.ply
+
+    Returns (instance_dir, instance_files) where instance_dir is the
+    permanent ``Site_XX_Instances/`` folder and instance_files are the
+    raw PLY files from the most recent timestamp subfolder.
     """
     ply_path = Path(ply_path)
-    stem = ply_path.stem
+    base = instance_base_name(ply_path)
     parent = ply_path.parent
 
+    # New convention: permanent <base>_Instances/ directory
+    perm_dir = parent / f"{base}_Instances"
+    if perm_dir.is_dir():
+        # Find the most recent timestamp subfolder with raw instance PLYs
+        ts_dirs = sorted(
+            [d for d in perm_dir.iterdir()
+             if d.is_dir() and d.name[0].isdigit()],
+            key=lambda p: p.name,
+            reverse=True,
+        )
+        inst_files = []
+        src_label = "none"
+        for ts_dir in ts_dirs:
+            files = sorted(ts_dir.glob("*.ply"))
+            if files:
+                inst_files = files
+                src_label = ts_dir.name
+                break
+
+        # Fall back to most recent labeled_* subfolder
+        if not inst_files:
+            labeled_dirs = sorted(
+                [d for d in perm_dir.iterdir()
+                 if d.is_dir() and d.name.startswith("labeled_")],
+                key=lambda p: p.name,
+                reverse=True,
+            )
+            for ld in labeled_dirs:
+                files = sorted(ld.glob("*.ply"))
+                if files:
+                    inst_files = files
+                    src_label = ld.name
+                    break
+
+        # Legacy fall back to labeled/ (no timestamp)
+        if not inst_files:
+            labeled_dir = perm_dir / "labeled"
+            if labeled_dir.is_dir():
+                inst_files = sorted(labeled_dir.glob("*.ply"))
+                src_label = "labeled/"
+
+        print(f"\n  Instance directory: {perm_dir.name}/")
+        print(f"  {len(inst_files)} PLY files ({src_label})")
+        return perm_dir, inst_files
+
+    # Legacy fallback: timestamped <base>_instances_<stamp>/ directories
     candidates = sorted(
-        parent.glob(f"{stem}_instances_*"),
+        set(parent.glob(f"{base}_instances_*"))
+        | set(parent.glob(f"{ply_path.stem}_instances_*")),
         key=lambda p: p.name,
         reverse=True,
     )
     if not candidates:
-        print(f"  [warn] No instance directories found for {stem}")
+        print(f"  [warn] No instance directories found for {base}")
         return None, []
 
     inst_dir = candidates[0]
 
-    # Prefer the 'labeled' subdirectory if it exists
     labeled_dir = inst_dir / "labeled"
     if labeled_dir.is_dir():
         inst_files = sorted(labeled_dir.glob("*.ply"))
@@ -406,14 +478,24 @@ def read_ply_with_utility_type(filepath):
 
 
 def utility_type_from_filename(filename):
-    """Fallback: parse utility label from filename like '..._type_WaterLine.ply'."""
+    """
+    Fallback: parse the utility type from a labelled instance filename.
+
+    Handles both the current numeric convention ('..._type_3.ply') and the
+    legacy name convention ('..._type_WaterLine.ply').
+    """
     from core.config import UTILITY_TYPE_LABELS
     m = re.search(r"_type_(\w+)\.ply$", filename)
-    if m:
-        label = m.group(1)
-        for uid, name in UTILITY_TYPE_LABELS.items():
-            if name == label:
-                return uid
+    if not m:
+        return 0
+    token = m.group(1)
+    # Numeric type id (current convention)
+    if token.isdigit():
+        return int(token)
+    # Legacy name token
+    for uid, name in UTILITY_TYPE_LABELS.items():
+        if name == token:
+            return uid
     return 0
 
 
