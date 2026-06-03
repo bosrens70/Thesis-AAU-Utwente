@@ -33,6 +33,7 @@ from core.config import (
     VOXEL_SIZE, MIN_CLUSTER_SIZE, MIN_SAMPLES, POINT_SIZE,
     MIN_INSTANCE_POINTS,
 )
+from core.data_loader import instance_base_name
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. LOAD PLY (lightweight — no GML, no area offset needed)
@@ -416,8 +417,9 @@ class InstanceViewer:
         mip = self._mip_edit.int_value
 
         stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = ply_path.parent / f"{ply_path.stem}_instances_{stamp}"
-        out_dir.mkdir(exist_ok=True)
+        perm_dir = ply_path.parent / f"{instance_base_name(ply_path)}_Instances"
+        out_dir  = perm_dir / stamp
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         instance_ids = sorted(uid for uid in np.unique(self._cur_labels) if uid >= 0)
         if not instance_ids:
@@ -434,7 +436,7 @@ class InstanceViewer:
             inst_cls  = cls1[inst_mask]
             n = len(inst_pts)
 
-            fname = out_dir / f"{ply_path.stem}_{TARGET_CLASS}_instance_{uid}.ply"
+            fname = out_dir / f"{TARGET_CLASS}_instance_{uid}.ply"
             with open(fname, "w") as f:
                 f.write("ply\n")
                 f.write("format ascii 1.0\n")
