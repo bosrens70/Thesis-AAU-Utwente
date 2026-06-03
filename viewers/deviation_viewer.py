@@ -27,18 +27,20 @@ import json
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
-    LINE_LAYERS, COMPONENT_LAYERS,
+    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    COMPONENT_SPHERE_RADIUS,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
     DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
-    FORSYNINGSART_COLOR_HINTS,
+    FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
 )
 from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
-    pick_ground_level,
+    pick_ground_level, instance_base_name,
 )
 from core.geometry import (
-    batch_point_to_segments, deviation_to_color, linear_to_srgb,
+    batch_point_to_segments, batch_point_to_plane_segments,
+    deviation_to_color, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
 )
 from core.ledningstrace import get_bredde_width
@@ -86,7 +88,9 @@ all_seg_p1 = []
 all_seg_p2 = []
 all_seg_layer = []
 all_seg_active = []       # True = "i drift", False = "permanent ude af drift"
+all_seg_half_width = []   # half-width for plane segments (ledningstrace), 0 for cylinders
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
+_layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
 
@@ -198,6 +202,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
     n_feat_act, n_seg_act = 0, 0
     n_feat_inact, n_seg_inact = 0, 0
     layer_cyls = []
+    _layer_z_vals = []
 
     for _, row in gdf.iterrows():
         geom = row.geometry
@@ -248,6 +253,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
             if not _in_crop_utm(coords_raw):
                 continue
             coords = _to_local(coords_raw, vejl)
+            _layer_z_vals.extend(coords[:, 2].tolist())
             hit = True
             for i in range(len(coords) - 1):
                 clipped = _clip_segment_to_crop(coords[i], coords[i + 1])
@@ -258,6 +264,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_p2.append(cp2)
                 all_seg_layer.append(display_name)
                 all_seg_active.append(is_active)
+                all_seg_half_width.append(bredde_m / 2.0 if bredde_m is not None else 0.0)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
@@ -321,10 +328,13 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 parts.append(f"{n_feat_inact} inactive")
             print(f"  {layer_name:<35} {', '.join(parts):>20}  "
                   f"{n_seg_act + n_seg_inact:>5} segments")
+    if _layer_z_vals:
+        _layer_avg_depth_local[layer_name] = float(np.mean(_layer_z_vals))
 
 seg_p1 = np.array(all_seg_p1) if all_seg_p1 else np.empty((0, 3))
 seg_p2 = np.array(all_seg_p2) if all_seg_p2 else np.empty((0, 3))
 seg_active = np.array(all_seg_active, dtype=bool) if all_seg_active else np.empty(0, dtype=bool)
+seg_half_width = np.array(all_seg_half_width, dtype=float) if all_seg_half_width else np.empty(0, dtype=float)
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
@@ -336,6 +346,65 @@ print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1
 if n_total_segs == 0:
     print("[WARNING] No LER segments found -deviations will be infinite.")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b.  Load LER utility components (points) within bbox
+# ─────────────────────────────────────────────────────────────────────────────
+print("\n--- Loading LER utility components within bbox ---")
+comp_meshes = {}        # layer_name -> merged TriangleMesh
+comp_stats = {}         # layer_name -> int count
+
+for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
+    try:
+        gdf_c = gpd.read_file(GML_PATH, layer=comp_layer)
+    except Exception:
+        continue
+
+    color = comp_cfg["color"]
+    n_comp = 0
+    spheres = []
+
+    parent_line = COMP_TO_LINE.get(comp_layer)
+    parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
+
+    for _, row in gdf_c.iterrows():
+        g = row.geometry
+        if g is None or g.geom_type not in ("Point", "PointZ"):
+            continue
+        dx = g.x - _cx_utm
+        dy = g.y - _cy_utm
+        if dx * dx + dy * dy > _crop_r2:
+            continue
+
+        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+
+        if (pt[0] - _cx) ** 2 + (pt[1] - _cy) ** 2 > _crop_r2:
+            continue
+
+        if g.z == -99 or pt[2] <= -98:
+            if parent_avg_z is not None:
+                pt[2] = parent_avg_z
+            else:
+                pt[2] = GROUND_Z
+
+        sphere = o3d.geometry.TriangleMesh.create_sphere(
+            radius=COMPONENT_SPHERE_RADIUS, resolution=12)
+        sphere.translate(pt)
+        sphere.paint_uniform_color(color)
+        spheres.append(sphere)
+        n_comp += 1
+
+    comp_stats[comp_layer] = n_comp
+    if spheres:
+        m = spheres[0]
+        for s in spheres[1:]:
+            m += s
+        m.compute_vertex_normals()
+        comp_meshes[comp_layer] = m
+    if n_comp > 0:
+        print(f"  {comp_layer:<35} {n_comp:>4} components")
+
+print(f"\n  Total: {sum(comp_stats.values())} component spheres")
+
 
 def _get_matching_segment_mask(utility_type, active_only=None):
     """Return a boolean mask over seg_p1/seg_p2 for segments matching this utility type.
@@ -346,16 +415,17 @@ def _get_matching_segment_mask(utility_type, active_only=None):
     if match is None:
         mask = np.ones(len(seg_p1), dtype=bool)
     else:
+        layers = match["layers"]
         mask = np.zeros(len(seg_p1), dtype=bool)
         for i, layer_name in enumerate(all_seg_layer):
-            if layer_name in match["layers"]:
+            if layer_name in layers:
                 mask[i] = True
-            elif layer_name.startswith("Ledningstrace") and match["trace_kw"]:
-                layer_lower = layer_name.lower()
-                if any(kw in layer_lower for kw in match["trace_kw"]):
+            elif layer_name.startswith("Ledningstrace"):
+                fa = layer_name.split("(")[-1].rstrip(")").strip() if "(" in layer_name else ""
+                mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
+                if mapped_line and mapped_line in layers:
                     mask[i] = True
 
-    # Filter by driftsstatus
     if active_only is True:
         mask &= seg_active
     elif active_only is False:
@@ -368,13 +438,15 @@ def _get_matching_ler_names(utility_type):
     match = UTILITY_TO_LER_MATCH.get(utility_type)
     if match is None:
         return set()
+    layers = match["layers"]
     names = set()
     for layer_name in ler_meshes:
-        if layer_name in match["layers"]:
+        if layer_name in layers:
             names.add(layer_name)
-        elif layer_name.startswith("Ledningstrace") and match["trace_kw"]:
-            layer_lower = layer_name.lower()
-            if any(kw in layer_lower for kw in match["trace_kw"]):
+        elif layer_name.startswith("Ledningstrace"):
+            fa = layer_name.split("(")[-1].rstrip(")").strip() if "(" in layer_name else ""
+            mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
+            if mapped_line and mapped_line in layers:
                 names.add(layer_name)
     return names
 
@@ -383,18 +455,63 @@ def _get_matching_ler_names(utility_type):
 # 4.  Load instances + compute deviations against LER segments
 # ─────────────────────────────────────────────────────────────────────────────
 _ply_stem = _ply_path.stem
-_inst_candidates = sorted(
-    _ply_path.parent.glob(f"{_ply_stem}_instances_*"),
-    key=lambda p: p.name, reverse=True,
-)
-if not _inst_candidates:
-    raise SystemExit(f"[ERROR] No instance directories for {_ply_stem}")
+_inst_base = instance_base_name(_ply_path)
 
-_inst_dir = _inst_candidates[0]
-_labeled_dir = _inst_dir / "labeled"
-_inst_files = sorted(_labeled_dir.glob("*.ply")) if _labeled_dir.is_dir() else sorted(_inst_dir.glob("*.ply"))
+# New convention: permanent <base>_Instances/ directory
+_perm_dir = _ply_path.parent / f"{_inst_base}_Instances"
+_inst_dir = None
+_inst_files = []
+_src_label = "none"
+
+if _perm_dir.is_dir():
+    _inst_dir = _perm_dir
+    # Find the most recent labeled_* subfolder
+    _labeled_dirs = sorted(
+        [d for d in _perm_dir.iterdir()
+         if d.is_dir() and d.name.startswith("labeled_")],
+        key=lambda p: p.name, reverse=True,
+    )
+    for _ld in _labeled_dirs:
+        _files = sorted(_ld.glob("*.ply"))
+        if _files:
+            _inst_files = _files
+            _src_label = _ld.name
+            break
+    # Legacy fallback: labeled/ (no timestamp)
+    if not _inst_files:
+        _legacy_labeled = _perm_dir / "labeled"
+        if _legacy_labeled.is_dir():
+            _inst_files = sorted(_legacy_labeled.glob("*.ply"))
+            _src_label = "labeled/"
+    # Always include top-level PLY files (e.g. water instance 0_instance_0_type_7.ply)
+    _top_level_plys = sorted(_perm_dir.glob("*.ply"))
+    if _top_level_plys:
+        _inst_files = _top_level_plys + _inst_files
+    # Fallback: top-level only when no labeled instances exist
+    if not _inst_files:
+        _src_label = "root"
+
+# Legacy fallback: old-style timestamped directories
+if not _inst_files:
+    _inst_candidates = sorted(
+        set(_ply_path.parent.glob(f"{_inst_base}_instances_*"))
+        | set(_ply_path.parent.glob(f"{_ply_stem}_instances_*")),
+        key=lambda p: p.name, reverse=True,
+    )
+    if _inst_candidates:
+        _inst_dir = _inst_candidates[0]
+        _legacy_labeled = _inst_dir / "labeled"
+        if _legacy_labeled.is_dir():
+            _inst_files = sorted(_legacy_labeled.glob("*.ply"))
+            _src_label = "labeled/"
+        else:
+            _inst_files = sorted(_inst_dir.glob("*.ply"))
+            _src_label = "root"
+
+if _inst_dir is None:
+    raise SystemExit(f"[ERROR] No instance directories for {_inst_base}")
 print(f"\nInstance directory: {_inst_dir.name}/")
-print(f"  {len(_inst_files)} PLY files ({'labeled/' if _labeled_dir.is_dir() else 'root'})")
+print(f"  {len(_inst_files)} PLY files ({_src_label})")
 
 if not _inst_files:
     raise SystemExit("[ERROR] No instance PLY files found.")
@@ -437,7 +554,9 @@ for inst_path in _inst_files:
 
     # Combined (active + inactive) for heatmap colouring
     if has_ler:
-        dists = batch_point_to_segments(pts_inst, seg_p1[seg_mask_all], seg_p2[seg_mask_all])
+        dists = batch_point_to_plane_segments(
+            pts_inst, seg_p1[seg_mask_all], seg_p2[seg_mask_all],
+            seg_half_width[seg_mask_all])
         stats = _make_stats(dists)
     else:
         dists = np.full(len(pts_inst), np.nan)
@@ -445,14 +564,18 @@ for inst_path in _inst_files:
 
     # Separate stats for active / inactive
     if n_act > 0:
-        dists_act = batch_point_to_segments(pts_inst, seg_p1[seg_mask_act], seg_p2[seg_mask_act])
+        dists_act = batch_point_to_plane_segments(
+            pts_inst, seg_p1[seg_mask_act], seg_p2[seg_mask_act],
+            seg_half_width[seg_mask_act])
         stats_act = _make_stats(dists_act)
     else:
         dists_act = None
         stats_act = dict(_nan_stats)
 
     if n_inact > 0:
-        dists_inact = batch_point_to_segments(pts_inst, seg_p1[seg_mask_inact], seg_p2[seg_mask_inact])
+        dists_inact = batch_point_to_plane_segments(
+            pts_inst, seg_p1[seg_mask_inact], seg_p2[seg_mask_inact],
+            seg_half_width[seg_mask_inact])
         stats_inact = _make_stats(dists_inact)
     else:
         dists_inact = None
@@ -669,6 +792,14 @@ for ln, mesh in ler_meshes.items():
     scene_widget.scene.add_geometry(gn, mesh, make_mesh_mat(0.6))
     _ler_visible[ln] = True
 
+# Add LER component meshes
+_comp_visible = {}
+for ln, mesh in comp_meshes.items():
+    gn = f"comp_{ln}"
+    scene_widget.scene.add_geometry(gn, mesh, make_mesh_mat(0.6))
+    _comp_visible[ln] = False
+    scene_widget.scene.show_geometry(gn, False)
+
 # Add instance geometries
 _inst_gnames = []
 _class_visible = {}
@@ -762,7 +893,7 @@ for _fut in sorted(class_summaries.keys()):
     _ler_names = _get_matching_ler_names(_fut)
     if _ler_names:
         _ler_short = ", ".join(sorted(_ler_names))
-        _filter_entries.append((f"{_fs['label']}  ↔  {_ler_short}", _fut))
+        _filter_entries.append((f"{_fs['label']} <-> {_ler_short}", _fut))
     else:
         _filter_entries.append((f"{_fs['label']}  (no LER)", _fut))
 
@@ -822,6 +953,9 @@ def _on_ler_opacity(val):
     for ln in ler_meshes:
         if _ler_visible.get(ln, True):
             scene_widget.scene.modify_geometry_material(f"ler_{ln}", make_mesh_mat(val))
+    for ln in comp_meshes:
+        if _comp_visible.get(ln, False):
+            scene_widget.scene.modify_geometry_material(f"comp_{ln}", make_mesh_mat(val))
     window.post_redraw()
 
 
@@ -872,6 +1006,39 @@ for ln in LINE_LAYERS:
     row.add_child(cb)
     panel.add_child(row)
 
+# LER component toggles
+if comp_meshes:
+    panel.add_fixed(int(0.3 * em))
+    panel.add_child(gui.Label("LER components:"))
+    for comp_ln in COMPONENT_LAYERS:
+        if comp_ln not in comp_meshes:
+            continue
+        comp_col = COMPONENT_LAYERS[comp_ln]["color"]
+        csr, csg, csb = (linear_to_srgb(c) for c in comp_col)
+        n_c = comp_stats.get(comp_ln, 0)
+
+        crow = gui.Horiz(int(0.3 * em))
+        csw = gui.Button(" ")
+        csw.background_color = gui.Color(csr, csg, csb, 1.0)
+        csw.toggleable = False
+        csw.vertical_padding_em = 0.0
+        csw.horizontal_padding_em = 0.3
+
+        def _make_comp_cb(layer):
+            def _cb(checked):
+                _comp_visible[layer] = checked
+                scene_widget.scene.show_geometry(f"comp_{layer}", checked)
+                window.post_redraw()
+            return _cb
+
+        ccb = gui.Checkbox(f"{comp_ln} ({n_c})")
+        ccb.checked = False
+        ccb.set_on_checked(_make_comp_cb(comp_ln))
+        crow.add_child(csw)
+        crow.add_fixed(int(0.4 * em))
+        crow.add_child(ccb)
+        panel.add_child(crow)
+
 # Instance class toggles + stats
 panel.add_fixed(int(0.8 * em))
 panel.add_child(gui.Label("Instance classes:"))
@@ -898,7 +1065,19 @@ for ut in sorted(class_summaries.keys()):
             window.post_redraw()
         return _cb
 
-    cb = gui.Checkbox(f"{s['label']} ({s['n_instances']})")
+    _match = UTILITY_TO_LER_MATCH.get(ut)
+    if _match:
+        _ler_layers = _match["layers"]
+        if _ler_layers:
+            _ler_name = sorted(_ler_layers)[0]
+        else:
+            _ler_name = "no LER"
+    else:
+        _ler_name = "no LER"
+    _cls_label = (f"{s['label']} -> {_ler_name} ({s['n_instances']})"
+                  if _ler_name != "no LER"
+                  else f"{s['label']} (no LER) ({s['n_instances']})")
+    cb = gui.Checkbox(_cls_label)
     cb.checked = True
     cb.set_on_checked(_make_cls_cb(ut))
     row.add_child(sw)
