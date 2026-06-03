@@ -126,6 +126,75 @@ def batch_point_to_segments(pts, seg_p1, seg_p2, batch_size=2000):
     return min_dists
 
 
+def batch_point_to_plane_segments(pts, seg_p1, seg_p2, seg_half_width,
+                                  batch_size=2000):
+    """
+    Like batch_point_to_segments, but for segments that represent horizontal
+    planes with a given half-width.  The distance is measured to the nearest
+    edge of the plane surface rather than the centerline.
+
+    For each point, the offset from the closest point on the centerline is
+    decomposed into a lateral component (perpendicular to the segment in XY)
+    and a vertical component (Z).  The lateral distance is reduced by the
+    half-width (clamped to zero), and the final distance is
+    sqrt(lateral_eff^2 + dz^2).
+
+    seg_half_width : (M,) — half-width per segment.  Segments with
+                     half_width == 0 fall back to normal centerline distance.
+    """
+    N = len(pts)
+    M = len(seg_p1)
+    if M == 0:
+        return np.full(N, np.inf)
+
+    min_dists = np.full(N, np.inf)
+
+    d = seg_p2 - seg_p1                          # (M, 3)
+    seg_len2 = np.einsum('ij,ij->i', d, d)       # (M,)
+    safe = seg_len2 > 1e-12
+
+    # Lateral unit vector for each segment (perpendicular to d in XY)
+    d_xy = d.copy()
+    d_xy[:, 2] = 0.0
+    d_xy_len = np.sqrt(np.einsum('ij,ij->i', d_xy, d_xy))
+    has_lateral = d_xy_len > 1e-12
+    lat_dir = np.zeros_like(d)  # (M, 3)
+    lat_dir[has_lateral, 0] = -d_xy[has_lateral, 1] / d_xy_len[has_lateral]
+    lat_dir[has_lateral, 1] =  d_xy[has_lateral, 0] / d_xy_len[has_lateral]
+
+    hw = seg_half_width  # (M,)
+    is_plane = hw > 1e-9  # (M,) bool
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        p = pts[start:end]                        # (B, 3)
+        B = len(p)
+
+        v = p[:, None, :] - seg_p1[None, :, :]   # (B, M, 3)
+        dot_vd = np.einsum('ijk,jk->ij', v, d)   # (B, M)
+
+        t = np.zeros((B, M), dtype=float)
+        t[:, safe] = np.clip(dot_vd[:, safe] / seg_len2[None, safe], 0.0, 1.0)
+
+        closest = seg_p1[None, :, :] + t[:, :, None] * d[None, :, :]  # (B, M, 3)
+        diff = p[:, None, :] - closest                                  # (B, M, 3)
+
+        # For non-plane segments: standard Euclidean distance
+        dists2 = np.einsum('ijk,ijk->ij', diff, diff)                  # (B, M)
+
+        # For plane segments: decompose into lateral and vertical
+        if is_plane.any():
+            lat_comp = np.abs(np.einsum('ijk,jk->ij', diff, lat_dir))  # (B, M)
+            dz = diff[:, :, 2]                                          # (B, M)
+            lat_eff = np.maximum(0.0, lat_comp - hw[None, :])           # (B, M)
+            plane_dists2 = lat_eff ** 2 + dz ** 2                       # (B, M)
+            dists2[:, is_plane] = plane_dists2[:, is_plane]
+
+        min_dists[start:end] = np.sqrt(dists2.min(axis=1))
+
+    return min_dists
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SPATIAL CLIPPING / FILTERING
 # ─────────────────────────────────────────────────────────────────────────────
