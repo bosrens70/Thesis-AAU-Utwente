@@ -294,8 +294,14 @@ def linear_to_srgb(c: float) -> float:
 
 def deviation_to_color(distances, thresholds=None, palette=None):
     """
-    Map an array of deviation distances to RGB colours via piecewise
-    linear interpolation between threshold/colour pairs.
+    Map an array of deviation distances to RGB colours using hard class bins
+    (no interpolation): every point is given the solid colour of the accuracy
+    class its deviation falls into.
+
+    The class upper bounds are ``thresholds[1:]`` (the leading ``thresholds[0]``
+    is the lower bound of class 1, not an edge).  With the defaults this gives:
+        d <= 0.25 m -> class 1, <= 0.50 -> class 2, <= 1.00 -> class 3,
+        <= 2.00 -> class 4, and  > 2.00 m -> class 5.
     """
     from core.config import DEVIATION_THRESHOLDS, DEVIATION_COLORS
     if thresholds is None:
@@ -303,19 +309,15 @@ def deviation_to_color(distances, thresholds=None, palette=None):
     if palette is None:
         palette = DEVIATION_COLORS
 
-    thresholds = np.array(thresholds)
-    palette = np.array(palette)
-    colors = np.zeros((len(distances), 3), dtype=float)
+    distances = np.asarray(distances, dtype=float)
+    palette = np.asarray(palette, dtype=float)
 
-    for i in range(len(thresholds) - 1):
-        lo, hi = thresholds[i], thresholds[i + 1]
-        mask = (distances >= lo) & (distances < hi)
-        if mask.any():
-            t = (distances[mask] - lo) / (hi - lo)
-            colors[mask] = palette[i] * (1.0 - t[:, None]) + palette[i + 1] * t[:, None]
-
-    colors[distances >= thresholds[-1]] = palette[-1]
-    return colors
+    # Upper edges of all but the last class; right=True so the boundary value
+    # belongs to the lower (better) class, matching the "<=" class labels.
+    edges = np.asarray(thresholds, dtype=float)[1:]
+    idx = np.digitize(distances, edges, right=True)
+    idx = np.clip(idx, 0, len(palette) - 1)
+    return palette[idx]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
