@@ -24,7 +24,7 @@ warnings.filterwarnings("ignore", module="pyogrio", category=RuntimeWarning)
 # ─────────────────────────────────────────────────────────────────────────────
 PLY_FILE = (
     r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_05.ply"
+    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_11.ply"
 )
 
 AREA_REF_GEOJSON = (

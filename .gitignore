@@ -4,6 +4,12 @@ Data/
 # ── Archive (old code, pre-restructure) ─────────────────────────
 _archive/
 
+# ── Personal notes (report drafts, not part of the codebase) ────
+notes/
+
+# ── Presentations / slide decks (not part of the codebase) ──────
+*.pptx
+
 # ── Legacy folders (kept for reference, gitignored) ─────────────
 Developing/
 Testing/
