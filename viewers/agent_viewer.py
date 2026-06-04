@@ -107,23 +107,12 @@ print(f"  {len(gdfs)} layers with features near site  ({n_total:,} features tota
 for name, gdf in gdfs.items():
     print(f"    {name:<35} {len(gdf):>4} features")
 
-# Build utility meshes — only segments within the local bbox + margin
+# Build utility meshes — only features whose geometry CROSSES the point cloud
+# AABB are shown, and each such feature is drawn in full (no per-segment trimming),
+# so the utilities that actually pass through the site appear as continuous lines.
 _t_mesh = time.perf_counter()
-_MARGIN = 2.0  # metres beyond point cloud bbox
-_lx_min = pc_min[0] - _MARGIN
-_lx_max = pc_max[0] + _MARGIN
-_ly_min = pc_min[1] - _MARGIN
-_ly_max = pc_max[1] + _MARGIN
-
-
-def _seg_in_local_bbox(p1, p2):
-    """Check if a segment's AABB overlaps the local site bbox."""
-    sx_min = min(p1[0], p2[0])
-    sx_max = max(p1[0], p2[0])
-    sy_min = min(p1[1], p2[1])
-    sy_max = max(p1[1], p2[1])
-    return not (sx_max < _lx_min or sx_min > _lx_max or
-                sy_max < _ly_min or sy_min > _ly_max)
+_pc_aabb_box = _box(_bbox_min_utm[0], _bbox_min_utm[1],
+                    _bbox_max_utm[0], _bbox_max_utm[1])
 
 
 # Track Ledningstrace forsyningsart variants
@@ -140,6 +129,9 @@ for layer_name, gdf in gdfs.items():
     for _, row in gdf.iterrows():
         geom = row.geometry
         if geom is None:
+            continue
+        # Only draw features that cross the point cloud AABB (then drawn in full)
+        if not geom.intersects(_pc_aabb_box):
             continue
         # Get Ledningstrace display info and width
         is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
@@ -159,8 +151,6 @@ for layer_name, gdf in gdfs.items():
             coords[:, 2] -= TZ
             for i in range(len(coords) - 1):
                 p1, p2 = coords[i], coords[i + 1]
-                if not _seg_in_local_bbox(p1, p2):
-                    continue
                 if bredde_m is not None:
                     mesh = segment_to_plane(p1, p2, bredde_m, color)
                 else:
@@ -521,8 +511,6 @@ def highlight_features(gdf_subset, color=None, radius=0.02):
                 coords[:, 2] -= TZ
                 for i in range(len(coords) - 1):
                     p1, p2 = coords[i], coords[i + 1]
-                    if not _seg_in_local_bbox(p1, p2):
-                        continue
                     if bredde_m is not None:
                         mesh = segment_to_plane(p1, p2, bredde_m, highlight_color)
                     else:
@@ -600,6 +588,15 @@ def pivot_to(x_local, y_local, z_local):
     _pending_gui_actions.append(_pivot)
 
 
+def zoom_to_point_cloud():
+    """Frame the camera on the point cloud centroid, ignoring the far-below
+    -99 (unregistered-depth) utilities that otherwise distort the view.
+    Safe to call directly from a GUI callback (button or key)."""
+    d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
+    eye = cloud_centroid + np.array([d, -d, d * 0.6])
+    scene_widget.look_at(cloud_centroid.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+
+
 def get_visible_layers():
     """Return list of currently visible layer names."""
     return [ln for ln, vis in _layer_visible.items() if vis]
@@ -617,6 +614,12 @@ panel.add_child(gui.Label(f"Site: {_ply_path.stem}"))
 panel.add_child(gui.Label(f"Area: {area.area_name}  |  Points: {len(pts):,}"))
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
 panel.add_child(gui.Label(f"Utilities near site: {n_total:,} features"))
+panel.add_fixed(int(0.5 * em))
+
+# Camera reset — reframe on the point cloud (utilities at -99 distort the view)
+zoom_btn = gui.Button("Zoom to point cloud")
+zoom_btn.set_on_clicked(zoom_to_point_cloud)
+panel.add_child(zoom_btn)
 panel.add_fixed(int(0.5 * em))
 
 # Header
@@ -754,9 +757,7 @@ def on_key(event):
         return IGNORED
     k = event.key
     if k in (ord('C'), ord('c')):
-        d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-        eye = cloud_centroid + np.array([d, -d, d * 0.6])
-        scene_widget.look_at(cloud_centroid.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+        zoom_to_point_cloud()
         return HANDLED
     if k in (ord('H'), ord('h')):
         print("\n-- Agent Viewer Shortcuts ---------------------------------------")
