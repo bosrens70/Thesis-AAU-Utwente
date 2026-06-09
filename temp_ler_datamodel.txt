@@ -1,9 +1,0 @@
-﻿python.exe : Traceback (most recent call last):
-At line:1 char:1
-+ & "C:\Users\bosre\anaconda3\envs\thesis\python.exe" -c "
-+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
-    + FullyQualifiedErrorId : NativeCommandError
- 
-  File "<string>", line 2, in <module>
-ModuleNotFoundError: No module named 'docx'
