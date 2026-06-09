@@ -1,0 +1,23 @@
+# Python dependencies for the utility depth-reconciliation toolkit.
+# Versions pinned to the environment the thesis was developed against
+# (conda env "thesis", Python 3.9+). Install with:  pip install -r requirements.txt
+#
+# Note: the agent_viewer talks to the Anthropic API directly over urllib,
+# so no SDK package is required, only an API key in API-KEY.env.
+
+# ── 3D rendering & GUI ──────────────────────────────────────────────
+open3d==0.19.0
+
+# ── Geospatial: GML/GeoJSON utility data ────────────────────────────
+geopandas==1.1.3
+pyogrio==0.12.1        # GeoPandas I/O engine for GML layers
+shapely==2.1.2
+pyproj==3.7.1          # UTM32 / ETRS89 (EPSG:25832) reprojection
+
+# ── Numerics & clustering ───────────────────────────────────────────
+numpy==2.2.6
+scikit-learn==1.7.2    # HDBSCAN / DBSCAN instance segmentation
+
+# ── Point-cloud format I/O (tools/ply_to_las.py) ────────────────────
+plyfile==1.1
+laspy==2.7.0
