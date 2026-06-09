@@ -4,9 +4,10 @@ Centralised configuration for all viewers and tools.
 =====================================================
 Change the site by editing PLY_FILE (and optionally GML_PATH /
 AREA_REF_GEOJSON if working with a different Ledningspakke).
-All other scripts import from here — nothing is duplicated.
+All other scripts import from here, nothing is duplicated.
 """
 
+import os
 from pathlib import Path
 from enum import IntEnum
 from dataclasses import dataclass
@@ -20,33 +21,28 @@ warnings.filterwarnings("ignore", message="parsed incompletely", category=Runtim
 warnings.filterwarnings("ignore", module="pyogrio", category=RuntimeWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SITE SELECTION — change these to switch site
+# DATA LOCATION: portable, project-root-relative
 # ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D\Water_Area_5\Area_5_Site_11.ply"
-)
+# PROJECT_ROOT is the Thesis/ folder (this file lives in Thesis/core/config.py).
+# DATA_DIR defaults to Thesis/Data/, but can be pointed elsewhere by setting the
+# THESIS_DATA_DIR environment variable, so no source edits are needed to relocate data.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR     = Path(os.environ.get("THESIS_DATA_DIR", PROJECT_ROOT / "Data"))
 
-AREA_REF_GEOJSON = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Translation_coordinates\area_points_utm32_etrs89.geojson"
-)
+PLY_BASE_DIR = DATA_DIR / "OpenTrench3D"
 
-GML_PATH = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\Ledningspakke_2803288_Area_4_and_5\consolidated.gml"
-)
-
-PLY_BASE_DIR = (
-    r"C:\Users\bosre\OneDrive - University of Twente\Documents\AAU UTwente thesis"
-    r"\Python\Thesis\Data\OpenTrench3D"
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# SITE SELECTION: change these to switch site
+# ─────────────────────────────────────────────────────────────────────────────
+PLY_FILE         = PLY_BASE_DIR / "Water_Area_5" / "Area_5_Site_11.ply"
+AREA_REF_GEOJSON = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
+GML_PATH         = DATA_DIR / "Ledningspakke_2803288_Area_4_and_5" / "consolidated.gml"
 
 # Circular crop radius (metres) around the point cloud centroid (XY).
 CROP_RADIUS = 2.0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLASS LABEL DEFINITIONS — OpenTrench3D semantic classes
+# CLASS LABEL DEFINITIONS: OpenTrench3D semantic classes
 # ─────────────────────────────────────────────────────────────────────────────
 CLASS_LABELS = {
     0: {"name": "Main Utility",     "color": [0.00, 0.80, 0.00]},
@@ -56,10 +52,10 @@ CLASS_LABELS = {
     4: {"name": "Misc",             "color": [0.60, 0.60, 0.60]},
 }
 
-DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]  # magenta — unknown class IDs
+DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]  # magenta, unknown class IDs
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITY LAYER DEFINITIONS — DLF-recommended colours (RGB 0-1)
+# UTILITY LAYER DEFINITIONS: DLF-recommended colours (RGB 0-1)
 # ─────────────────────────────────────────────────────────────────────────────
 LINE_LAYERS = {
     "Vandledning":               {"color": [0.000, 0.000, 1.000], "fallback_radius": 0.005},  # DLF blue
@@ -237,7 +233,7 @@ DEVIATION_CLASS_LABELS = [
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEPTH HIERARCHY — enum, config (used by BASE1 and LABEL1)
+# DEPTH HIERARCHY: enum, config (used by BASE1 and LABEL1)
 # ─────────────────────────────────────────────────────────────────────────────
 class DepthSource(IntEnum):
     REGISTERED   = 1
@@ -284,7 +280,7 @@ DEPTH_STATS_KEY = {
 PLY_HEADER_ROWS    = 11
 CLASS_COLUMN       = 6
 TARGET_CLASS       = 1       # "Other Utility"
-VOXEL_SIZE         = 0.01    # metres — downsample before clustering
+VOXEL_SIZE         = 0.01    # metres, downsample before clustering
 MIN_CLUSTER_SIZE   = 100
 MIN_SAMPLES        = 5
 POINT_SIZE         = 2.0
