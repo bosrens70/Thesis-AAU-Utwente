@@ -26,7 +26,7 @@ import time
 import json
 
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
@@ -40,8 +40,10 @@ from core.data_loader import (
 )
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
+    discretize_segment,
     deviation_to_color, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
+    segments_in_rect, point_in_rect, clip_segment_to_rect,
 )
 from core.ledningstrace import get_bredde_width
 
@@ -70,6 +72,19 @@ _cx_utm = site.pc.crop_center_utm[0]
 _cy_utm = site.pc.crop_center_utm[1]
 _crop_r2 = CROP_RADIUS ** 2
 
+# Rectangle region (CROP_MODE == "rect"): full-cloud XY AABB grown by the utility
+# buffer.  Selection and clipping are XY-only so every utility passing through the
+# footprint is rendered regardless of its depth.  pc_min/pc_max are local;
+# UTM = local + (TX, TY).
+_rect_min_x = pc_min[0] - UTILITY_RECT_BUFFER
+_rect_max_x = pc_max[0] + UTILITY_RECT_BUFFER
+_rect_min_y = pc_min[1] - UTILITY_RECT_BUFFER
+_rect_max_y = pc_max[1] + UTILITY_RECT_BUFFER
+_rect_min_x_utm = _rect_min_x + TX
+_rect_max_x_utm = _rect_max_x + TX
+_rect_min_y_utm = _rect_min_y + TY
+_rect_max_y_utm = _rect_max_y + TY
+
 _ply_path = Path(PLY_FILE)
 
 # Ground level — interactive picking (shared from core/)
@@ -89,17 +104,21 @@ all_seg_p2 = []
 all_seg_layer = []
 all_seg_active = []       # True = "i drift", False = "permanent ude af drift"
 all_seg_half_width = []   # half-width for plane segments (ledningstrace), 0 for cylinders
+all_seg_radius = []       # cylinder radius per segment (used to sample the tube surface)
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
 
 def _in_crop_utm(coords):
-    """Conservative check: any part of the polyline within the circular crop (UTM).
+    """Conservative check: any part of the polyline within the crop region (UTM).
     First checks whether any vertex is inside the circle.
     Falls back to an AABB overlap test to catch segments that cross the disc
     but have no vertex inside it — the segment clipper makes the final call.
     """
+    if CROP_MODE == "rect":
+        return segments_in_rect(coords, _rect_min_x_utm, _rect_min_y_utm,
+                                _rect_max_x_utm, _rect_max_y_utm)
     dx = coords[:, 0] - _cx_utm
     dy = coords[:, 1] - _cy_utm
     if (dx * dx + dy * dy <= _crop_r2).any():
@@ -148,10 +167,13 @@ def _to_local(coords_utm, vejl_dybde_mm=None):
 
 def _clip_segment_to_crop(p1, p2):
     """
-    Clip a 3D segment to the circular crop disc in XY.
-    Circle: centre (_cx, _cy), radius CROP_RADIUS.
+    Clip a 3D segment to the crop region in XY.
+    Circle: centre (_cx, _cy), radius CROP_RADIUS, or the rectangle in rect mode.
     Returns (clipped_p1, clipped_p2) or None if entirely outside.
     """
+    if CROP_MODE == "rect":
+        return clip_segment_to_rect(p1, p2, _rect_min_x, _rect_min_y,
+                                    _rect_max_x, _rect_max_y)
     x1 = p1[0] - _cx
     y1 = p1[1] - _cy
     x2 = p2[0] - _cx
@@ -265,6 +287,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_layer.append(display_name)
                 all_seg_active.append(is_active)
                 all_seg_half_width.append(bredde_m / 2.0 if bredde_m is not None else 0.0)
+                all_seg_radius.append(radius)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
@@ -335,6 +358,7 @@ seg_p1 = np.array(all_seg_p1) if all_seg_p1 else np.empty((0, 3))
 seg_p2 = np.array(all_seg_p2) if all_seg_p2 else np.empty((0, 3))
 seg_active = np.array(all_seg_active, dtype=bool) if all_seg_active else np.empty(0, dtype=bool)
 seg_half_width = np.array(all_seg_half_width, dtype=float) if all_seg_half_width else np.empty(0, dtype=float)
+seg_radius = np.array(all_seg_radius, dtype=float) if all_seg_radius else np.empty(0, dtype=float)
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
@@ -370,14 +394,23 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         g = row.geometry
         if g is None or g.geom_type not in ("Point", "PointZ"):
             continue
-        dx = g.x - _cx_utm
-        dy = g.y - _cy_utm
-        if dx * dx + dy * dy > _crop_r2:
-            continue
+        if CROP_MODE == "rect":
+            if not point_in_rect(g.x, g.y, _rect_min_x_utm, _rect_min_y_utm,
+                                 _rect_max_x_utm, _rect_max_y_utm):
+                continue
+        else:
+            dx = g.x - _cx_utm
+            dy = g.y - _cy_utm
+            if dx * dx + dy * dy > _crop_r2:
+                continue
 
         pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
 
-        if (pt[0] - _cx) ** 2 + (pt[1] - _cy) ** 2 > _crop_r2:
+        if CROP_MODE == "rect":
+            if not point_in_rect(pt[0], pt[1], _rect_min_x, _rect_min_y,
+                                 _rect_max_x, _rect_max_y):
+                continue
+        elif (pt[0] - _cx) ** 2 + (pt[1] - _cy) ** 2 > _crop_r2:
             continue
 
         if g.z == -99 or pt[2] <= -98:
@@ -721,6 +754,69 @@ for ut, instances in sorted(class_instances.items()):
 
 print("\n" + "=" * 72)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5b.  Discretized LER deviation point clouds
+# ─────────────────────────────────────────────────────────────────────────────
+# Each LER segment is sampled into a dense cloud of points approximating the
+# utility surface: a tube of the registered radius for pipes, the flat ribbon
+# for traces.  Every sample is coloured by its deviation = distance to the
+# nearest measured instance point of a matching utility type, giving the
+# accuracy-class heatmap resolved over the registered utility surface.
+print("\n--- Discretizing LER surfaces + per-sample deviation ---")
+from scipy.spatial import cKDTree
+
+_seg_layer_arr = np.array(all_seg_layer)
+_NO_DATA_COLOR = [0.5, 0.5, 0.5]
+LER_LENGTH_STEP = 0.02    # m — sample spacing along each segment
+LER_SURFACE_STEP = 0.02   # m — surface sample spacing (ribbon width / tube ring)
+
+# Instance points each layer is compared against: the union over all utility
+# types whose LER match covers a segment in that layer.
+_layer_ref_pts = {}
+for ut, instances in class_instances.items():
+    mask = _get_matching_segment_mask(ut)   # combined active + inactive
+    if not mask.any() or not instances:
+        continue
+    pts_ut = np.concatenate(
+        [np.asarray(inst["pcd_dev"].points) for inst in instances])
+    if len(pts_ut) == 0:
+        continue
+    for ln in set(_seg_layer_arr[mask]):
+        _layer_ref_pts.setdefault(ln, []).append(pts_ut)
+
+ler_pcd_dev = {}   # layer -> PointCloud of discretized samples coloured by deviation
+_n_samples_total = 0
+for ln in ler_meshes:
+    seg_ids = np.where(_seg_layer_arr == ln)[0]
+    if len(seg_ids) == 0:
+        continue
+    ref_list = _layer_ref_pts.get(ln)
+    tree = cKDTree(np.concatenate(ref_list)) if ref_list else None
+
+    samp_chunks, col_chunks = [], []
+    for idx in seg_ids:
+        samp = discretize_segment(
+            seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
+            LER_LENGTH_STEP, LER_SURFACE_STEP)
+        if tree is not None:
+            dev, _ = tree.query(samp, workers=-1)
+            cols = deviation_to_color(dev)
+        else:
+            cols = np.tile(_NO_DATA_COLOR, (len(samp), 1))
+        samp_chunks.append(samp)
+        col_chunks.append(cols)
+
+    samp_pts = np.concatenate(samp_chunks)
+    samp_cols = np.concatenate(col_chunks)
+    _n_samples_total += len(samp_pts)
+
+    pc = o3d.geometry.PointCloud()
+    pc.points = o3d.utility.Vector3dVector(samp_pts)
+    pc.colors = o3d.utility.Vector3dVector(samp_cols)
+    ler_pcd_dev[ln] = pc
+
+print(f"  {_n_samples_total:,} LER samples across {len(ler_pcd_dev)} layers")
+
 # Normals for original cloud
 try:
     pcd_orig.estimate_normals(
@@ -735,8 +831,11 @@ _t_load = time.perf_counter()
 # 6.  GUI
 # ─────────────────────────────────────────────────────────────────────────────
 ORIG_GEOM = "original_cloud"
+CROP_GEOM = "crop_region"
 _color_mode = [0]
-_MODE_NAMES = ["Deviation heatmap", "Original RGB", "Utility class"]
+_MODE_NAMES = ["Deviation heatmap", "Original RGB", "Utility class", "LER deviation"]
+# Modes that show the accuracy-class heatmap legend
+_HEATMAP_MODES = (0, 3)
 
 app = gui.Application.instance
 app.initialize()
@@ -783,6 +882,34 @@ except Exception:
     pass
 scene_widget.scene.add_geometry(ORIG_GEOM, pcd_dim, make_pt_mat(2.0))
 
+# Crop-region wireframe at ground level (same style as base_viewer): the
+# AABB + buffer rectangle that bounds utility selection in rect mode, or the
+# disc in circle mode.
+if CROP_MODE == "rect":
+    _crop_corners = [
+        (_rect_min_x, _rect_min_y), (_rect_max_x, _rect_min_y),
+        (_rect_max_x, _rect_max_y), (_rect_min_x, _rect_max_y),
+    ]
+    _crop_pts = np.array([[x, y, GROUND_Z] for x, y in _crop_corners])
+    _crop_lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
+else:
+    _N_CIRCLE = 72
+    _theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
+    _crop_pts = np.stack([
+        _cx + CROP_RADIUS * np.cos(_theta),
+        _cy + CROP_RADIUS * np.sin(_theta),
+        np.full(_N_CIRCLE + 1, GROUND_Z),
+    ], axis=1)
+    _crop_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
+_crop_ls = o3d.geometry.LineSet(
+    points=o3d.utility.Vector3dVector(_crop_pts),
+    lines=o3d.utility.Vector2iVector(_crop_lines))
+_crop_ls.paint_uniform_color([1.0, 1.0, 0.0])
+_crop_mat = rendering.MaterialRecord()
+_crop_mat.shader = "unlitLine"
+_crop_mat.line_width = 2.0
+scene_widget.scene.add_geometry(CROP_GEOM, _crop_ls, _crop_mat)
+
 # Add LER pipe meshes
 _ler_visible = {}
 for ln, mesh in ler_meshes.items():
@@ -817,15 +944,32 @@ scene_widget.setup_camera(60, bounds, cloud_centroid.tolist())
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Colour-mode switch
 # ─────────────────────────────────────────────────────────────────────────────
+def _apply_ler_color_mode(use_dev):
+    """Swap each LER layer between its solid mesh and the discretized
+    deviation-heatmap point cloud."""
+    for ln in ler_meshes:
+        gn = f"ler_{ln}"
+        scene_widget.scene.remove_geometry(gn)
+        if use_dev and ln in ler_pcd_dev:
+            scene_widget.scene.add_geometry(gn, ler_pcd_dev[ln], make_pt_mat(6.0))
+        else:
+            scene_widget.scene.add_geometry(gn, ler_meshes[ln], make_mesh_mat(_ler_opacity[0]))
+        scene_widget.scene.show_geometry(gn, _ler_visible.get(ln, True))
+
+
 def _apply_color_mode(mode):
     _color_mode[0] = mode
+    # In "LER deviation" mode the heatmap lives on the LER segments, so the
+    # instance points fall back to their original RGB for context.
+    inst_idx = 1 if mode == 3 else mode
     for ut, instances in class_instances.items():
         for i, inst in enumerate(instances):
             gn = f"inst_{ut}_{i}"
-            pcd = [inst["pcd_dev"], inst["pcd_rgb"], inst["pcd_class"]][mode]
+            pcd = [inst["pcd_dev"], inst["pcd_rgb"], inst["pcd_class"]][inst_idx]
             scene_widget.scene.remove_geometry(gn)
             scene_widget.scene.add_geometry(gn, pcd, make_pt_mat(4.0))
             scene_widget.scene.show_geometry(gn, _class_visible.get(ut, True))
+    _apply_ler_color_mode(mode == 3)
     window.post_redraw()
 
 
@@ -867,7 +1011,7 @@ for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
 
 def _on_mode(val, idx):
     _apply_color_mode(idx)
-    _heatmap_legend.visible = (idx == 0)
+    _heatmap_legend.visible = (idx in _HEATMAP_MODES)
     window.set_needs_layout()
 
 
@@ -881,6 +1025,12 @@ orig_cb = gui.Checkbox("Original cloud")
 orig_cb.checked = True
 orig_cb.set_on_checked(lambda c: (scene_widget.scene.show_geometry(ORIG_GEOM, c), window.post_redraw()))
 panel.add_child(orig_cb)
+
+# Crop-region toggle (XY AABB + buffer rectangle in rect mode)
+crop_cb = gui.Checkbox("Crop region (XY AABB + buffer)")
+crop_cb.checked = True
+crop_cb.set_on_checked(lambda c: (scene_widget.scene.show_geometry(CROP_GEOM, c), window.post_redraw()))
+panel.add_child(crop_cb)
 
 # ── Utility filter (per-class view) ──
 panel.add_fixed(int(0.5 * em))
@@ -950,9 +1100,12 @@ ler_slider.double_value = 0.6
 
 def _on_ler_opacity(val):
     _ler_opacity[0] = val
-    for ln in ler_meshes:
-        if _ler_visible.get(ln, True):
-            scene_widget.scene.modify_geometry_material(f"ler_{ln}", make_mesh_mat(val))
+    # In "LER deviation" mode the LER layers are point clouds, not meshes, so
+    # the mesh-opacity material does not apply to them.
+    if _color_mode[0] != 3:
+        for ln in ler_meshes:
+            if _ler_visible.get(ln, True):
+                scene_widget.scene.modify_geometry_material(f"ler_{ln}", make_mesh_mat(val))
     for ln in comp_meshes:
         if _comp_visible.get(ln, False):
             scene_widget.scene.modify_geometry_material(f"comp_{ln}", make_mesh_mat(val))
