@@ -17,7 +17,7 @@ import re
 import time
 
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
@@ -123,10 +123,14 @@ def load_area_offset(geojson_path, area_name):
 # 2. PLY LOADING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_ply(ply_path, crop_radius=None, area_info=None):
+def load_ply(ply_path, crop_radius=None, area_info=None, crop_mode="circle"):
     """
     Load a PLY point cloud.  Reads the Open3D PointCloud, parses class
-    labels from the ASCII header, and optionally applies a circular crop.
+    labels from the ASCII header, and optionally applies a crop.
+
+    crop_mode : "circle" crops the cloud to a disc of radius crop_radius around
+    the XY centroid; "rect" keeps the full cloud uncropped (its AABB drives
+    utility selection in the viewers).
 
     Returns a PointCloudData.
     """
@@ -191,11 +195,16 @@ def load_ply(ply_path, crop_radius=None, area_info=None):
 
     cloud_centroid_full = pts.mean(axis=0)
 
-    # ── Circular crop ────────────────────────────────────────────────────
+    # ── Crop (circular disc, or none in rect mode) ───────────────────────
     crop_cx = float(cloud_centroid_full[0])
     crop_cy = float(cloud_centroid_full[1])
 
-    if crop_radius is not None and crop_radius > 0:
+    if crop_mode == "rect":
+        # Rect mode: keep the full point cloud.  Its AABB (pc_min/pc_max), grown
+        # by the utility buffer, is what the viewers use to select utilities.
+        crop_radius = 0.0
+        print(f"  Rect mode: full point-cloud AABB, no crop ({len(pts):,} points)")
+    elif crop_radius is not None and crop_radius > 0:
         dxy2 = (pts[:, 0] - crop_cx) ** 2 + (pts[:, 1] - crop_cy) ** 2
         crop_mask = dxy2 <= (crop_radius ** 2)
 
@@ -538,7 +547,7 @@ def extract_row_attrs(row):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def init_site(ply_file=None, geojson_path=None, gml_path=None,
-              crop_radius=None, load_gml=True, load_instances=True):
+              crop_radius=None, crop_mode=None, load_gml=True, load_instances=True):
     """
     Master initialisation: load area offset, point cloud, GML layers,
     and discover instances — everything a viewer needs to start.
@@ -549,6 +558,7 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
     geojson_path  : str or Path, default config.AREA_REF_GEOJSON
     gml_path      : str or Path, default config.GML_PATH
     crop_radius   : float, default config.CROP_RADIUS
+    crop_mode     : "circle" | "rect", default config.CROP_MODE
     load_gml      : bool — set False to skip GML loading (e.g. segment viewer)
     load_instances: bool — set False to skip instance discovery
 
@@ -566,6 +576,8 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
         gml_path = GML_PATH
     if crop_radius is None:
         crop_radius = CROP_RADIUS
+    if crop_mode is None:
+        crop_mode = CROP_MODE
 
     # ── Validate paths ───────────────────────────────────────────────────
     required = {"PLY_FILE": ply_file, "AREA_REF_GEOJSON": geojson_path}
@@ -584,7 +596,8 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
     area = load_area_offset(geojson_path, area_name)
 
     # ── 2. Point cloud ───────────────────────────────────────────────────
-    pc = load_ply(ply_file, crop_radius=crop_radius, area_info=area)
+    pc = load_ply(ply_file, crop_radius=crop_radius, area_info=area,
+                  crop_mode=crop_mode)
 
     # ── 3. GML layers ────────────────────────────────────────────────────
     gml = None

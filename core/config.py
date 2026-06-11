@@ -38,6 +38,22 @@ PLY_FILE         = PLY_BASE_DIR / "Water_Area_5" / "Area_5_Site_11.ply"
 AREA_REF_GEOJSON = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
 GML_PATH         = DATA_DIR / "Ledningspakke_2803288_Area_4_and_5" / "consolidated.gml"
 
+
+
+# Crop region shape (load-time switch).
+#   "circle" — disc of radius CROP_RADIUS around the cloud XY centroid (the cloud
+#              is cropped to that disc).
+#   "rect"   — the cloud is kept in full; its 3D axis-aligned bounding box (AABB)
+#              is expanded by UTILITY_RECT_BUFFER in X, Y and Z, and utilities are
+#              selected and clipped to that box.  CROP_RADIUS is not used here.
+# Honoured by the point-cloud crop (every init_site viewer) and by utility
+# selection in base_viewer / label_viewer / deviation_viewer.  Other viewers keep
+# their own selection logic.  Set to "circle" to restore the legacy disc crop.
+CROP_MODE = "rect"
+
+# Margin (metres) added around the point-cloud AABB in every dimension (X, Y, Z)
+# when selecting utilities in "rect" mode (the "additional crop distance").
+UTILITY_RECT_BUFFER = 0.0
 # Circular crop radius (metres) around the point cloud centroid (XY).
 CROP_RADIUS = 2.0
 

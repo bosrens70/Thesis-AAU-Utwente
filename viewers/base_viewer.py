@@ -27,7 +27,7 @@ import re
 import time
 import copy
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
@@ -36,6 +36,7 @@ from core.config import (
     forsyningsart_color,
 )
 from core.data_loader import init_site, pick_ground_level
+from core.geometry import segments_in_rect, point_in_rect, clip_segment_to_rect
 from core.gui_helpers import make_legend_row
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
@@ -67,6 +68,19 @@ _crop_cy_local = site.pc.crop_center_local[1]
 _crop_cx_utm   = site.pc.crop_center_utm[0]
 _crop_cy_utm   = site.pc.crop_center_utm[1]
 _crop_r2       = CROP_RADIUS * CROP_RADIUS
+
+# Rectangle region (CROP_MODE == "rect"): full-cloud XY AABB grown by the utility
+# buffer.  Selection and clipping are XY-only so every utility passing through the
+# footprint is rendered regardless of its depth.  pc_min/pc_max are local;
+# UTM = local + (TX, TY).
+_rect_min_x = pc_min[0] - UTILITY_RECT_BUFFER
+_rect_max_x = pc_max[0] + UTILITY_RECT_BUFFER
+_rect_min_y = pc_min[1] - UTILITY_RECT_BUFFER
+_rect_max_y = pc_max[1] + UTILITY_RECT_BUFFER
+_rect_min_x_utm = _rect_min_x + TX
+_rect_max_x_utm = _rect_max_x + TX
+_rect_min_y_utm = _rect_min_y + TY
+_rect_max_y_utm = _rect_max_y + TY
 
 _ply_path = Path(PLY_FILE)
 
@@ -179,12 +193,18 @@ def _batch_point_to_segment_dists(p, p1s, p2s): # define a function to calculate
 
 
 def _point_in_bbox(x, y):
+    if CROP_MODE == "rect":
+        return point_in_rect(x, y, _rect_min_x_utm, _rect_min_y_utm,
+                             _rect_max_x_utm, _rect_max_y_utm)
     dx = x - _crop_cx_utm
     dy = y - _crop_cy_utm
     return (dx * dx + dy * dy) <= _crop_r2
 
 
 def _pt_in_local_bbox(x, y):
+    if CROP_MODE == "rect":
+        return point_in_rect(x, y, _rect_min_x, _rect_min_y,
+                             _rect_max_x, _rect_max_y)
     dx = x - _crop_cx_local
     dy = y - _crop_cy_local
     return (dx * dx + dy * dy) <= _crop_r2
@@ -278,7 +298,10 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
 
 
 def _segments_in_bbox(coords_utm):
-    """Conservative check: any part of the polyline within the circular crop (UTM)."""
+    """Conservative check: any part of the polyline within the crop region (UTM)."""
+    if CROP_MODE == "rect":
+        return segments_in_rect(coords_utm, _rect_min_x_utm, _rect_min_y_utm,
+                                _rect_max_x_utm, _rect_max_y_utm)
     dx = coords_utm[:, 0] - _crop_cx_utm
     dy = coords_utm[:, 1] - _crop_cy_utm
     d2 = dx * dx + dy * dy
@@ -303,6 +326,9 @@ def _clip_segment_to_bbox(p1, p2):
     Z is linearly interpolated along the segment parameter, matching how
     the previous Liang-Barsky rectangular clipper handled it.
     """
+    if CROP_MODE == "rect":
+        return clip_segment_to_rect(p1, p2, _rect_min_x, _rect_min_y,
+                                    _rect_max_x, _rect_max_y)
     x1 = p1[0] - _crop_cx_local
     y1 = p1[1] - _crop_cy_local
     x2 = p2[0] - _crop_cx_local
@@ -709,17 +735,27 @@ except Exception as _e:
 _t_norm1 = time.perf_counter()
 print(f"  [timer] Normal estimation: {_t_norm1 - _t_norm0:.3f}s")
 
-# Circle wireframe showing the crop boundary at ground level
-_N_CIRCLE = 72
-_theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
-_circle_x = _crop_cx_local + CROP_RADIUS * np.cos(_theta)
-_circle_y = _crop_cy_local + CROP_RADIUS * np.sin(_theta)
-bbox_wire_pts = np.stack([
-    _circle_x,
-    _circle_y,
-    np.array([_ground_level_local(x, y) for x, y in zip(_circle_x, _circle_y)]),
-], axis=1)
-bbox_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
+# Wireframe showing the crop boundary at ground level
+if CROP_MODE == "rect":
+    _rect_corners = [
+        (_rect_min_x, _rect_min_y), (_rect_max_x, _rect_min_y),
+        (_rect_max_x, _rect_max_y), (_rect_min_x, _rect_max_y),
+    ]
+    bbox_wire_pts = np.array([
+        [x, y, _ground_level_local(x, y)] for x, y in _rect_corners
+    ])
+    bbox_lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
+else:
+    _N_CIRCLE = 72
+    _theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
+    _circle_x = _crop_cx_local + CROP_RADIUS * np.cos(_theta)
+    _circle_y = _crop_cy_local + CROP_RADIUS * np.sin(_theta)
+    bbox_wire_pts = np.stack([
+        _circle_x,
+        _circle_y,
+        np.array([_ground_level_local(x, y) for x, y in zip(_circle_x, _circle_y)]),
+    ], axis=1)
+    bbox_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
 bbox_ls = o3d.geometry.LineSet(
     points=o3d.utility.Vector3dVector(bbox_wire_pts),
     lines=o3d.utility.Vector2iVector(bbox_lines),
@@ -871,7 +907,11 @@ PANEL_WIDTH = int(20 * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Points: {len(pts):,}"))
-panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
+if CROP_MODE == "rect":
+    panel.add_child(gui.Label(
+        f"Crop: cloud AABB + {UTILITY_RECT_BUFFER:.0f} m (rect)"))
+else:
+    panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
 panel.add_fixed(int(0.3 * em))
 

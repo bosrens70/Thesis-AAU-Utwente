@@ -195,6 +195,63 @@ def batch_point_to_plane_segments(pts, seg_p1, seg_p2, seg_half_width,
     return min_dists
 
 
+def discretize_segment(p1, p2, radius=0.0, half_width=0.0,
+                       length_step=0.02, surface_step=0.02):
+    """
+    Sample a segment into a cloud of points approximating the utility surface.
+
+    Stations are placed along the centerline at roughly ``length_step`` spacing,
+    then for each station:
+
+    * Plane (trace) segments — ``half_width > 0`` — are sampled laterally across
+      the full ribbon width at ``surface_step`` spacing, filling the flat trace.
+    * Cylinder (pipe) segments — ``radius > 0`` — get a ring of points on the
+      cylindrical surface at that radius, with the ring spacing matched to
+      ``surface_step`` so the tube is sampled roughly uniformly.
+    * Otherwise only the centerline is returned.
+
+    The surface samples (rather than the bare centerline) let the deviation be
+    measured surface-to-surface against the instance point cloud.
+
+    Returns an (K, 3) array of sample positions.
+    """
+    p1 = np.asarray(p1, dtype=float)
+    p2 = np.asarray(p2, dtype=float)
+    vec = p2 - p1
+    L = float(np.linalg.norm(vec))
+
+    n_len = max(2, int(np.ceil(L / max(length_step, 1e-6))) + 1)
+    ts = np.linspace(0.0, 1.0, n_len)
+    centers = p1[None, :] + ts[:, None] * vec[None, :]   # (n_len, 3)
+
+    # Plane / trace ribbon: flat lateral fill
+    if half_width > 1e-9:
+        fwd = vec / L if L > 1e-9 else np.array([1.0, 0.0, 0.0])
+        side = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
+        sl = float(np.linalg.norm(side))
+        side = side / sl if sl > 1e-9 else np.array([1.0, 0.0, 0.0])
+        n_w = max(2, int(np.ceil((2.0 * half_width) / max(surface_step, 1e-6))) + 1)
+        offs = np.linspace(-half_width, half_width, n_w)
+        pts = centers[:, None, :] + offs[None, :, None] * side[None, None, :]
+        return pts.reshape(-1, 3)
+
+    # Cylinder / pipe: ring of points on the tube surface at each station
+    if radius > 1e-9:
+        axis = vec / L if L > 1e-9 else np.array([0.0, 0.0, 1.0])
+        ref = np.array([1.0, 0.0, 0.0]) if abs(axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        u = np.cross(axis, ref)
+        u /= np.linalg.norm(u)
+        w = np.cross(axis, u)   # unit, completes the orthonormal ring basis
+        n_ang = max(3, int(np.ceil((2.0 * np.pi * radius) / max(surface_step, 1e-6))))
+        thetas = np.linspace(0.0, 2.0 * np.pi, n_ang, endpoint=False)
+        ring = radius * (np.cos(thetas)[:, None] * u[None, :]
+                         + np.sin(thetas)[:, None] * w[None, :])   # (n_ang, 3)
+        pts = centers[:, None, :] + ring[None, :, :]               # (n_len, n_ang, 3)
+        return pts.reshape(-1, 3)
+
+    return centers
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SPATIAL CLIPPING / FILTERING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +325,60 @@ def point_in_crop(x, y, center_x, center_y, crop_radius):
     dx = x - center_x
     dy = y - center_y
     return (dx * dx + dy * dy) <= (crop_radius * crop_radius)
+
+
+def segments_in_rect(coords, min_x, min_y, max_x, max_y):
+    """
+    Conservative AABB-overlap test: does the polyline ``coords`` (N, 2+) fall
+    within the axis-aligned rectangle [min_x, max_x] x [min_y, max_y]?
+    The segment clipper makes the final call for crossing segments.
+    """
+    xs, ys = coords[:, 0], coords[:, 1]
+    if xs.max() < min_x or xs.min() > max_x:
+        return False
+    if ys.max() < min_y or ys.min() > max_y:
+        return False
+    return True
+
+
+def point_in_rect(x, y, min_x, min_y, max_x, max_y):
+    """Check if a single point (x, y) lies within the axis-aligned rectangle."""
+    return (min_x <= x <= max_x) and (min_y <= y <= max_y)
+
+
+def clip_segment_to_rect(p1, p2, min_x, min_y, max_x, max_y):
+    """
+    Liang-Barsky clip of a 3D segment (p1 -> p2) to an axis-aligned XY
+    rectangle.  Z is linearly interpolated along the segment parameter.
+    Returns (clipped_p1, clipped_p2) or None if entirely outside.
+    """
+    x0, y0 = p1[0], p1[1]
+    dx = p2[0] - x0
+    dy = p2[1] - y0
+
+    t0, t1 = 0.0, 1.0
+    for p_val, q_val in [
+        (-dx, x0 - min_x),
+        (dx,  max_x - x0),
+        (-dy, y0 - min_y),
+        (dy,  max_y - y0),
+    ]:
+        if abs(p_val) < 1e-12:
+            # Segment parallel to this edge — reject if it starts outside
+            if q_val < 0:
+                return None
+        else:
+            r = q_val / p_val
+            if p_val < 0:
+                t0 = max(t0, r)
+            else:
+                t1 = min(t1, r)
+            if t0 > t1:
+                return None
+
+    c1 = p1 + t0 * (p2 - p1)
+    c2 = p1 + t1 * (p2 - p1)
+    return c1, c2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -27,7 +27,7 @@ import glob as _globmod
 from datetime import datetime
 
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
@@ -37,7 +37,10 @@ from core.config import (
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level
 from core.gui_helpers import make_legend_row, make_master_pipe_toggle, make_master_comp_toggle
-from core.geometry import segment_to_plane
+from core.geometry import (
+    segment_to_plane,
+    segments_in_rect, point_in_rect, clip_segment_to_rect,
+)
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,6 +68,19 @@ _crop_cy_local = site.pc.crop_center_local[1]
 _crop_cx_utm   = site.pc.crop_center_utm[0]
 _crop_cy_utm   = site.pc.crop_center_utm[1]
 _crop_r2       = CROP_RADIUS * CROP_RADIUS
+
+# Rectangle region (CROP_MODE == "rect"): full-cloud XY AABB grown by the utility
+# buffer.  Selection and clipping are XY-only so every utility passing through the
+# footprint is rendered regardless of its depth.  pc_min/pc_max are local;
+# UTM = local + (TX, TY).
+_rect_min_x = pc_min[0] - UTILITY_RECT_BUFFER
+_rect_max_x = pc_max[0] + UTILITY_RECT_BUFFER
+_rect_min_y = pc_min[1] - UTILITY_RECT_BUFFER
+_rect_max_y = pc_max[1] + UTILITY_RECT_BUFFER
+_rect_min_x_utm = _rect_min_x + TX
+_rect_max_x_utm = _rect_max_x + TX
+_rect_min_y_utm = _rect_min_y + TY
+_rect_max_y_utm = _rect_max_y + TY
 
 _ply_path = Path(PLY_FILE)
 
@@ -262,7 +278,10 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm): # define a functi
 
 
 def _segments_in_bbox(coords_utm):
-    """Conservative check: any part of the polyline within the circular crop (UTM)."""
+    """Conservative check: any part of the polyline within the crop region (UTM)."""
+    if CROP_MODE == "rect":
+        return segments_in_rect(coords_utm, _rect_min_x_utm, _rect_min_y_utm,
+                                _rect_max_x_utm, _rect_max_y_utm)
     dx = coords_utm[:, 0] - _crop_cx_utm
     dy = coords_utm[:, 1] - _crop_cy_utm
     d2 = dx * dx + dy * dy
@@ -279,12 +298,18 @@ def _segments_in_bbox(coords_utm):
 
 
 def _point_in_bbox(x, y):
+    if CROP_MODE == "rect":
+        return point_in_rect(x, y, _rect_min_x_utm, _rect_min_y_utm,
+                             _rect_max_x_utm, _rect_max_y_utm)
     dx = x - _crop_cx_utm
     dy = y - _crop_cy_utm
     return (dx * dx + dy * dy) <= _crop_r2
 
 
 def _pt_in_local_bbox(x, y):
+    if CROP_MODE == "rect":
+        return point_in_rect(x, y, _rect_min_x, _rect_min_y,
+                             _rect_max_x, _rect_max_y)
     dx = x - _crop_cx_local
     dy = y - _crop_cy_local
     return (dx * dx + dy * dy) <= _crop_r2
@@ -299,6 +324,9 @@ def _clip_segment_to_bbox(p1, p2):
     Z is linearly interpolated along the segment parameter, matching how
     the previous Liang-Barsky rectangular clipper handled it.
     """
+    if CROP_MODE == "rect":
+        return clip_segment_to_rect(p1, p2, _rect_min_x, _rect_min_y,
+                                    _rect_max_x, _rect_max_y)
     x1 = p1[0] - _crop_cx_local
     y1 = p1[1] - _crop_cy_local
     x2 = p2[0] - _crop_cx_local
@@ -646,22 +674,40 @@ try:
 except Exception as _e:
     print(f"  [warn] point cloud normal estimation failed: {_e}")
 
-# Circle wireframe showing the crop boundary on the ground plane
-_N_CIRCLE = 72
-_theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
-# Build two tangent vectors in the ground plane
-_n = _ground_normal
-if abs(_n[0]) < 0.9:
-    _t1 = np.cross(_n, np.array([1.0, 0.0, 0.0]))
+# Wireframe showing the crop boundary on the ground plane
+if CROP_MODE == "rect":
+    _n = _ground_normal
+
+    def _ground_z_at(x, y):
+        """Z on the fitted ground plane at local (x, y)."""
+        if abs(_n[2]) < 1e-9:
+            return _ground_center[2]
+        return _ground_center[2] - (
+            _n[0] * (x - _ground_center[0]) + _n[1] * (y - _ground_center[1])
+        ) / _n[2]
+
+    _rect_corners = [
+        (_rect_min_x, _rect_min_y), (_rect_max_x, _rect_min_y),
+        (_rect_max_x, _rect_max_y), (_rect_min_x, _rect_max_y),
+    ]
+    bbox_wire_pts = np.array([[x, y, _ground_z_at(x, y)] for x, y in _rect_corners])
+    bbox_lines = [[0, 1], [1, 2], [2, 3], [3, 0]]
 else:
-    _t1 = np.cross(_n, np.array([0.0, 1.0, 0.0]))
-_t1 /= np.linalg.norm(_t1)
-_t2 = np.cross(_n, _t1)
-bbox_wire_pts = np.array([
-    _ground_center + CROP_RADIUS * (np.cos(t) * _t1 + np.sin(t) * _t2)
-    for t in _theta
-])
-bbox_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
+    _N_CIRCLE = 72
+    _theta = np.linspace(0.0, 2.0 * np.pi, _N_CIRCLE + 1)
+    # Build two tangent vectors in the ground plane
+    _n = _ground_normal
+    if abs(_n[0]) < 0.9:
+        _t1 = np.cross(_n, np.array([1.0, 0.0, 0.0]))
+    else:
+        _t1 = np.cross(_n, np.array([0.0, 1.0, 0.0]))
+    _t1 /= np.linalg.norm(_t1)
+    _t2 = np.cross(_n, _t1)
+    bbox_wire_pts = np.array([
+        _ground_center + CROP_RADIUS * (np.cos(t) * _t1 + np.sin(t) * _t2)
+        for t in _theta
+    ])
+    bbox_lines = [[i, i + 1] for i in range(_N_CIRCLE)]
 bbox_ls = o3d.geometry.LineSet(
     points=o3d.utility.Vector3dVector(bbox_wire_pts),
     lines=o3d.utility.Vector2iVector(bbox_lines),
@@ -884,7 +930,11 @@ panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 # Title
 panel.add_child(gui.Label(f"Points: {len(pts):,}"))
-panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
+if CROP_MODE == "rect":
+    panel.add_child(gui.Label(
+        f"Crop: cloud AABB + {UTILITY_RECT_BUFFER:.0f} m (rect)"))
+else:
+    panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
 panel.add_fixed(int(0.5 * em))
 
 origin_toggle_cb = gui.Checkbox("Show origin axis")
