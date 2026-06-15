@@ -431,6 +431,36 @@ def deviation_to_color(distances, thresholds=None, palette=None):
     return palette[idx]
 
 
+def deviation_to_color_continuous(distances, thresholds=None, palette=None):
+    """
+    Map an array of deviation distances to RGB colours via piecewise linear
+    interpolation between the threshold/colour pairs, giving a smooth gradient
+    instead of the hard class bins produced by :func:`deviation_to_color`.
+
+    Distances at or above the last threshold are clamped to the final colour.
+    """
+    from core.config import DEVIATION_THRESHOLDS, DEVIATION_COLORS
+    if thresholds is None:
+        thresholds = DEVIATION_THRESHOLDS
+    if palette is None:
+        palette = DEVIATION_COLORS
+
+    distances = np.asarray(distances, dtype=float)
+    thresholds = np.asarray(thresholds, dtype=float)
+    palette = np.asarray(palette, dtype=float)
+    colors = np.zeros((len(distances), 3), dtype=float)
+
+    for i in range(len(thresholds) - 1):
+        lo, hi = thresholds[i], thresholds[i + 1]
+        mask = (distances >= lo) & (distances < hi)
+        if mask.any():
+            t = (distances[mask] - lo) / (hi - lo)
+            colors[mask] = palette[i] * (1.0 - t[:, None]) + palette[i + 1] * t[:, None]
+
+    colors[distances >= thresholds[-1]] = palette[-1]
+    return colors
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PLANE FITTING
 # ─────────────────────────────────────────────────────────────────────────────
