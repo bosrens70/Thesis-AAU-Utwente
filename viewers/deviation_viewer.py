@@ -41,7 +41,7 @@ from core.data_loader import (
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
     discretize_segment,
-    deviation_to_color, linear_to_srgb,
+    deviation_to_color, deviation_to_color_continuous, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
     segments_in_rect, point_in_rect, clip_segment_to_rect,
 )
@@ -614,14 +614,18 @@ for inst_path in _inst_files:
         dists_inact = None
         stats_inact = dict(_nan_stats)
 
-    # Deviation heatmap point cloud (grey if no matching LER)
+    # Deviation point clouds (grey if no matching LER): discrete class bins and
+    # a continuous gradient over the same distances.
+    _grey = np.tile([0.5, 0.5, 0.5], (len(pts_inst), 1))
     pcd_dev = o3d.geometry.PointCloud()
     pcd_dev.points = o3d.utility.Vector3dVector(pts_inst)
-    if has_ler:
-        pcd_dev.colors = o3d.utility.Vector3dVector(deviation_to_color(dists))
-    else:
-        pcd_dev.colors = o3d.utility.Vector3dVector(
-            np.tile([0.5, 0.5, 0.5], (len(pts_inst), 1)))
+    pcd_dev.colors = o3d.utility.Vector3dVector(
+        deviation_to_color(dists) if has_ler else _grey)
+
+    pcd_dev_cont = o3d.geometry.PointCloud()
+    pcd_dev_cont.points = o3d.utility.Vector3dVector(pts_inst)
+    pcd_dev_cont.colors = o3d.utility.Vector3dVector(
+        deviation_to_color_continuous(dists) if has_ler else _grey)
 
     # Original RGB point cloud
     pcd_rgb = o3d.geometry.PointCloud()
@@ -645,6 +649,7 @@ for inst_path in _inst_files:
         "n_active_segs": n_act,
         "n_inactive_segs": n_inact,
         "pcd_dev": pcd_dev,
+        "pcd_dev_cont": pcd_dev_cont,
         "pcd_rgb": pcd_rgb,
         "pcd_class": pcd_class,
         "distances": dists,
@@ -784,36 +789,68 @@ for ut, instances in class_instances.items():
     for ln in set(_seg_layer_arr[mask]):
         _layer_ref_pts.setdefault(ln, []).append(pts_ut)
 
-ler_pcd_dev = {}   # layer -> PointCloud of discretized samples coloured by deviation
+ler_pcd_dev = {}          # layer -> PointCloud, 3D deviation, discrete colours
+ler_pcd_dev_cont = {}     # layer -> PointCloud, 3D deviation, continuous colours
+ler_pcd_zdev = {}         # layer -> PointCloud, |Z| deviation, discrete colours
+ler_pcd_zdev_cont = {}    # layer -> PointCloud, |Z| deviation, continuous colours
+ler_pcd_xydev = {}        # layer -> PointCloud, horizontal deviation, discrete colours
+ler_pcd_xydev_cont = {}   # layer -> PointCloud, horizontal deviation, continuous colours
 _n_samples_total = 0
 for ln in ler_meshes:
     seg_ids = np.where(_seg_layer_arr == ln)[0]
     if len(seg_ids) == 0:
         continue
     ref_list = _layer_ref_pts.get(ln)
-    tree = cKDTree(np.concatenate(ref_list)) if ref_list else None
+    ref_pts = np.concatenate(ref_list) if ref_list else None
+    tree = cKDTree(ref_pts) if ref_pts is not None else None
 
-    samp_chunks, col_chunks = [], []
+    samp_chunks = []
+    col_chunks, col_cont_chunks = [], []
+    zcol_chunks, zcol_cont_chunks = [], []
+    xycol_chunks, xycol_cont_chunks = [], []
     for idx in seg_ids:
         samp = discretize_segment(
             seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
             LER_LENGTH_STEP, LER_SURFACE_STEP)
         if tree is not None:
-            dev, _ = tree.query(samp, workers=-1)
+            # 3D-nearest measured point; the Z and XY deviations are the
+            # vertical and horizontal components of the displacement to that
+            # same neighbour.
+            dev, nn = tree.query(samp, workers=-1)
+            zdev = np.abs(samp[:, 2] - ref_pts[nn, 2])
+            xydev = np.linalg.norm(samp[:, :2] - ref_pts[nn, :2], axis=1)
             cols = deviation_to_color(dev)
+            cols_cont = deviation_to_color_continuous(dev)
+            zcols = deviation_to_color(zdev)
+            zcols_cont = deviation_to_color_continuous(zdev)
+            xycols = deviation_to_color(xydev)
+            xycols_cont = deviation_to_color_continuous(xydev)
         else:
             cols = np.tile(_NO_DATA_COLOR, (len(samp), 1))
+            cols_cont = zcols = zcols_cont = xycols = xycols_cont = cols
         samp_chunks.append(samp)
         col_chunks.append(cols)
+        col_cont_chunks.append(cols_cont)
+        zcol_chunks.append(zcols)
+        zcol_cont_chunks.append(zcols_cont)
+        xycol_chunks.append(xycols)
+        xycol_cont_chunks.append(xycols_cont)
 
     samp_pts = np.concatenate(samp_chunks)
-    samp_cols = np.concatenate(col_chunks)
     _n_samples_total += len(samp_pts)
 
-    pc = o3d.geometry.PointCloud()
-    pc.points = o3d.utility.Vector3dVector(samp_pts)
-    pc.colors = o3d.utility.Vector3dVector(samp_cols)
-    ler_pcd_dev[ln] = pc
+    def _make_pc(color_chunks):
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(samp_pts)
+        pc.colors = o3d.utility.Vector3dVector(np.concatenate(color_chunks))
+        return pc
+
+    ler_pcd_dev[ln] = _make_pc(col_chunks)
+    ler_pcd_dev_cont[ln] = _make_pc(col_cont_chunks)
+    ler_pcd_zdev[ln] = _make_pc(zcol_chunks)
+    ler_pcd_zdev_cont[ln] = _make_pc(zcol_cont_chunks)
+    ler_pcd_xydev[ln] = _make_pc(xycol_chunks)
+    ler_pcd_xydev_cont[ln] = _make_pc(xycol_cont_chunks)
 
 print(f"  {_n_samples_total:,} LER samples across {len(ler_pcd_dev)} layers")
 
@@ -833,9 +870,37 @@ _t_load = time.perf_counter()
 ORIG_GEOM = "original_cloud"
 CROP_GEOM = "crop_region"
 _color_mode = [0]
-_MODE_NAMES = ["Deviation heatmap", "Original RGB", "Utility class", "LER deviation"]
-# Modes that show the accuracy-class heatmap legend
-_HEATMAP_MODES = (0, 3)
+_MODE_NAMES = [
+    "Point cloud XYZ deviation (discrete)",
+    "Point cloud XYZ deviation (continuous)",
+    "Original RGB",
+    "OpenTrench3D utility class",
+    "LER XYZ deviation (discrete)",
+    "LER XYZ deviation (continuous)",
+    "LER Z deviation (discrete)",
+    "LER Z deviation (continuous)",
+    "LER XY deviation (discrete)",
+    "LER XY deviation (continuous)",
+]
+# Instance point cloud shown per mode. In the LER deviation modes the heatmap
+# lives on the LER segments, so the instance points fall back to original RGB.
+_MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont", "pcd_rgb", "pcd_class",
+                  "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb"]
+# LER deviation modes: the LER layers become deviation-coloured point clouds.
+# Each maps to the precomputed cloud carrying the right metric + colouring.
+_LER_MODE_PCD = {
+    4: ler_pcd_dev,          # XYZ deviation, discrete accuracy-class colours
+    5: ler_pcd_dev_cont,     # XYZ deviation, continuous gradient
+    6: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
+    7: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
+    8: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
+    9: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
+}
+_LER_DEV_MODES = tuple(_LER_MODE_PCD)
+# Modes that show the discrete accuracy-class heatmap legend
+_HEATMAP_MODES = (0, 4, 6, 8)
+# Modes that show the continuous deviation-gradient legend
+_GRADIENT_MODES = (1, 5, 7, 9)
 
 app = gui.Application.instance
 app.initialize()
@@ -944,14 +1009,16 @@ scene_widget.setup_camera(60, bounds, cloud_centroid.tolist())
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Colour-mode switch
 # ─────────────────────────────────────────────────────────────────────────────
-def _apply_ler_color_mode(use_dev):
-    """Swap each LER layer between its solid mesh and the discretized
-    deviation-heatmap point cloud."""
+def _apply_ler_color_mode(mode):
+    """Swap each LER layer between its solid mesh and a discretized deviation
+    point cloud. The cloud carries the metric (XYZ or Z) and colouring
+    (discrete accuracy classes or continuous gradient) for the active mode."""
+    dev_pcds = _LER_MODE_PCD.get(mode)
     for ln in ler_meshes:
         gn = f"ler_{ln}"
         scene_widget.scene.remove_geometry(gn)
-        if use_dev and ln in ler_pcd_dev:
-            scene_widget.scene.add_geometry(gn, ler_pcd_dev[ln], make_pt_mat(6.0))
+        if dev_pcds is not None and ln in dev_pcds:
+            scene_widget.scene.add_geometry(gn, dev_pcds[ln], make_pt_mat(6.0))
         else:
             scene_widget.scene.add_geometry(gn, ler_meshes[ln], make_mesh_mat(_ler_opacity[0]))
         scene_widget.scene.show_geometry(gn, _ler_visible.get(ln, True))
@@ -959,17 +1026,15 @@ def _apply_ler_color_mode(use_dev):
 
 def _apply_color_mode(mode):
     _color_mode[0] = mode
-    # In "LER deviation" mode the heatmap lives on the LER segments, so the
-    # instance points fall back to their original RGB for context.
-    inst_idx = 1 if mode == 3 else mode
+    pcd_key = _MODE_INST_PCD[mode]
     for ut, instances in class_instances.items():
         for i, inst in enumerate(instances):
             gn = f"inst_{ut}_{i}"
-            pcd = [inst["pcd_dev"], inst["pcd_rgb"], inst["pcd_class"]][inst_idx]
+            pcd = inst[pcd_key]
             scene_widget.scene.remove_geometry(gn)
             scene_widget.scene.add_geometry(gn, pcd, make_pt_mat(4.0))
             scene_widget.scene.show_geometry(gn, _class_visible.get(ut, True))
-    _apply_ler_color_mode(mode == 3)
+    _apply_ler_color_mode(mode)
     window.post_redraw()
 
 
@@ -1008,16 +1073,40 @@ for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
     row.add_child(gui.Label(lbl))
     _heatmap_legend.add_child(row)
 
+# Continuous gradient legend: same anchor colours as the accuracy classes, but
+# sampled at intermediate ticks to show the smooth interpolation between them.
+_gradient_legend = gui.Vert(0)
+_gradient_legend.add_child(gui.Label("LER deviation (gradient):"))
+_grad_ticks_mm = [0, 250, 500, 750, 1000, 1500, 2000]
+_grad_tick_cols = deviation_to_color_continuous(
+    np.asarray(_grad_ticks_mm, dtype=float) / 1000.0)
+for _mm, _col in zip(_grad_ticks_mm, _grad_tick_cols):
+    sr, sg, sb = (linear_to_srgb(c) for c in _col)
+    row = gui.Horiz(int(0.3 * em))
+    sw = gui.Button(" ")
+    sw.background_color = gui.Color(sr, sg, sb, 1.0)
+    sw.toggleable = False
+    sw.vertical_padding_em = 0.0
+    sw.horizontal_padding_em = 0.3
+    row.add_child(sw)
+    row.add_fixed(int(0.4 * em))
+    _lbl = f">= {_mm} mm" if _mm == _grad_ticks_mm[-1] else f"{_mm} mm"
+    row.add_child(gui.Label(_lbl))
+    _gradient_legend.add_child(row)
+_gradient_legend.visible = False
+
 
 def _on_mode(val, idx):
     _apply_color_mode(idx)
     _heatmap_legend.visible = (idx in _HEATMAP_MODES)
+    _gradient_legend.visible = (idx in _GRADIENT_MODES)
     window.set_needs_layout()
 
 
 combo.set_on_selection_changed(_on_mode)
 panel.add_child(combo)
 panel.add_child(_heatmap_legend)
+panel.add_child(_gradient_legend)
 panel.add_fixed(int(0.5 * em))
 
 # Original cloud toggle
@@ -1102,7 +1191,7 @@ def _on_ler_opacity(val):
     _ler_opacity[0] = val
     # In "LER deviation" mode the LER layers are point clouds, not meshes, so
     # the mesh-opacity material does not apply to them.
-    if _color_mode[0] != 3:
+    if _color_mode[0] not in _LER_DEV_MODES:
         for ln in ler_meshes:
             if _ler_visible.get(ln, True):
                 scene_widget.scene.modify_geometry_material(f"ler_{ln}", make_mesh_mat(val))
