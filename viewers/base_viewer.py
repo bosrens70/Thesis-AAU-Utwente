@@ -35,7 +35,7 @@ from core.config import (
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
     forsyningsart_color,
 )
-from core.data_loader import init_site, pick_ground_level
+from core.data_loader import init_site, load_or_pick_ground_level
 from core.geometry import segments_in_rect, point_in_rect, clip_segment_to_rect
 from core.gui_helpers import make_legend_row
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
@@ -93,7 +93,7 @@ _DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 # ─────────────────────────────────────────────────────────────────────────────
 # 3.  Pick ground-level points (shared function from core/)
 # ─────────────────────────────────────────────────────────────────────────────
-GROUND_Z = pick_ground_level(site.pc)
+GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)
 _pick_method = site.pc.ground_z_method
 print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 

@@ -35,7 +35,7 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     forsyningsart_color,
 )
-from core.data_loader import init_site, pick_ground_level
+from core.data_loader import init_site, load_or_pick_ground_level
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
@@ -62,7 +62,7 @@ _crop_cx_utm   = site.pc.crop_center_utm[0]
 _crop_cy_utm   = site.pc.crop_center_utm[1]
 
 # Ground picking
-GROUND_Z = pick_ground_level(site.pc)
+GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)
 _pick_method = site.pc.ground_z_method
 print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 
