@@ -15,6 +15,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 import re
 import time
+import json
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE,
@@ -673,3 +674,145 @@ def pick_ground_level(pc: PointCloudData) -> float:
     print(f"\n  Ground level (local) = {ground_z:.3f} m")
 
     return ground_z
+
+
+def pick_trench_vertices(pc: PointCloudData) -> np.ndarray:
+    """
+    Let the user mark the trench outline by picking points.
+
+    Opens a VisualizerWithEditing window (same mechanism as
+    :func:`pick_ground_level`) so the user can Shift + Left-Click the corner
+    points of the trench, then close the window (Q or X) when done.
+
+    Returns an ``(N, 3)`` array of the picked point coordinates in the cloud's
+    local frame (empty ``(0, 3)`` array if nothing was picked). The caller is
+    responsible for turning these into a footprint polygon.
+    """
+    print("\n" + "=" * 62)
+    print("  TRENCH OUTLINE POINT PICKING")
+    print("=" * 62)
+    print("  Shift + Left-Click  the corner points of the trench outline.")
+    print("  Pick three or more points; close the window (Q) when finished.")
+    print("  Pick nothing to leave the deviation colouring unrestricted.")
+    print("=" * 62 + "\n")
+
+    vis = o3d.visualization.VisualizerWithEditing()
+    vis.create_window(
+        window_name="Pick trench outline points  (Shift+Click, then Q to finish)",
+        width=1280, height=720,
+    )
+    vis.add_geometry(pc.pcd)
+    vis.run()
+    picked_indices = vis.get_picked_points()
+    vis.destroy_window()
+
+    if len(picked_indices) == 0:
+        print("  No trench points picked.")
+        return np.empty((0, 3), dtype=float)
+
+    picked_pts = pc.pts[picked_indices]
+    print(f"\n  Picked {len(picked_indices)} trench-outline point(s):")
+    for i, idx in enumerate(picked_indices):
+        p = pc.pts[idx]
+        print(f"    [{i+1}]  index {idx:>8,}  ->  "
+              f"X={p[0]:.3f}  Y={p[1]:.3f}  Z={p[2]:.3f}")
+    return np.asarray(picked_pts, dtype=float)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SITE PICK PERSISTENCE (ground level + trench footprint)
+# ─────────────────────────────────────────────────────────────────────────────
+# Both the ground-level pick and the trench-outline pick are cached in a small
+# JSON next to the site PLY (``<stem>_ground.json`` / ``<stem>_trench.json``) so
+# the user only picks once per site. Delete the JSON or pass ``repick=True`` to
+# pick again. Shared by every viewer that needs these picks.
+
+def _site_sidecar(ply_path, suffix):
+    """Path of the cache file ``<stem>_<suffix>.json`` next to the PLY."""
+    p = Path(ply_path)
+    return p.parent / f"{p.stem}_{suffix}.json"
+
+
+def load_or_pick_ground_level(pc: "PointCloudData", ply_path, repick=False) -> float:
+    """Ground Z for a site, cached in ``<stem>_ground.json`` next to the PLY.
+
+    Loads the cached value when present (unless ``repick``); otherwise opens the
+    picker (:func:`pick_ground_level`) and saves the result. Sets ``pc.ground_z``
+    and ``pc.ground_z_method`` in place and returns the ground Z.
+    """
+    sidecar = _site_sidecar(ply_path, "ground")
+    if not repick and sidecar.is_file():
+        try:
+            data = json.loads(sidecar.read_text())
+            gz = float(data["ground_z"])
+            pc.ground_z = gz
+            pc.ground_z_method = data.get("method", "loaded from cache")
+            print(f"\n  Loaded ground level {gz:.3f} m "
+                  f"({pc.ground_z_method}) from {sidecar.name}")
+            return gz
+        except Exception as exc:
+            print(f"[WARN] Could not read {sidecar.name}: {exc}")
+    gz = pick_ground_level(pc)
+    try:
+        sidecar.write_text(json.dumps(
+            {"ground_z": gz, "method": pc.ground_z_method}, indent=2))
+        print(f"  Saved ground level to {sidecar.name}")
+    except Exception as exc:
+        print(f"[WARN] Could not save {sidecar.name}: {exc}")
+    return gz
+
+
+def load_or_pick_trench(pc: "PointCloudData", ply_path, mode="hull", repick=False):
+    """Trench-outline vertices for a site, cached in ``<stem>_trench.json``.
+
+    Returns ``(vertices, mode)`` where ``vertices`` is a list of ``[x, y, z]``
+    picked points (or ``None`` when no trench is defined) and ``mode`` is
+    ``"hull"`` or ``"order"``. Loads the cache when present (unless ``repick``);
+    otherwise opens the picker (:func:`pick_trench_vertices`) and, if at least
+    three points are picked, saves them. Use :func:`trench_path_from_vertices`
+    to turn the result into a footprint polygon.
+    """
+    sidecar = _site_sidecar(ply_path, "trench")
+    if not repick and sidecar.is_file():
+        try:
+            data = json.loads(sidecar.read_text())
+            verts = data.get("vertices")
+            saved_mode = data.get("mode", mode)
+            n = len(verts) if verts else 0
+            print(f"\n  Loaded trench: {n} vertices ({saved_mode}) "
+                  f"from {sidecar.name}")
+            return verts, saved_mode
+        except Exception as exc:
+            print(f"[WARN] Could not read {sidecar.name}: {exc}")
+    picked = pick_trench_vertices(pc)
+    if len(picked) >= 3:
+        verts = picked.tolist()
+        try:
+            sidecar.write_text(json.dumps(
+                {"vertices": verts, "mode": mode}, indent=2))
+            print(f"  Saved trench to {sidecar.name}")
+        except Exception as exc:
+            print(f"[WARN] Could not save {sidecar.name}: {exc}")
+        return verts, mode
+    print("  No trench defined; restriction not applied.")
+    return None, mode
+
+
+def trench_path_from_vertices(vertices, mode="hull"):
+    """Build a matplotlib ``Path`` footprint (XY) from picked trench vertices.
+
+    ``mode="hull"`` uses the convex hull of the points; ``mode="order"`` keeps
+    the pick order (for irregular / concave outlines). Returns ``None`` when
+    fewer than three vertices are supplied.
+    """
+    if vertices is None or len(vertices) < 3:
+        return None
+    import matplotlib.path as mpath
+    pts = np.asarray(vertices, dtype=float)[:, :2]
+    if mode == "hull":
+        from scipy.spatial import ConvexHull
+        try:
+            pts = pts[ConvexHull(pts).vertices]
+        except Exception as exc:
+            print(f"[WARN] Convex hull failed ({exc}); using pick order.")
+    return mpath.Path(pts)
