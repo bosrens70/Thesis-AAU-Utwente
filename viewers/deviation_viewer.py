@@ -23,7 +23,6 @@ import geopandas as gpd
 import numpy as np
 import re
 import time
-import json
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
@@ -36,7 +35,8 @@ from core.config import (
 )
 from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
-    pick_ground_level, instance_base_name,
+    load_or_pick_ground_level, load_or_pick_trench, trench_path_from_vertices,
+    instance_base_name,
 )
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
@@ -87,8 +87,8 @@ _rect_max_y_utm = _rect_max_y + TY
 
 _ply_path = Path(PLY_FILE)
 
-# Ground level — interactive picking (shared from core/)
-GROUND_Z = pick_ground_level(site.pc)
+# Ground level: cached per site (delete <site>_ground.json to re-pick).
+GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LER LOADING + DEVIATION COMPUTATION + GUI
@@ -653,6 +653,8 @@ for inst_path in _inst_files:
         "pcd_rgb": pcd_rgb,
         "pcd_class": pcd_class,
         "distances": dists,
+        "dists_active": dists_act,
+        "dists_inactive": dists_inact,
         "stats": stats,
         "stats_active": stats_act,
         "stats_inactive": stats_inact,
@@ -681,79 +683,133 @@ print("\n" + "=" * 72)
 print("  DEVIATION SUMMARY -Instances vs LER (by utility class)")
 print("=" * 72)
 
-class_summaries = {}
-for ut, instances in sorted(class_instances.items()):
-    label = UTILITY_TYPE_LABELS.get(ut, f"Unknown({ut})")
-    has_ler = any(inst["has_ler"] for inst in instances)
-    total_pts = sum(inst["stats"]["n_pts"] for inst in instances)
-    total_act = sum(inst["n_active_segs"] for inst in instances)
-    total_inact = sum(inst["n_inactive_segs"] for inst in instances)
+# ───── Trench footprint: restricts deviation colouring + statistics ─────
+# The user marks the trench outline by picking points (Shift+Click) on the
+# cloud at startup; the footprint is the XY polygon through those points
+# (convex hull by default, pick order optionally). Only points whose XY falls
+# inside the polygon are coloured by the deviation modes and counted in the
+# per-class statistics; everything outside is greyed. The polygon is cached in
+# a JSON next to the site PLY so it survives restarts. With no trench defined
+# the whole cloud is coloured / measured as before.
+TRENCH_POLYGON_MODE = "hull"          # "hull" (convex) or "order" (pick order)
+# Resolve the trench via the shared cache (load <site>_trench.json, else pick).
+_trench_verts, _trench_mode = load_or_pick_trench(
+    site.pc, _ply_path, mode=TRENCH_POLYGON_MODE)
+_trench_path_obj = trench_path_from_vertices(_trench_verts, _trench_mode)
 
-    def _agg_stats(key):
-        """Aggregate per-instance stats arrays for a given stats key ('stats_active' or 'stats_inactive')."""
-        # We need the raw distances, but we only stored summary stats per split.
-        # Use the combined distances and filter isn't possible here,
-        # so we report from the per-instance stats (weighted is close enough for display).
-        vals = [inst[key] for inst in instances
-                if not np.isnan(inst[key].get("mean", np.nan))]
-        if not vals:
-            return None
-        # Re-aggregate from per-instance stats (approximate but representative)
-        all_n = sum(v["n_pts"] for v in vals)
-        w_mean = sum(v["mean"] * v["n_pts"] for v in vals) / all_n if all_n else np.nan
-        return {
-            "mean": w_mean,
-            "p95": max(v["p95"] for v in vals),
-            "max": max(v["max"] for v in vals),
-        }
 
-    if has_ler:
-        matched_dists = np.concatenate([
-            inst["distances"] for inst in instances if inst["has_ler"]])
-        summary = {
+def _inside_mask(points_xyz):
+    """Boolean mask of points whose XY lies inside the trench, or None when no
+    trench is defined (meaning no restriction)."""
+    if _trench_path_obj is None:
+        return None
+    xy = np.asarray(points_xyz)[:, :2]
+    return _trench_path_obj.contains_points(xy)
+
+
+# Inside-trench mask per instance (keyed (ut, i)); absent key => unrestricted.
+_inst_inside = {}
+for _ut, _insts in class_instances.items():
+    for _i, _inst in enumerate(_insts):
+        _m = _inside_mask(np.asarray(_inst["pcd_dev"].points))
+        if _m is not None:
+            _inst_inside[(_ut, _i)] = _m
+
+
+def _build_class_summaries():
+    """Per-class deviation statistics over inside-trench points (or all points
+    when no trench is defined). Reads the current _inst_inside masks so it can
+    be recomputed if the trench changes."""
+    summaries = {}
+    for ut, instances in sorted(class_instances.items()):
+        label = UTILITY_TYPE_LABELS.get(ut, f"Unknown({ut})")
+        has_ler = any(inst["has_ler"] for inst in instances)
+        total_act = sum(inst["n_active_segs"] for inst in instances)
+        total_inact = sum(inst["n_inactive_segs"] for inst in instances)
+
+        def _masked(idx, arr):
+            if arr is None:
+                return None
+            m = _inst_inside.get((ut, idx))
+            return arr if m is None else arr[m]
+
+        total_pts = 0
+        for idx, inst in enumerate(instances):
+            m = _inst_inside.get((ut, idx))
+            total_pts += int(inst["stats"]["n_pts"] if m is None else int(m.sum()))
+
+        def _pool(arr_key, only_ler=False):
+            parts = []
+            for idx, inst in enumerate(instances):
+                if only_ler and not inst["has_ler"]:
+                    continue
+                a = _masked(idx, inst.get(arr_key))
+                if a is not None and len(a):
+                    parts.append(a)
+            return np.concatenate(parts) if parts else np.array([])
+
+        def _agg(arr_key):
+            alld = _pool(arr_key)
+            if alld.size == 0:
+                return None
+            return {"mean": float(np.mean(alld)),
+                    "p95": float(np.percentile(alld, 95)),
+                    "max": float(np.max(alld))}
+
+        base = {
             "label": label, "n_instances": len(instances), "n_points": total_pts,
-            "has_ler": True,
-            "n_active_segs": total_act, "n_inactive_segs": total_inact,
-            "mean": float(np.mean(matched_dists)),
-            "median": float(np.median(matched_dists)),
-            "std": float(np.std(matched_dists)),
-            "p95": float(np.percentile(matched_dists, 95)),
-            "max": float(np.max(matched_dists)),
-            "active_agg": _agg_stats("stats_active"),
-            "inactive_agg": _agg_stats("stats_inactive"),
+            "has_ler": has_ler,
+            "n_active_segs": total_act if has_ler else 0,
+            "n_inactive_segs": total_inact if has_ler else 0,
         }
-    else:
-        summary = {
-            "label": label, "n_instances": len(instances), "n_points": total_pts,
-            "has_ler": False,
-            "n_active_segs": 0, "n_inactive_segs": 0,
-            "mean": np.nan, "median": np.nan, "std": np.nan,
-            "p95": np.nan, "max": np.nan,
-            "active_agg": None, "inactive_agg": None,
-        }
-    class_summaries[ut] = summary
+        matched = _pool("distances", only_ler=True) if has_ler else np.array([])
+        if matched.size:
+            base.update({
+                "mean": float(np.mean(matched)),
+                "median": float(np.median(matched)),
+                "std": float(np.std(matched)),
+                "p95": float(np.percentile(matched, 95)),
+                "max": float(np.max(matched)),
+                "active_agg": _agg("dists_active"),
+                "inactive_agg": _agg("dists_inactive"),
+            })
+        else:
+            base.update({
+                "mean": np.nan, "median": np.nan, "std": np.nan,
+                "p95": np.nan, "max": np.nan,
+                "active_agg": None, "inactive_agg": None,
+            })
+        summaries[ut] = base
+    return summaries
 
-    print(f"\n  {label} (type {ut})")
-    print(f"    Instances:  {len(instances)}")
-    print(f"    Points:     {total_pts:,}")
-    print(f"    LER segs:   {total_act} active, {total_inact} inactive")
-    if has_ler:
-        print(f"    ── Combined (all matching LER) ──")
-        print(f"    Mean:       {summary['mean']*1000:>8.2f} mm")
-        print(f"    Median:     {summary['median']*1000:>8.2f} mm")
-        print(f"    Std dev:    {summary['std']*1000:>8.2f} mm")
-        print(f"    P95:        {summary['p95']*1000:>8.2f} mm")
-        print(f"    Max:        {summary['max']*1000:>8.2f} mm")
-        if summary["active_agg"]:
-            a = summary["active_agg"]
-            print(f"    ── Active LER only ──")
+
+class_summaries = _build_class_summaries()
+
+for ut in sorted(class_summaries.keys()):
+    s = class_summaries[ut]
+    print(f"\n  {s['label']} (type {ut})")
+    print(f"    Instances:  {s['n_instances']}")
+    print(f"    Points (in trench): {s['n_points']:,}")
+    print(f"    LER segs:   {s['n_active_segs']} active, {s['n_inactive_segs']} inactive")
+    if s["has_ler"] and not np.isnan(s["mean"]):
+        print(f"    -- Combined (all matching LER) --")
+        print(f"    Mean:       {s['mean']*1000:>8.2f} mm")
+        print(f"    Median:     {s['median']*1000:>8.2f} mm")
+        print(f"    Std dev:    {s['std']*1000:>8.2f} mm")
+        print(f"    P95:        {s['p95']*1000:>8.2f} mm")
+        print(f"    Max:        {s['max']*1000:>8.2f} mm")
+        if s["active_agg"]:
+            a = s["active_agg"]
+            print(f"    -- Active LER only --")
             print(f"    Mean:       {a['mean']*1000:>8.2f} mm   "
                   f"P95: {a['p95']*1000:.2f} mm   Max: {a['max']*1000:.2f} mm")
-        if summary["inactive_agg"]:
-            ia = summary["inactive_agg"]
-            print(f"    ── Inactive LER only ──")
+        if s["inactive_agg"]:
+            ia = s["inactive_agg"]
+            print(f"    -- Inactive LER only --")
             print(f"    Mean:       {ia['mean']*1000:>8.2f} mm   "
                   f"P95: {ia['p95']*1000:.2f} mm   Max: {ia['max']*1000:.2f} mm")
+    elif s["has_ler"]:
+        print(f"    ** No measured points inside the trench **")
     else:
         print(f"    ** No matching LER utility — deviation not computed **")
 
@@ -854,6 +910,14 @@ for ln in ler_meshes:
 
 print(f"  {_n_samples_total:,} LER samples across {len(ler_pcd_dev)} layers")
 
+# Inside-trench mask per LER layer (the six dev clouds of a layer share points,
+# so one mask suffices); absent key => unrestricted.
+_ler_inside = {}
+for _ln, _pc in ler_pcd_dev.items():
+    _m = _inside_mask(np.asarray(_pc.points))
+    if _m is not None:
+        _ler_inside[_ln] = _m
+
 # Normals for original cloud
 try:
     pcd_orig.estimate_normals(
@@ -874,7 +938,7 @@ _MODE_NAMES = [
     "Point cloud XYZ deviation (discrete)",
     "Point cloud XYZ deviation (continuous)",
     "Original RGB",
-    "OpenTrench3D utility class",
+    "LER utility class",
     "LER XYZ deviation (discrete)",
     "LER XYZ deviation (continuous)",
     "LER Z deviation (discrete)",
@@ -897,6 +961,9 @@ _LER_MODE_PCD = {
     9: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
+# Instance-deviation modes (the measured points themselves are deviation
+# coloured); these are the modes whose instance clouds the trench restricts.
+_PC_DEV_MODES = (0, 1)
 # Modes that show the discrete accuracy-class heatmap legend
 _HEATMAP_MODES = (0, 4, 6, 8)
 # Modes that show the continuous deviation-gradient legend
@@ -934,6 +1001,36 @@ def make_mesh_mat(alpha=1.0):
     mat.shader = "defaultLitTransparency"
     mat.base_color = [1, 1, 1, float(alpha)]
     return mat
+
+
+def make_ler_pt_mat(size=6.0, alpha=1.0):
+    """Point material for the LER deviation clouds. A transparency shader with a
+    white base colour preserves the per-point deviation colours while letting
+    the LER-opacity slider fade the cloud, mirroring the mesh material used in
+    the non-deviation modes."""
+    mat = rendering.MaterialRecord()
+    mat.shader = "defaultLitTransparency"
+    mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
+    mat.point_size = size
+    return mat
+
+
+def _trench_colored_pcd(base_pcd, inside_mask, outside_colors):
+    """Inside the trench keep the cloud's deviation colours; outside, restore
+    its original colours (``outside_colors``). Returns the cloud unchanged when
+    no trench is defined (inside_mask is None) or the arrays do not match."""
+    if inside_mask is None:
+        return base_pcd
+    cols = np.asarray(base_pcd.colors)
+    outside = np.asarray(outside_colors)
+    if cols.shape[0] != inside_mask.shape[0] or outside.shape != cols.shape:
+        return base_pcd
+    new_cols = cols.copy()
+    new_cols[~inside_mask] = outside[~inside_mask]
+    out = o3d.geometry.PointCloud()
+    out.points = base_pcd.points
+    out.colors = o3d.utility.Vector3dVector(new_cols)
+    return out
 
 
 # Add dimmed original cloud
@@ -975,6 +1072,24 @@ _crop_mat.shader = "unlitLine"
 _crop_mat.line_width = 2.0
 scene_widget.scene.add_geometry(CROP_GEOM, _crop_ls, _crop_mat)
 
+# Trench outline overlay (only when a trench is defined). Drawn as a closed
+# cyan polygon at ground level, in the same style as the crop region.
+TRENCH_GEOM = "trench_outline"
+if _trench_path_obj is not None:
+    _tv = np.asarray(_trench_path_obj.vertices, dtype=float)
+    if len(_tv) > 1 and np.allclose(_tv[0], _tv[-1]):
+        _tv = _tv[:-1]
+    _tpts = np.column_stack([_tv[:, 0], _tv[:, 1], np.full(len(_tv), GROUND_Z)])
+    _tlines = [[i, (i + 1) % len(_tv)] for i in range(len(_tv))]
+    _trench_ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(_tpts),
+        lines=o3d.utility.Vector2iVector(_tlines))
+    _trench_ls.paint_uniform_color([0.0, 1.0, 1.0])
+    _trench_mat = rendering.MaterialRecord()
+    _trench_mat.shader = "unlitLine"
+    _trench_mat.line_width = 3.0
+    scene_widget.scene.add_geometry(TRENCH_GEOM, _trench_ls, _trench_mat)
+
 # Add LER pipe meshes
 _ler_visible = {}
 for ln, mesh in ler_meshes.items():
@@ -992,15 +1107,21 @@ for ln, mesh in comp_meshes.items():
     _comp_visible[ln] = False
     scene_widget.scene.show_geometry(gn, False)
 
-# Add instance geometries
+# Add instance geometries. Visibility is tracked per instance (ut, index) so the
+# utility filter can isolate a single instance; the class checkboxes and the
+# colour-mode switch read the same dict.
 _inst_gnames = []
-_class_visible = {}
+_inst_visible = {}
 for ut, instances in class_instances.items():
-    _class_visible[ut] = True
     for i, inst in enumerate(instances):
         gn = f"inst_{ut}_{i}"
         _inst_gnames.append((ut, i, gn))
-        scene_widget.scene.add_geometry(gn, inst["pcd_dev"], make_pt_mat(4.0))
+        _inst_visible[(ut, i)] = True
+        # Startup is mode 0 (a deviation mode): inside-trench points get the
+        # deviation colour, outside points keep their original RGB.
+        _init_pcd = _trench_colored_pcd(inst["pcd_dev"], _inst_inside.get((ut, i)),
+                                        np.asarray(inst["pcd_rgb"].colors))
+        scene_widget.scene.add_geometry(gn, _init_pcd, make_pt_mat(4.0))
 
 # Camera
 bounds = scene_widget.scene.bounding_box
@@ -1018,7 +1139,12 @@ def _apply_ler_color_mode(mode):
         gn = f"ler_{ln}"
         scene_widget.scene.remove_geometry(gn)
         if dev_pcds is not None and ln in dev_pcds:
-            scene_widget.scene.add_geometry(gn, dev_pcds[ln], make_pt_mat(6.0))
+            base = dev_pcds[ln]
+            _lcol = LINE_LAYERS.get(ln, {}).get("color", [0.5, 0.5, 0.5])
+            _fb = np.tile(_lcol, (len(np.asarray(base.points)), 1))
+            disp = _trench_colored_pcd(base, _ler_inside.get(ln), _fb)
+            scene_widget.scene.add_geometry(gn, disp,
+                                            make_ler_pt_mat(6.0, _ler_opacity[0]))
         else:
             scene_widget.scene.add_geometry(gn, ler_meshes[ln], make_mesh_mat(_ler_opacity[0]))
         scene_widget.scene.show_geometry(gn, _ler_visible.get(ln, True))
@@ -1027,13 +1153,17 @@ def _apply_ler_color_mode(mode):
 def _apply_color_mode(mode):
     _color_mode[0] = mode
     pcd_key = _MODE_INST_PCD[mode]
+    restrict = mode in _PC_DEV_MODES
     for ut, instances in class_instances.items():
         for i, inst in enumerate(instances):
             gn = f"inst_{ut}_{i}"
             pcd = inst[pcd_key]
+            if restrict:
+                pcd = _trench_colored_pcd(pcd, _inst_inside.get((ut, i)),
+                                          np.asarray(inst["pcd_rgb"].colors))
             scene_widget.scene.remove_geometry(gn)
             scene_widget.scene.add_geometry(gn, pcd, make_pt_mat(4.0))
-            scene_widget.scene.show_geometry(gn, _class_visible.get(ut, True))
+            scene_widget.scene.show_geometry(gn, _inst_visible.get((ut, i), True))
     _apply_ler_color_mode(mode)
     window.post_redraw()
 
@@ -1121,22 +1251,41 @@ crop_cb.checked = True
 crop_cb.set_on_checked(lambda c: (scene_widget.scene.show_geometry(CROP_GEOM, c), window.post_redraw()))
 panel.add_child(crop_cb)
 
+# Trench outline toggle + status (only meaningful when a trench is defined).
+if _trench_path_obj is not None:
+    trench_cb = gui.Checkbox(
+        f"Trench outline ({len(_trench_verts)} pts, {_trench_mode})")
+    trench_cb.checked = True
+    trench_cb.set_on_checked(
+        lambda c: (scene_widget.scene.show_geometry(TRENCH_GEOM, c), window.post_redraw()))
+    panel.add_child(trench_cb)
+else:
+    panel.add_child(gui.Label("Trench: none (whole cloud)"))
+
 # ── Utility filter (per-class view) ──
 panel.add_fixed(int(0.5 * em))
 panel.add_child(gui.Label("Utility filter:"))
 
-# Build filter entries: (label, utility_type or None for "all")
+# Build filter entries: (label, selector). The selector is None for "show all"
+# or an (utility_type, instance_index) pair isolating a single instance. Each
+# instance gets its own entry; a per-class "#k" suffix disambiguates classes
+# that hold more than one instance (e.g. the two TelecomunicationLine clouds).
 _filter_entries = [("All utilities", None)]
-for _fut in sorted(class_summaries.keys()):
+for _fut in sorted(class_instances.keys()):
     _fs = class_summaries[_fut]
+    _instances = class_instances[_fut]
     _ler_names = _get_matching_ler_names(_fut)
-    if _ler_names:
-        _ler_short = ", ".join(sorted(_ler_names))
-        _filter_entries.append((f"{_fs['label']} <-> {_ler_short}", _fut))
-    else:
-        _filter_entries.append((f"{_fs['label']}  (no LER)", _fut))
+    _ler_suffix = (f" <-> {', '.join(sorted(_ler_names))}"
+                   if _ler_names else "  (no LER)")
+    _multi = len(_instances) > 1
+    for _i in range(len(_instances)):
+        _num = f" #{_i + 1}" if _multi else ""
+        _filter_entries.append((f"{_fs['label']}{_num}{_ler_suffix}", (_fut, _i)))
 
 _active_filter = [None]   # None = show all
+# Class-checkbox widgets, populated when the "Instance classes" panel is built;
+# the filter uses these to keep checkbox states truthful.
+_class_checkboxes = {}
 
 filter_combo = gui.Combobox()
 for _flbl, _ in _filter_entries:
@@ -1144,34 +1293,43 @@ for _flbl, _ in _filter_entries:
 filter_combo.selected_index = 0
 
 
-def _apply_utility_filter(filter_ut):
-    """Show/hide instances and LER layers to isolate one utility pair."""
-    _active_filter[0] = filter_ut
-    matching_ler = _get_matching_ler_names(filter_ut) if filter_ut is not None else None
+def _apply_utility_filter(sel):
+    """Show/hide geometry to isolate a single instance, or show everything.
 
-    # Instances: show only the selected utility type (or all)
+    ``sel`` is ``None`` (show all) or an ``(utility_type, index)`` pair. The LER
+    layers shown are those matching the selected instance's utility type."""
+    _active_filter[0] = sel
+    sel_ut = sel[0] if sel is not None else None
+    matching_ler = _get_matching_ler_names(sel_ut) if sel_ut is not None else None
+
+    # Instances: show only the selected one (or all)
     for ut, instances in class_instances.items():
-        vis = (filter_ut is None or ut == filter_ut)
-        _class_visible[ut] = vis
-        for i, inst in enumerate(instances):
-            gn = f"inst_{ut}_{i}"
-            scene_widget.scene.show_geometry(gn, vis)
+        for i in range(len(instances)):
+            vis = (sel is None or (ut, i) == sel)
+            _inst_visible[(ut, i)] = vis
+            scene_widget.scene.show_geometry(f"inst_{ut}_{i}", vis)
 
-    # LER layers: show only those matching the selected utility (or all)
+    # LER layers: show only those matching the selected instance's type (or all)
     for ln in ler_meshes:
-        if filter_ut is None:
+        if sel is None:
             vis = True
         else:
             vis = ln in matching_ler if matching_ler else False
         _ler_visible[ln] = vis
         scene_widget.scene.show_geometry(f"ler_{ln}", vis)
 
+    # Keep the class checkboxes truthful: checked if any of the class's
+    # instances is currently visible.
+    for ut, cb in _class_checkboxes.items():
+        cb.checked = any(_inst_visible[(ut, j)]
+                         for j in range(len(class_instances[ut])))
+
     window.post_redraw()
 
 
 def _on_filter(val, idx):
-    _, filter_ut = _filter_entries[idx]
-    _apply_utility_filter(filter_ut)
+    _, sel = _filter_entries[idx]
+    _apply_utility_filter(sel)
 
 
 filter_combo.set_on_selection_changed(_on_filter)
@@ -1189,12 +1347,14 @@ ler_slider.double_value = 0.6
 
 def _on_ler_opacity(val):
     _ler_opacity[0] = val
-    # In "LER deviation" mode the LER layers are point clouds, not meshes, so
-    # the mesh-opacity material does not apply to them.
-    if _color_mode[0] not in _LER_DEV_MODES:
-        for ln in ler_meshes:
-            if _ler_visible.get(ln, True):
-                scene_widget.scene.modify_geometry_material(f"ler_{ln}", make_mesh_mat(val))
+    # In the LER deviation modes the LER layers are deviation-coloured point
+    # clouds, so the slider fades them via the point material; in the other
+    # modes they are solid meshes faded via the mesh material.
+    in_ler_dev = _color_mode[0] in _LER_DEV_MODES
+    for ln in ler_meshes:
+        if _ler_visible.get(ln, True):
+            mat = make_ler_pt_mat(6.0, val) if in_ler_dev else make_mesh_mat(val)
+            scene_widget.scene.modify_geometry_material(f"ler_{ln}", mat)
     for ln in comp_meshes:
         if _comp_visible.get(ln, False):
             scene_widget.scene.modify_geometry_material(f"comp_{ln}", make_mesh_mat(val))
@@ -1300,9 +1460,9 @@ for ut in sorted(class_summaries.keys()):
 
     def _make_cls_cb(u):
         def _cb(checked):
-            _class_visible[u] = checked
             for _u, _i, gn in _inst_gnames:
                 if _u == u:
+                    _inst_visible[(_u, _i)] = checked
                     scene_widget.scene.show_geometry(gn, checked)
             window.post_redraw()
         return _cb
@@ -1322,6 +1482,7 @@ for ut in sorted(class_summaries.keys()):
     cb = gui.Checkbox(_cls_label)
     cb.checked = True
     cb.set_on_checked(_make_cls_cb(ut))
+    _class_checkboxes[ut] = cb
     row.add_child(sw)
     row.add_fixed(int(0.4 * em))
     row.add_child(cb)
@@ -1330,7 +1491,7 @@ for ut in sorted(class_summaries.keys()):
     stat_box = gui.Vert(0, gui.Margins(int(2.5 * em), 0, 0, 0))
     n_a = s.get("n_active_segs", 0)
     n_i = s.get("n_inactive_segs", 0)
-    if s.get("has_ler", True):
+    if s.get("has_ler", True) and not np.isnan(s["mean"]):
         stat_box.add_child(gui.Label(
             f"{s['n_points']:,} pts  |  LER: {n_a}a {n_i}i"))
         stat_box.add_child(gui.Label(
@@ -1340,6 +1501,10 @@ for ut in sorted(class_summaries.keys()):
             ia = s["inactive_agg"]
             stat_box.add_child(gui.Label(
                 f"active mean {a['mean']*1000:.0f}  |  inactive mean {ia['mean']*1000:.0f} mm"))
+    elif s.get("has_ler", True):
+        stat_box.add_child(gui.Label(
+            f"{s['n_points']:,} pts  |  LER: {n_a}a {n_i}i"))
+        stat_box.add_child(gui.Label("No measured points inside the trench"))
     else:
         stat_box.add_child(gui.Label(f"{s['n_points']:,} pts"))
         stat_box.add_child(gui.Label("No matching LER utility"))
