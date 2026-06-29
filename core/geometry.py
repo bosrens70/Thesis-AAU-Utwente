@@ -195,6 +195,73 @@ def batch_point_to_plane_segments(pts, seg_p1, seg_p2, seg_half_width,
     return min_dists
 
 
+def batch_point_to_plane_segment_components(pts, seg_p1, seg_p2, seg_half_width,
+                                            batch_size=2000):
+    """Like :func:`batch_point_to_plane_segments`, but also returns, per point,
+    the horizontal (XY) and vertical (Z) components of the deviation evaluated
+    at the nearest segment.
+
+    Returns ``(dist, xy, z)`` where ``dist`` matches
+    :func:`batch_point_to_plane_segments` and ``dist == sqrt(xy**2 + z**2)``.
+    For plane segments the XY component is the lateral offset reduced by the
+    half-width (``lat_eff``); for centerline segments it is the horizontal
+    Euclidean component. The vertical component is ``|dz|`` in both cases.
+    """
+    N = len(pts)
+    M = len(seg_p1)
+    if M == 0:
+        inf = np.full(N, np.inf)
+        return inf, inf.copy(), inf.copy()
+
+    min_dists = np.full(N, np.inf)
+    xy_out = np.full(N, np.inf)
+    z_out = np.full(N, np.inf)
+
+    d = seg_p2 - seg_p1
+    seg_len2 = np.einsum('ij,ij->i', d, d)
+    safe = seg_len2 > 1e-12
+
+    d_xy = d.copy()
+    d_xy[:, 2] = 0.0
+    d_xy_len = np.sqrt(np.einsum('ij,ij->i', d_xy, d_xy))
+    has_lateral = d_xy_len > 1e-12
+    lat_dir = np.zeros_like(d)
+    lat_dir[has_lateral, 0] = -d_xy[has_lateral, 1] / d_xy_len[has_lateral]
+    lat_dir[has_lateral, 1] =  d_xy[has_lateral, 0] / d_xy_len[has_lateral]
+
+    hw = seg_half_width
+    is_plane = hw > 1e-9
+
+    for start in range(0, N, batch_size):
+        end = min(start + batch_size, N)
+        p = pts[start:end]
+        B = len(p)
+
+        v = p[:, None, :] - seg_p1[None, :, :]
+        dot_vd = np.einsum('ijk,jk->ij', v, d)
+        t = np.zeros((B, M), dtype=float)
+        t[:, safe] = np.clip(dot_vd[:, safe] / seg_len2[None, safe], 0.0, 1.0)
+        closest = seg_p1[None, :, :] + t[:, :, None] * d[None, :, :]
+        diff = p[:, None, :] - closest
+
+        dz = np.abs(diff[:, :, 2])                                  # (B, M)
+        xy_eucl = np.sqrt(diff[:, :, 0] ** 2 + diff[:, :, 1] ** 2)  # (B, M)
+        lat_comp = np.abs(np.einsum('ijk,jk->ij', diff, lat_dir))  # (B, M)
+        lat_eff = np.maximum(0.0, lat_comp - hw[None, :])          # (B, M)
+        xy_comp = np.where(is_plane[None, :], lat_eff, xy_eucl)     # (B, M)
+        dists2 = np.where(is_plane[None, :],
+                          lat_eff ** 2 + dz ** 2,
+                          xy_eucl ** 2 + dz ** 2)                   # (B, M)
+
+        am = dists2.argmin(axis=1)                                  # (B,)
+        rows = np.arange(B)
+        min_dists[start:end] = np.sqrt(dists2[rows, am])
+        xy_out[start:end] = xy_comp[rows, am]
+        z_out[start:end] = dz[rows, am]
+
+    return min_dists, xy_out, z_out
+
+
 def discretize_segment(p1, p2, radius=0.0, half_width=0.0,
                        length_step=0.02, surface_step=0.02):
     """
