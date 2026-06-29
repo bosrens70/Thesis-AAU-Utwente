@@ -969,10 +969,10 @@ _MODE_NAMES = [
     "LER utility class",                         # 7
     "LER XYZ deviation (discrete)",              # 8
     "LER XYZ deviation (continuous)",            # 9
-    "LER Z deviation (discrete)",                # 10
-    "LER Z deviation (continuous)",              # 11
-    "LER XY deviation (discrete)",               # 12
-    "LER XY deviation (continuous)",             # 13
+    "LER XY deviation (discrete)",               # 10
+    "LER XY deviation (continuous)",             # 11
+    "LER Z deviation (discrete)",                # 12
+    "LER Z deviation (continuous)",              # 13
 ]
 # Instance point cloud shown per mode. In the LER deviation modes the heatmap
 # lives on the LER segments, so the instance points fall back to original RGB.
@@ -986,10 +986,10 @@ _MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont",
 _LER_MODE_PCD = {
     8: ler_pcd_dev,           # XYZ deviation, discrete accuracy-class colours
     9: ler_pcd_dev_cont,      # XYZ deviation, continuous gradient
-    10: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
-    11: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
-    12: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
-    13: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
+    10: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
+    11: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
+    12: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
+    13: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
 # Instance-deviation modes (the measured points themselves are deviation
