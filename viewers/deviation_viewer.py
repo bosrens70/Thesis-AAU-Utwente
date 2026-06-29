@@ -40,6 +40,7 @@ from core.data_loader import (
 )
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
+    batch_point_to_plane_segment_components,
     discretize_segment,
     deviation_to_color, deviation_to_color_continuous, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
@@ -585,14 +586,17 @@ for inst_path in _inst_files:
     _nan_stats = {"mean": np.nan, "median": np.nan, "std": np.nan,
                   "p95": np.nan, "max": np.nan, "min": np.nan, "n_pts": len(pts_inst)}
 
-    # Combined (active + inactive) for heatmap colouring
+    # Combined (active + inactive) for heatmap colouring. The XY and Z
+    # components are taken at the same nearest segment, so XYZ^2 = XY^2 + Z^2.
     if has_ler:
-        dists = batch_point_to_plane_segments(
+        dists, xy_dists, z_dists = batch_point_to_plane_segment_components(
             pts_inst, seg_p1[seg_mask_all], seg_p2[seg_mask_all],
             seg_half_width[seg_mask_all])
         stats = _make_stats(dists)
     else:
         dists = np.full(len(pts_inst), np.nan)
+        xy_dists = np.full(len(pts_inst), np.nan)
+        z_dists = np.full(len(pts_inst), np.nan)
         stats = dict(_nan_stats)
 
     # Separate stats for active / inactive
@@ -627,6 +631,22 @@ for inst_path in _inst_files:
     pcd_dev_cont.colors = o3d.utility.Vector3dVector(
         deviation_to_color_continuous(dists) if has_ler else _grey)
 
+    def _dev_pcd(values, continuous):
+        """Instance cloud coloured by a deviation metric (grey if no LER)."""
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(pts_inst)
+        if has_ler:
+            fn = deviation_to_color_continuous if continuous else deviation_to_color
+            pc.colors = o3d.utility.Vector3dVector(fn(values))
+        else:
+            pc.colors = o3d.utility.Vector3dVector(_grey)
+        return pc
+
+    pcd_dev_xy = _dev_pcd(xy_dists, False)
+    pcd_dev_xy_cont = _dev_pcd(xy_dists, True)
+    pcd_dev_z = _dev_pcd(z_dists, False)
+    pcd_dev_z_cont = _dev_pcd(z_dists, True)
+
     # Original RGB point cloud
     pcd_rgb = o3d.geometry.PointCloud()
     pcd_rgb.points = o3d.utility.Vector3dVector(pts_inst)
@@ -650,6 +670,10 @@ for inst_path in _inst_files:
         "n_inactive_segs": n_inact,
         "pcd_dev": pcd_dev,
         "pcd_dev_cont": pcd_dev_cont,
+        "pcd_dev_xy": pcd_dev_xy,
+        "pcd_dev_xy_cont": pcd_dev_xy_cont,
+        "pcd_dev_z": pcd_dev_z,
+        "pcd_dev_z_cont": pcd_dev_z_cont,
         "pcd_rgb": pcd_rgb,
         "pcd_class": pcd_class,
         "distances": dists,
@@ -935,39 +959,46 @@ ORIG_GEOM = "original_cloud"
 CROP_GEOM = "crop_region"
 _color_mode = [0]
 _MODE_NAMES = [
-    "Point cloud XYZ deviation (discrete)",
-    "Point cloud XYZ deviation (continuous)",
-    "Original RGB",
-    "LER utility class",
-    "LER XYZ deviation (discrete)",
-    "LER XYZ deviation (continuous)",
-    "LER Z deviation (discrete)",
-    "LER Z deviation (continuous)",
-    "LER XY deviation (discrete)",
-    "LER XY deviation (continuous)",
+    "Point cloud XYZ deviation (discrete)",      # 0
+    "Point cloud XYZ deviation (continuous)",    # 1
+    "Point cloud XY deviation (discrete)",       # 2
+    "Point cloud XY deviation (continuous)",     # 3
+    "Point cloud Z deviation (discrete)",        # 4
+    "Point cloud Z deviation (continuous)",      # 5
+    "Original RGB",                              # 6
+    "LER utility class",                         # 7
+    "LER XYZ deviation (discrete)",              # 8
+    "LER XYZ deviation (continuous)",            # 9
+    "LER Z deviation (discrete)",                # 10
+    "LER Z deviation (continuous)",              # 11
+    "LER XY deviation (discrete)",               # 12
+    "LER XY deviation (continuous)",             # 13
 ]
 # Instance point cloud shown per mode. In the LER deviation modes the heatmap
 # lives on the LER segments, so the instance points fall back to original RGB.
-_MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont", "pcd_rgb", "pcd_class",
+_MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont",
+                  "pcd_dev_xy", "pcd_dev_xy_cont",
+                  "pcd_dev_z", "pcd_dev_z_cont",
+                  "pcd_rgb", "pcd_class",
                   "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb"]
 # LER deviation modes: the LER layers become deviation-coloured point clouds.
 # Each maps to the precomputed cloud carrying the right metric + colouring.
 _LER_MODE_PCD = {
-    4: ler_pcd_dev,          # XYZ deviation, discrete accuracy-class colours
-    5: ler_pcd_dev_cont,     # XYZ deviation, continuous gradient
-    6: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
-    7: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
-    8: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
-    9: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
+    8: ler_pcd_dev,           # XYZ deviation, discrete accuracy-class colours
+    9: ler_pcd_dev_cont,      # XYZ deviation, continuous gradient
+    10: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
+    11: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
+    12: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
+    13: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
 # Instance-deviation modes (the measured points themselves are deviation
 # coloured); these are the modes whose instance clouds the trench restricts.
-_PC_DEV_MODES = (0, 1)
+_PC_DEV_MODES = (0, 1, 2, 3, 4, 5)
 # Modes that show the discrete accuracy-class heatmap legend
-_HEATMAP_MODES = (0, 4, 6, 8)
+_HEATMAP_MODES = (0, 2, 4, 8, 10, 12)
 # Modes that show the continuous deviation-gradient legend
-_GRADIENT_MODES = (1, 5, 7, 9)
+_GRADIENT_MODES = (1, 3, 5, 9, 11, 13)
 
 app = gui.Application.instance
 app.initialize()
@@ -1189,7 +1220,7 @@ for n in _MODE_NAMES:
 combo.selected_index = 0
 
 _heatmap_legend = gui.Vert(0)
-_heatmap_legend.add_child(gui.Label("LER Accuracy Class:"))
+_heatmap_legend.add_child(gui.Label("Accuracy class:"))
 for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
     sr, sg, sb = (linear_to_srgb(c) for c in col)
     row = gui.Horiz(int(0.3 * em))
@@ -1206,7 +1237,7 @@ for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
 # Continuous gradient legend: same anchor colours as the accuracy classes, but
 # sampled at intermediate ticks to show the smooth interpolation between them.
 _gradient_legend = gui.Vert(0)
-_gradient_legend.add_child(gui.Label("LER deviation (gradient):"))
+_gradient_legend.add_child(gui.Label("Deviation (gradient):"))
 _grad_ticks_mm = [0, 250, 500, 750, 1000, 1500, 2000]
 _grad_tick_cols = deviation_to_color_continuous(
     np.asarray(_grad_ticks_mm, dtype=float) / 1000.0)
