@@ -23,6 +23,8 @@ import geopandas as gpd
 import numpy as np
 import re
 import time
+from shapely.geometry import LineString as ShapelyLine, Point as ShapelyPoint, box as shapely_box
+from shapely.ops import unary_union
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
@@ -37,6 +39,7 @@ from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
     load_or_pick_ground_level, load_or_pick_trench, trench_path_from_vertices,
     instance_base_name,
+    feature_accuracy_tolerance, accuracy_class_coverage,
 )
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
@@ -45,8 +48,14 @@ from core.geometry import (
     deviation_to_color, deviation_to_color_continuous, linear_to_srgb,
     segment_to_cylinder, segment_to_plane,
     segments_in_rect, point_in_rect, clip_segment_to_rect,
+    accuracy_buffer_polygon, polygon_to_o3d_mesh, polygon_to_o3d_lineset,
+    merge_linesets, drape_z_from_polylines,
 )
 from core.ledningstrace import get_bredde_width
+from core.rendering import (
+    point_material_shaded, point_material_flat, mesh_material, line_material,
+    setup_scene_lighting,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -439,6 +448,132 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
 
 print(f"\n  Total: {sum(comp_stats.values())} component spheres")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3c.  Registered accuracy buffers (noejagtighedsklasse, 2D)
+# ─────────────────────────────────────────────────────────────────────────────
+# For every LER line/component feature that registers an accuracy class, draw a
+# flat 2D buffer around its centerline (a circle around components) whose
+# half-width equals the registered horizontal tolerance, coloured by class. The
+# attribute is checked per feature, so a buffer is built only where this dataset
+# actually records the class. Each feature's buffer sits at its resolved depth.
+print("\n--- Building registered accuracy buffers (noejagtighedsklasse, 2D) ---")
+
+# Crop region as a shapely polygon in local coords (clips every buffer to view).
+if CROP_MODE == "rect":
+    _acc_clip = shapely_box(_rect_min_x, _rect_min_y, _rect_max_x, _rect_max_y)
+else:
+    _acc_clip = ShapelyPoint(_cx, _cy).buffer(CROP_RADIUS)
+
+accbuf_fill = {}     # layer -> merged TriangleMesh (translucent fill)
+accbuf_outline = {}  # layer -> merged LineSet (outline)
+accbuf_stats = {}    # layer -> (n_registered_in_view, n_in_view)
+_acc_cov_rows = []   # (layer, has_column, n_registered_total, n_total)
+
+
+def _store_accbuf(layer_name, fills, outlines, n_reg_view, n_in_view):
+    if fills:
+        m = fills[0]
+        for f in fills[1:]:
+            m += f
+        m.compute_vertex_normals()
+        accbuf_fill[layer_name] = m
+    if outlines:
+        ml = merge_linesets(outlines)
+        if ml is not None:
+            accbuf_outline[layer_name] = ml
+    accbuf_stats[layer_name] = (n_reg_view, n_in_view)
+
+
+# ── Line layers ──────────────────────────────────────────────────────────────
+for layer_name, cfg in list(LINE_LAYERS.items()):
+    # Skip the synthetic per-forsyningsart Ledningstrace sub-layers added above;
+    # the real "Ledningstrace" layer (no parenthesis) is still processed.
+    if layer_name.startswith("Ledningstrace ("):
+        continue
+    try:
+        gdf = gpd.read_file(GML_PATH, layer=layer_name)
+    except Exception:
+        continue
+
+    has_col, n_reg_total, n_total = accuracy_class_coverage(gdf)
+    _acc_cov_rows.append((layer_name, has_col, n_reg_total, n_total))
+    if not has_col:
+        continue
+
+    is_trace = (layer_name == "Ledningstrace")
+    # Group buffers by display name so the utility filter can isolate them. For
+    # Ledningstrace this splits per forsyningsart, keyed identically to the LER
+    # meshes (e.g. "Ledningstrace (Vand)"); other layers form a single group.
+    grp_fills, grp_outlines = {}, {}     # display_name -> [meshes] / [linesets]
+    grp_in_view, grp_reg_view = {}, {}
+    for _, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None:
+            continue
+        subs = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
+        vejl = row.get("vejledendeDybde", None) if "vejledendeDybde" in row.index else None
+
+        if is_trace and "forsyningsart" in row.index:
+            fa = str(row.get("forsyningsart", "") or "").strip()
+            display_name = f"Ledningstrace ({fa})" if fa else "Ledningstrace"
+        elif is_trace:
+            display_name = "Ledningstrace"
+        else:
+            display_name = layer_name
+
+        local_lines = []      # XY arrays for buffering
+        local_lines_xyz = []  # XYZ arrays for draping the buffer onto the depth
+        for sub in subs:
+            cr = np.array(sub.coords, dtype=float)
+            if not _in_crop_utm(cr):
+                continue
+            cl = _to_local(cr, vejl)
+            local_lines.append(cl[:, :2])
+            local_lines_xyz.append(cl)
+        if not local_lines:
+            continue
+        grp_in_view[display_name] = grp_in_view.get(display_name, 0) + 1
+
+        tol = feature_accuracy_tolerance(row)
+        if tol is None:
+            continue                      # in view but accuracy class not registered
+        half_width, cls_idx = tol
+        color = DEVIATION_COLORS[cls_idx - 1]
+        # Drape the flat buffer onto the utility's depth profile: each buffer
+        # vertex takes the Z of the nearest point on the registered centerline.
+        _lines_xyz = local_lines_xyz
+        z = lambda xy, _l=_lines_xyz: drape_z_from_polylines(xy, _l)
+
+        polys = []
+        for ln_xy in local_lines:
+            g = ShapelyPoint(ln_xy[0]) if len(ln_xy) < 2 else ShapelyLine(ln_xy)
+            poly = accuracy_buffer_polygon(g, half_width, _acc_clip)
+            if poly is not None and not poly.is_empty:
+                polys.append(poly)
+        if not polys:
+            continue
+        merged = unary_union(polys)
+        fm = polygon_to_o3d_mesh(merged, z, color)
+        om = polygon_to_o3d_lineset(merged, z, color)
+        if fm is not None:
+            grp_fills.setdefault(display_name, []).append(fm)
+        if om is not None:
+            grp_outlines.setdefault(display_name, []).append(om)
+        grp_reg_view[display_name] = grp_reg_view.get(display_name, 0) + 1
+
+    for dname in set(grp_fills) | set(grp_outlines) | set(grp_in_view):
+        _store_accbuf(dname, grp_fills.get(dname, []), grp_outlines.get(dname, []),
+                      grp_reg_view.get(dname, 0), grp_in_view.get(dname, 0))
+
+# Accuracy buffers are built for line layers only; components are excluded.
+
+print("\n  Registered accuracy class (noejagtighedsklasse) coverage:")
+for _ln, _has, _nreg, _ntot in _acc_cov_rows:
+    status = f"{_nreg}/{_ntot} registered" if _has else "no column"
+    print(f"    {_ln:<32} {status}")
+_n_acc_view = sum(v[0] for v in accbuf_stats.values())
+print(f"  Buffers built for {_n_acc_view} features within the view")
+
 
 def _get_matching_segment_mask(utility_type, active_only=None):
     """Return a boolean mask over seg_p1/seg_p2 for segments matching this utility type.
@@ -483,6 +618,29 @@ def _get_matching_ler_names(utility_type):
             if mapped_line and mapped_line in layers:
                 names.add(layer_name)
     return names
+
+
+def _get_matching_accbuf_keys(utility_type):
+    """Return the accuracy-buffer layer keys that match the given utility type.
+
+    Covers line layers, their components (via COMP_TO_LINE) and Ledningstrace
+    sub-layers whose forsyningsart maps to a matching line, so the utility filter
+    shows only the selected utility's registered-accuracy buffers."""
+    match = UTILITY_TO_LER_MATCH.get(utility_type)
+    if match is None:
+        return set()
+    line_layers = match["layers"]
+    comp_layers = {c for c, pl in COMP_TO_LINE.items() if pl in line_layers}
+    keys = set()
+    for ln in set(accbuf_fill) | set(accbuf_outline):
+        if ln in line_layers or ln in comp_layers:
+            keys.add(ln)
+        elif ln.startswith("Ledningstrace"):
+            fa = ln.split("(")[-1].rstrip(")").strip() if "(" in ln else ""
+            mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
+            if mapped_line and mapped_line in line_layers:
+                keys.add(ln)
+    return keys
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -856,9 +1014,15 @@ LER_LENGTH_STEP = 0.02    # m — sample spacing along each segment
 LER_SURFACE_STEP = 0.02   # m — surface sample spacing (ribbon width / tube ring)
 
 # Instance points each layer is compared against: the union over all utility
-# types whose LER match covers a segment in that layer.
+# types whose LER match covers a segment in that layer. Only utility types with
+# an explicit LER match contribute; unlabelled / unmatched instances (whose
+# match mask would otherwise cover every segment) are skipped so that
+# unsegmented LER layers, e.g. Gasledning or Foeringsroer, get no reference
+# points and therefore no deviation.
 _layer_ref_pts = {}
 for ut, instances in class_instances.items():
+    if UTILITY_TO_LER_MATCH.get(ut) is None:
+        continue
     mask = _get_matching_segment_mask(ut)   # combined active + inactive
     if not mask.any() or not instances:
         continue
@@ -875,6 +1039,12 @@ ler_pcd_zdev = {}         # layer -> PointCloud, |Z| deviation, discrete colours
 ler_pcd_zdev_cont = {}    # layer -> PointCloud, |Z| deviation, continuous colours
 ler_pcd_xydev = {}        # layer -> PointCloud, horizontal deviation, discrete colours
 ler_pcd_xydev_cont = {}   # layer -> PointCloud, horizontal deviation, continuous colours
+# Raw deviation values per layer, retained for the QGIS LAS export (the
+# point clouds above only keep baked colours). None where no measured
+# neighbour exists (no LER match), matching the no-data colouring.
+ler_raw_xyz = {}          # layer -> float array, 3D deviation (m)
+ler_raw_xy = {}           # layer -> float array, horizontal deviation (m)
+ler_raw_z = {}            # layer -> float array, |Z| deviation (m)
 _n_samples_total = 0
 for ln in ler_meshes:
     seg_ids = np.where(_seg_layer_arr == ln)[0]
@@ -888,6 +1058,7 @@ for ln in ler_meshes:
     col_chunks, col_cont_chunks = [], []
     zcol_chunks, zcol_cont_chunks = [], []
     xycol_chunks, xycol_cont_chunks = [], []
+    dev_chunks, zdev_chunks, xydev_chunks = [], [], []
     for idx in seg_ids:
         samp = discretize_segment(
             seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
@@ -908,6 +1079,7 @@ for ln in ler_meshes:
         else:
             cols = np.tile(_NO_DATA_COLOR, (len(samp), 1))
             cols_cont = zcols = zcols_cont = xycols = xycols_cont = cols
+            dev = zdev = xydev = np.full(len(samp), np.nan)
         samp_chunks.append(samp)
         col_chunks.append(cols)
         col_cont_chunks.append(cols_cont)
@@ -915,6 +1087,9 @@ for ln in ler_meshes:
         zcol_cont_chunks.append(zcols_cont)
         xycol_chunks.append(xycols)
         xycol_cont_chunks.append(xycols_cont)
+        dev_chunks.append(dev)
+        zdev_chunks.append(zdev)
+        xydev_chunks.append(xydev)
 
     samp_pts = np.concatenate(samp_chunks)
     _n_samples_total += len(samp_pts)
@@ -931,6 +1106,9 @@ for ln in ler_meshes:
     ler_pcd_zdev_cont[ln] = _make_pc(zcol_cont_chunks)
     ler_pcd_xydev[ln] = _make_pc(xycol_chunks)
     ler_pcd_xydev_cont[ln] = _make_pc(xycol_cont_chunks)
+    ler_raw_xyz[ln] = np.concatenate(dev_chunks)
+    ler_raw_xy[ln] = np.concatenate(xydev_chunks)
+    ler_raw_z[ln] = np.concatenate(zdev_chunks)
 
 print(f"  {_n_samples_total:,} LER samples across {len(ler_pcd_dev)} layers")
 
@@ -1012,26 +1190,29 @@ em = window.theme.font_size
 scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
 scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
-try:
-    scene_widget.scene.view.set_post_processing(True)
-except Exception:
-    pass
-scene_widget.scene.scene.set_sun_light([0, 0, -1], [1, 1, 1], 75000)
-scene_widget.scene.scene.enable_sun_light(True)
+setup_scene_lighting(scene_widget.scene, post_processing=True)
 
 
+# Instance clouds are coloured by deviation / class, so they use the shaded
+# (lit) material for a depth cue; the background RGB cloud uses the flat one.
 def make_pt_mat(size=3.0):
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultLit"
-    mat.point_size = size
-    return mat
+    return point_material_shaded(size)
+
+
+def make_pt_mat_unlit(size=3.0):
+    return point_material_flat(size)
+
+
+def _srgb_to_linear_arr(c):
+    """Vectorised sRGB -> linear. Open3D's Filament renderer treats vertex
+    colours as linear and re-encodes to sRGB for display, so PLY colours (already
+    sRGB) must be linearised first or they render too bright."""
+    c = np.asarray(c, dtype=float)
+    return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
 def make_mesh_mat(alpha=1.0):
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultLitTransparency"
-    mat.base_color = [1, 1, 1, float(alpha)]
-    return mat
+    return mesh_material(alpha)
 
 
 def make_ler_pt_mat(size=6.0, alpha=1.0):
@@ -1064,16 +1245,37 @@ def _trench_colored_pcd(base_pcd, inside_mask, outside_colors):
     return out
 
 
-# Add dimmed original cloud
-_dim = original_colors * 0.35
+# Background original cloud. Dimmed in every mode except "Original RGB", where
+# it is shown at full brightness so the whole scene (trench included) reads in
+# true RGB rather than the darkened backdrop. Colours are linearised so Filament
+# re-encodes them to the original sRGB; the cloud is drawn unlit so it reads flat
+# like a 2D viewer instead of being lit and tonemapped (which looked too bright).
+_orig_lin = _srgb_to_linear_arr(original_colors)
 pcd_dim = o3d.geometry.PointCloud()
 pcd_dim.points = o3d.utility.Vector3dVector(pts_orig)
-pcd_dim.colors = o3d.utility.Vector3dVector(_dim)
+pcd_dim.colors = o3d.utility.Vector3dVector(_orig_lin * 0.35)
+
+pcd_full = o3d.geometry.PointCloud()
+pcd_full.points = o3d.utility.Vector3dVector(pts_orig)
+pcd_full.colors = o3d.utility.Vector3dVector(_orig_lin)
 try:
     pcd_dim.normals = pcd_orig.normals
+    pcd_full.normals = pcd_orig.normals
 except Exception:
     pass
-scene_widget.scene.add_geometry(ORIG_GEOM, pcd_dim, make_pt_mat(2.0))
+
+ORIG_RGB_MODE = 6              # the "Original RGB" colour mode index
+_orig_visible = [True]         # tracks the "Original cloud" checkbox state
+scene_widget.scene.add_geometry(ORIG_GEOM, pcd_dim, make_pt_mat_unlit(2.0))
+
+
+def _apply_orig_cloud_mode(mode):
+    """Show the background cloud at full brightness in Original RGB mode, dimmed
+    otherwise. Preserves the current visibility set by the 'Original cloud' box."""
+    scene_widget.scene.remove_geometry(ORIG_GEOM)
+    base = pcd_full if mode == ORIG_RGB_MODE else pcd_dim
+    scene_widget.scene.add_geometry(ORIG_GEOM, base, make_pt_mat_unlit(2.0))
+    scene_widget.scene.show_geometry(ORIG_GEOM, _orig_visible[0])
 
 # Crop-region wireframe at ground level (same style as base_viewer): the
 # AABB + buffer rectangle that bounds utility selection in rect mode, or the
@@ -1098,9 +1300,7 @@ _crop_ls = o3d.geometry.LineSet(
     points=o3d.utility.Vector3dVector(_crop_pts),
     lines=o3d.utility.Vector2iVector(_crop_lines))
 _crop_ls.paint_uniform_color([1.0, 1.0, 0.0])
-_crop_mat = rendering.MaterialRecord()
-_crop_mat.shader = "unlitLine"
-_crop_mat.line_width = 2.0
+_crop_mat = line_material(2.0)
 scene_widget.scene.add_geometry(CROP_GEOM, _crop_ls, _crop_mat)
 
 # Trench outline overlay (only when a trench is defined). Drawn as a closed
@@ -1116,9 +1316,7 @@ if _trench_path_obj is not None:
         points=o3d.utility.Vector3dVector(_tpts),
         lines=o3d.utility.Vector2iVector(_tlines))
     _trench_ls.paint_uniform_color([0.0, 1.0, 1.0])
-    _trench_mat = rendering.MaterialRecord()
-    _trench_mat.shader = "unlitLine"
-    _trench_mat.line_width = 3.0
+    _trench_mat = line_material(3.0)
     scene_widget.scene.add_geometry(TRENCH_GEOM, _trench_ls, _trench_mat)
 
 # Add LER pipe meshes
@@ -1137,6 +1335,102 @@ for ln, mesh in comp_meshes.items():
     scene_widget.scene.add_geometry(gn, mesh, make_mesh_mat(0.6))
     _comp_visible[ln] = False
     scene_widget.scene.show_geometry(gn, False)
+
+# Registered accuracy buffers (noejagtighedsklasse, 2D), hidden by default.
+ACC_FILL_PREFIX = "accfill_"
+ACC_OUT_PREFIX = "accout_"
+_acc_show = [False]        # master toggle for the buffers
+_acc_fill_show = [True]    # fill on/off (outline always shown when buffers are on)
+# Per-layer buffer visibility, driven by the utility filter (all visible = show
+# everything the master toggle allows).
+_acc_layer_vis = {ln: True for ln in set(accbuf_fill) | set(accbuf_outline)}
+_acc_outline_mat = line_material(2.0)
+# Dash pattern (metres) for the accuracy-buffer outlines, so they read as
+# dashed and are easy to tell apart from the solid utility lines. Open3D's line
+# shader has no dash support, so each outline edge is broken into short dash
+# segments with gaps. Each accuracy class gets its own (dash, gap) pattern so
+# the five classes are tellable apart by line style as well as by colour; the
+# pattern lengthens with class (class 1 finest, class 5 coarsest).
+ACC_DASH_BY_CLASS = {
+    1: (0.10, 0.10),
+    2: (0.20, 0.15),
+    3: (0.35, 0.20),
+    4: (0.55, 0.30),
+    5: (0.80, 0.40),
+}
+ACC_DASH_DEFAULT = (0.20, 0.15)
+_CLASS_COLORS = [np.asarray(c, dtype=float) for c in DEVIATION_COLORS]
+
+
+def _dash_params_for_color(col):
+    """Dash and gap length (metres) for an outline line, chosen by its accuracy
+    class. The class is identified by matching the line colour to the class
+    palette; falls back to a default pattern if no class matches."""
+    if col is not None:
+        for idx, cc in enumerate(_CLASS_COLORS):
+            if np.allclose(col, cc, atol=1e-3):
+                return ACC_DASH_BY_CLASS[idx + 1]
+    return ACC_DASH_DEFAULT
+
+
+def _dash_lineset(ls):
+    """Return a dashed copy of a LineSet by splitting each edge into on/off
+    segments. The pattern depends on the line's accuracy class (class 1 differs
+    from the rest), and the per-line colour is preserved."""
+    pts = np.asarray(ls.points)
+    lines = np.asarray(ls.lines)
+    if len(pts) == 0 or len(lines) == 0:
+        return ls
+    cols = np.asarray(ls.colors)
+    has_cols = len(cols) == len(lines)
+    new_pts, new_lines, new_cols = [], [], []
+    for li in range(len(lines)):
+        a, b = lines[li]
+        col = cols[li] if has_cols else None
+        dash, gap = _dash_params_for_color(col)
+        period = dash + gap
+        p0, p1 = pts[a], pts[b]
+        seg = p1 - p0
+        length = float(np.linalg.norm(seg))
+        if length < 1e-9:
+            continue
+        direction = seg / length
+        t = 0.0
+        while t < length:
+            t_end = min(t + dash, length)
+            i = len(new_pts)
+            new_pts.append(p0 + direction * t)
+            new_pts.append(p0 + direction * t_end)
+            new_lines.append([i, i + 1])
+            if col is not None:
+                new_cols.append(col)
+            t += period
+    out = o3d.geometry.LineSet()
+    out.points = o3d.utility.Vector3dVector(np.asarray(new_pts, dtype=float))
+    out.lines = o3d.utility.Vector2iVector(np.asarray(new_lines, dtype=np.int32))
+    if new_cols and len(new_cols) == len(new_lines):
+        out.colors = o3d.utility.Vector3dVector(np.asarray(new_cols, dtype=float))
+    return out
+
+
+for ln, mesh in accbuf_fill.items():
+    scene_widget.scene.add_geometry(ACC_FILL_PREFIX + ln, mesh, make_mesh_mat(0.30))
+    scene_widget.scene.show_geometry(ACC_FILL_PREFIX + ln, False)
+for ln, ls in accbuf_outline.items():
+    scene_widget.scene.add_geometry(ACC_OUT_PREFIX + ln, _dash_lineset(ls), _acc_outline_mat)
+    scene_widget.scene.show_geometry(ACC_OUT_PREFIX + ln, False)
+
+
+def _update_acc_buffers():
+    """Apply the master toggle, fill toggle and per-layer (filter) visibility."""
+    show = _acc_show[0]
+    for ln in accbuf_fill:
+        vis = show and _acc_fill_show[0] and _acc_layer_vis.get(ln, True)
+        scene_widget.scene.show_geometry(ACC_FILL_PREFIX + ln, vis)
+    for ln in accbuf_outline:
+        vis = show and _acc_layer_vis.get(ln, True)
+        scene_widget.scene.show_geometry(ACC_OUT_PREFIX + ln, vis)
+    window.post_redraw()
 
 # Add instance geometries. Visibility is tracked per instance (ut, index) so the
 # utility filter can isolate a single instance; the class checkboxes and the
@@ -1196,6 +1490,7 @@ def _apply_color_mode(mode):
             scene_widget.scene.add_geometry(gn, pcd, make_pt_mat(4.0))
             scene_widget.scene.show_geometry(gn, _inst_visible.get((ut, i), True))
     _apply_ler_color_mode(mode)
+    _apply_orig_cloud_mode(mode)
     window.post_redraw()
 
 
@@ -1273,7 +1568,15 @@ panel.add_fixed(int(0.5 * em))
 # Original cloud toggle
 orig_cb = gui.Checkbox("Original cloud")
 orig_cb.checked = True
-orig_cb.set_on_checked(lambda c: (scene_widget.scene.show_geometry(ORIG_GEOM, c), window.post_redraw()))
+
+
+def _on_orig(c):
+    _orig_visible[0] = c
+    scene_widget.scene.show_geometry(ORIG_GEOM, c)
+    window.post_redraw()
+
+
+orig_cb.set_on_checked(_on_orig)
 panel.add_child(orig_cb)
 
 # Crop-region toggle (XY AABB + buffer rectangle in rect mode)
@@ -1292,6 +1595,30 @@ if _trench_path_obj is not None:
     panel.add_child(trench_cb)
 else:
     panel.add_child(gui.Label("Trench: none (whole cloud)"))
+
+# Registered accuracy buffer toggle (noejagtighedsklasse, 2D).
+if accbuf_fill or accbuf_outline:
+    acc_cb = gui.Checkbox(f"Accuracy buffer 2D ({_n_acc_view} feats)")
+    acc_cb.checked = False
+
+    def _on_acc(c):
+        _acc_show[0] = c
+        _update_acc_buffers()
+
+    acc_cb.set_on_checked(_on_acc)
+    panel.add_child(acc_cb)
+
+    accfill_cb = gui.Checkbox("   buffer fill")
+    accfill_cb.checked = True
+
+    def _on_acc_fill(c):
+        _acc_fill_show[0] = c
+        _update_acc_buffers()
+
+    accfill_cb.set_on_checked(_on_acc_fill)
+    panel.add_child(accfill_cb)
+else:
+    panel.add_child(gui.Label("Accuracy buffer: none registered"))
 
 # ── Utility filter (per-class view) ──
 panel.add_fixed(int(0.5 * em))
@@ -1349,6 +1676,15 @@ def _apply_utility_filter(sel):
         _ler_visible[ln] = vis
         scene_widget.scene.show_geometry(f"ler_{ln}", vis)
 
+    # Accuracy buffers follow the same per-utility matching as the LER layers.
+    matching_acc = _get_matching_accbuf_keys(sel_ut) if sel_ut is not None else None
+    for ln in _acc_layer_vis:
+        if sel is None:
+            _acc_layer_vis[ln] = True
+        else:
+            _acc_layer_vis[ln] = ln in matching_acc if matching_acc else False
+    _update_acc_buffers()
+
     # Keep the class checkboxes truthful: checked if any of the class's
     # instances is currently visible.
     for ut, cb in _class_checkboxes.items():
@@ -1395,6 +1731,50 @@ def _on_ler_opacity(val):
 ler_slider.set_on_value_changed(_on_ler_opacity)
 ler_row.add_child(ler_slider)
 panel.add_child(ler_row)
+
+# Export the trench-restricted discrete LER deviation modes (XYZ, XY, Z) to LAS
+# for QGIS. Only the samples inside the picked trench are written; with no
+# trench the whole LER cloud is exported.
+panel.add_fixed(int(0.3 * em))
+_export_status = gui.Label("")
+
+
+def _on_export_ler_las():
+    from core.ler_las_export import export_ler_deviation_las
+    out_dir = _ply_path.parent / f"{_ply_path.stem}_LER_deviation_LAS"
+    # Export only the LER layers currently shown in the deviation colour mode:
+    # visible in the LER layers panel and passing the utility filter. Layers
+    # with no computed deviation (unsegmented) are further dropped in the
+    # exporter via the NaN filter, so the LAS matches the on-screen discrete
+    # deviation mode exactly.
+    export_layers = [ln for ln in ler_pcd_dev if _ler_visible.get(ln, True)]
+    samples_by_layer = {ln: np.asarray(ler_pcd_dev[ln].points)
+                        for ln in export_layers}
+    raw_by_metric = {"xyz": ler_raw_xyz, "xy": ler_raw_xy, "z": ler_raw_z}
+    print(f"\nExporting LER deviation LAS to {out_dir} ...")
+    print(f"  Visible layers to export ({len(export_layers)}): "
+          f"{', '.join(export_layers) if export_layers else '(none)'}")
+    try:
+        written = export_ler_deviation_las(
+            _ply_path.stem, out_dir, (TX, TY, TZ),
+            samples_by_layer, raw_by_metric, _ler_inside)
+    except Exception as exc:
+        print(f"  [ERROR] export failed: {exc}")
+        _export_status.text = f"Export failed: {exc}"
+        window.post_redraw()
+        return
+    if written:
+        las_n = sum(1 for p in written if p.suffix == ".las")
+        _export_status.text = f"Exported {las_n} LAS to {out_dir.name}"
+    else:
+        _export_status.text = "Nothing to export (no in-trench LER samples)"
+    window.post_redraw()
+
+
+_export_btn = gui.Button("Export LER deviation to LAS (QGIS)")
+_export_btn.set_on_clicked(_on_export_ler_las)
+panel.add_child(_export_btn)
+panel.add_child(_export_status)
 
 # LER layer toggles
 panel.add_fixed(int(0.3 * em))
@@ -1518,28 +1898,6 @@ for ut in sorted(class_summaries.keys()):
     row.add_fixed(int(0.4 * em))
     row.add_child(cb)
     panel.add_child(row)
-
-    stat_box = gui.Vert(0, gui.Margins(int(2.5 * em), 0, 0, 0))
-    n_a = s.get("n_active_segs", 0)
-    n_i = s.get("n_inactive_segs", 0)
-    if s.get("has_ler", True) and not np.isnan(s["mean"]):
-        stat_box.add_child(gui.Label(
-            f"{s['n_points']:,} pts  |  LER: {n_a}a {n_i}i"))
-        stat_box.add_child(gui.Label(
-            f"mean {s['mean']*1000:.1f}  |  P95 {s['p95']*1000:.1f}  |  max {s['max']*1000:.1f} mm"))
-        if s.get("active_agg") and s.get("inactive_agg"):
-            a = s["active_agg"]
-            ia = s["inactive_agg"]
-            stat_box.add_child(gui.Label(
-                f"active mean {a['mean']*1000:.0f}  |  inactive mean {ia['mean']*1000:.0f} mm"))
-    elif s.get("has_ler", True):
-        stat_box.add_child(gui.Label(
-            f"{s['n_points']:,} pts  |  LER: {n_a}a {n_i}i"))
-        stat_box.add_child(gui.Label("No measured points inside the trench"))
-    else:
-        stat_box.add_child(gui.Label(f"{s['n_points']:,} pts"))
-        stat_box.add_child(gui.Label("No matching LER utility"))
-    panel.add_child(stat_box)
     panel.add_fixed(int(0.3 * em))
 
 panel.add_stretch()
@@ -1557,6 +1915,22 @@ def _pivot_to(pt):
     scene_widget.look_at(pt.tolist(), eye.tolist(), [0, 0, 1])
 
 
+def _top_view():
+    """Bird's-eye view looking straight down, framed on the trench footprint
+    when one is defined, otherwise on the whole scene."""
+    if _trench_path_obj is not None:
+        v = np.asarray(_trench_path_obj.vertices, dtype=float)
+        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
+        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
+        cz = float(GROUND_Z)
+    else:
+        cx, cy, cz = (float(cloud_centroid[0]), float(cloud_centroid[1]),
+                      float(cloud_centroid[2]))
+        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+    h = max(1.0, span) * 1.2
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+
+
 def on_key(event):
     if event.type != gui.KeyEvent.DOWN:
         return IGNORED
@@ -1564,8 +1938,11 @@ def on_key(event):
     if k in (ord('C'), ord('c')):
         _pivot_to(cloud_centroid)
         return HANDLED
+    if k in (ord('T'), ord('t')):
+        _top_view()
+        return HANDLED
     if k in (ord('H'), ord('h')):
-        print("\n  C   pivot to centroid    H   help\n")
+        print("\n  C   pivot to centroid    T   top view of trench    H   help\n")
         return HANDLED
     return IGNORED
 
