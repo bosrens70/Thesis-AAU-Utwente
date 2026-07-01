@@ -8,6 +8,7 @@ return Open3D geometry objects or numpy arrays.
 
 import open3d as o3d
 import numpy as np
+from shapely.ops import triangulate
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -584,3 +585,180 @@ def fit_plane_z(points, n_robust_iters=3, reject_sigma=2.0):
         mask = new_mask
 
     return coeffs, mask
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2D ACCURACY BUFFER (noejagtighedsklasse) — flat polygons around the centerline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def drape_z_from_polylines(query_xy, polylines_xyz):
+    """Z for each XY query point, taken from the nearest point on the centerline.
+
+    Each query point is projected (in XY) onto the nearest segment of the given
+    3D polylines, and Z is linearly interpolated along that segment. This lets a
+    flat 2D buffer be draped onto the depth profile of the utility it surrounds.
+
+    ``polylines_xyz`` is a list of ``(M, 3)`` arrays (the feature's centerline,
+    possibly several sub-lines). Returns a ``(N,)`` Z array. Falls back to zeros
+    when no usable segment is supplied.
+    """
+    query_xy = np.asarray(query_xy, dtype=float)
+    p1s, p2s = [], []
+    for pl in polylines_xyz:
+        pl = np.asarray(pl, dtype=float)
+        if len(pl) >= 2:
+            p1s.append(pl[:-1])
+            p2s.append(pl[1:])
+        elif len(pl) == 1:
+            p1s.append(pl[:1])
+            p2s.append(pl[:1])
+    if not p1s:
+        return np.zeros(len(query_xy))
+    p1 = np.vstack(p1s)
+    p2 = np.vstack(p2s)
+    d_xy = p2[:, :2] - p1[:, :2]
+    seg_len2 = np.einsum('ij,ij->i', d_xy, d_xy)
+    safe = seg_len2 > 1e-12
+
+    N = len(query_xy)
+    K = len(p1)
+    z_out = np.zeros(N)
+    BATCH = 4000
+    for s in range(0, N, BATCH):
+        q = query_xy[s:s + BATCH]
+        v = q[:, None, :] - p1[None, :, :2]                  # (B, K, 2)
+        dot = np.einsum('bkj,kj->bk', v, d_xy)               # (B, K)
+        t = np.zeros((len(q), K))
+        t[:, safe] = np.clip(dot[:, safe] / seg_len2[None, safe], 0.0, 1.0)
+        closest = p1[None, :, :2] + t[:, :, None] * d_xy[None, :, :]
+        diff = q[:, None, :] - closest
+        d2 = np.einsum('bkj,bkj->bk', diff, diff)            # (B, K)
+        am = d2.argmin(axis=1)
+        rows = np.arange(len(q))
+        tt = t[rows, am]
+        z_out[s:s + len(q)] = p1[am, 2] + tt * (p2[am, 2] - p1[am, 2])
+    return z_out
+
+
+def _vertex_z(xy, z):
+    """Resolve a per-vertex Z array for ``xy`` (N, 2). ``z`` is either a scalar
+    height or a callable ``f(xy) -> (N,)`` (e.g. :func:`drape_z_from_polylines`)."""
+    if callable(z):
+        return np.asarray(z(np.asarray(xy, dtype=float)), dtype=float)
+    return np.full(len(xy), float(z), dtype=float)
+
+
+def accuracy_buffer_polygon(geom_xy, half_width, clip_poly=None):
+    """Flat 2D buffer of ``half_width`` metres around a centerline or point.
+
+    ``geom_xy`` is a shapely ``LineString`` (utility centerline) or ``Point``
+    (component) in local XY. Returns the buffered shapely polygon, optionally
+    intersected with ``clip_poly`` (the crop region), or ``None`` when empty.
+    """
+    if half_width is None or half_width <= 0:
+        return None
+    poly = geom_xy.buffer(float(half_width))
+    if clip_poly is not None:
+        poly = poly.intersection(clip_poly)
+    if poly.is_empty:
+        return None
+    return poly
+
+
+def _polygon_parts(poly):
+    """Return the Polygon parts of a (Multi)Polygon / GeometryCollection."""
+    gt = poly.geom_type
+    if gt == "Polygon":
+        return [poly]
+    if gt in ("MultiPolygon", "GeometryCollection"):
+        return [g for g in poly.geoms if g.geom_type == "Polygon"]
+    return []
+
+
+def polygon_to_o3d_mesh(poly, z, color):
+    """Triangulate a shapely polygon into an Open3D mesh.
+
+    ``z`` is either a scalar height (flat polygon) or a callable ``f(xy) -> (N,)``
+    that supplies a Z per vertex (e.g. :func:`drape_z_from_polylines` to drape the
+    buffer onto a utility's depth profile). Triangles whose representative point
+    falls outside the polygon are dropped, so concave buffers and holes render
+    correctly. Returns ``None`` when nothing triangulates.
+    """
+    verts_xy = []
+    tris = []
+    for part in _polygon_parts(poly):
+        for tri in triangulate(part):
+            if not part.contains(tri.representative_point()):
+                continue
+            coords = list(tri.exterior.coords)[:3]
+            base = len(verts_xy)
+            verts_xy.extend(coords)
+            tris.append([base, base + 1, base + 2])
+    if not tris:
+        return None
+    verts_xy = np.asarray(verts_xy, dtype=float)
+    zc = _vertex_z(verts_xy, z)
+    verts = np.column_stack([verts_xy, zc])
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(verts),
+        o3d.utility.Vector3iVector(np.asarray(tris, dtype=np.int32)))
+    mesh.paint_uniform_color(color)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def polygon_to_o3d_lineset(poly, z, color):
+    """Outline of a shapely polygon (exterior + holes) as an Open3D LineSet.
+
+    ``z`` is either a scalar height or a callable ``f(xy) -> (N,)`` (see
+    :func:`polygon_to_o3d_mesh`). Returns ``None`` when the polygon has no rings.
+    """
+    pts_xy = []
+    lines = []
+    for part in _polygon_parts(poly):
+        for ring in [part.exterior, *part.interiors]:
+            coords = list(ring.coords)
+            if len(coords) < 2:
+                continue
+            base = len(pts_xy)
+            pts_xy.extend(coords)
+            for i in range(len(coords) - 1):
+                lines.append([base + i, base + i + 1])
+    if not lines:
+        return None
+    pts_xy = np.asarray(pts_xy, dtype=float)
+    zc = _vertex_z(pts_xy, z)
+    pts = np.column_stack([pts_xy, zc])
+    ls = o3d.geometry.LineSet(
+        o3d.utility.Vector3dVector(pts),
+        o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32)))
+    ls.paint_uniform_color(color)
+    return ls
+
+
+def merge_linesets(linesets):
+    """Combine several LineSets into one (Open3D LineSet has no ``+`` operator).
+
+    Per-vertex colours are preserved when every input carries them. Returns
+    ``None`` when there are no lines to merge.
+    """
+    pts = []
+    lines = []
+    cols = []
+    have_cols = bool(linesets) and all(ls.has_colors() for ls in linesets)
+    for ls in linesets:
+        p = np.asarray(ls.points)
+        l = np.asarray(ls.lines)
+        base = len(pts)
+        pts.extend(p.tolist())
+        lines.extend((l + base).tolist())
+        if have_cols:
+            cols.extend(np.asarray(ls.colors).tolist())
+    if not lines:
+        return None
+    out = o3d.geometry.LineSet(
+        o3d.utility.Vector3dVector(np.asarray(pts, dtype=float)),
+        o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32)))
+    if have_cols and cols:
+        out.colors = o3d.utility.Vector3dVector(np.asarray(cols, dtype=float))
+    return out
