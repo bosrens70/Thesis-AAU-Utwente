@@ -40,6 +40,10 @@ from core.config import (
 )
 from core.gui_helpers import make_legend_row
 from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear
+from core.rendering import (
+    point_material_flat, mesh_material, line_material, flat_material,
+    setup_scene_lighting,
+)
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # Buffer (metres) around the Graveforesp polygon
@@ -1058,23 +1062,16 @@ frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
 # 10.  Material helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultLitTransparency"
-    mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
-    return mat
+    return mesh_material(alpha)
 
 
 def make_point_material() -> rendering.MaterialRecord:
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultUnlit"
-    mat.point_size = 2.0
-    return mat
+    # RGB cloud, rendered flat (unlit) for faithful colour.
+    return point_material_flat(2.0)
 
 
 def make_frame_material() -> rendering.MaterialRecord:
-    mat = rendering.MaterialRecord()
-    mat.shader = "defaultUnlit"
-    return mat
+    return flat_material()
 
 
 def linear_to_srgb(c: float) -> float:
@@ -1128,13 +1125,9 @@ scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
 scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
 
-# Gentle top-down sun light for subtle depth shading on utility meshes
-scene_widget.scene.scene.set_sun_light(
-    [0.0, 0.0, -1.0],        # direction: straight down
-    [1.0, 1.0, 1.0],         # white colour
-    75000,                    # intensity
-)
-scene_widget.scene.scene.enable_sun_light(True)
+# Top-down sun light for subtle depth shading on utility meshes; post-processing
+# is left at the default so the flat RGB cloud is not tonemapped.
+setup_scene_lighting(scene_widget.scene)
 
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, merged_pcd, make_point_material())
@@ -1146,9 +1139,7 @@ scene_widget.scene.add_geometry(
 )
 
 # Add Graveforesp wireframe
-line_mat = rendering.MaterialRecord()
-line_mat.shader = "unlitLine"
-line_mat.line_width = 3.0
+line_mat = line_material(3.0)
 scene_widget.scene.add_geometry(GRAVE_WIRE_GEOM, grave_ls, line_mat)
 
 # Add utility line layers
@@ -1574,8 +1565,7 @@ def _place_highlight(centre: np.ndarray):
     marker.translate(centre)
     marker.paint_uniform_color([1.0, 1.0, 0.0])
     marker.compute_vertex_normals()
-    marker_mat = rendering.MaterialRecord()
-    marker_mat.shader = "defaultUnlit"
+    marker_mat = flat_material()
     scene_widget.scene.add_geometry(HIGHLIGHT_GEOM, marker, marker_mat)
     window.post_redraw()
 
@@ -1798,6 +1788,16 @@ def _pivot_to(point: np.ndarray):
     print(f"  Pivot -> [{point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}]")
 
 
+def _top_view():
+    """Bird's-eye view looking straight down, framed on the whole scene. This
+    viewer spans multiple sites, so there is no single trench to frame."""
+    cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
+    cz = float(cloud_centroid[2])
+    span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+    h = max(1.0, span) * 1.2
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 15.  Key callbacks
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1839,6 +1839,9 @@ def on_key(event):
     if k == ord('0'):
         _pivot_to(origin_pt)
         return HANDLED
+    if k in (ord('T'), ord('t')):
+        _top_view()
+        return HANDLED
 
     if k in (ord('H'), ord('h')):
         print("\n-- Shortcuts ---------------------------------------------------")
@@ -1846,6 +1849,7 @@ def on_key(event):
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  0              pivot to world origin (0, 0, 0)")
+        print("  T              top view of scene")
         print("  ]              increase all utility opacities +0.05")
         print("  [              decrease all utility opacities -0.05")
         print("  L              toggle class label colours on/off")
