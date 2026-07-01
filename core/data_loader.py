@@ -22,6 +22,7 @@ from core.config import (
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
+    ACCURACY_CLASS_FIELD, accuracy_class_halfwidth,
 )
 
 
@@ -544,6 +545,42 @@ def extract_row_attrs(row):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 7b. REGISTERED ACCURACY CLASS (noejagtighedsklasse) — per feature / per dataset
+# ─────────────────────────────────────────────────────────────────────────────
+# These helpers never assume which layers carry the accuracy class. The presence
+# of the attribute is checked per feature (feature_accuracy_tolerance) and per
+# layer (accuracy_class_coverage), so a viewer applies the registered class only
+# where a given LER dataset actually records it.
+
+def feature_accuracy_tolerance(row):
+    """2D accuracy tolerance for one GML feature from its registered accuracy
+    class, or ``None`` when not registered.
+
+    Checks the ``noejagtighedsklasse`` attribute *for this feature*: returns
+    ``None`` when the column is absent on the layer or the value is empty /
+    unparseable. Returns ``(half_width_m, class_idx)`` otherwise.
+    """
+    if ACCURACY_CLASS_FIELD not in row.index:
+        return None
+    return accuracy_class_halfwidth(row.get(ACCURACY_CLASS_FIELD))
+
+
+def accuracy_class_coverage(gdf):
+    """Registered-accuracy coverage for one GeoDataFrame.
+
+    Returns ``(has_column, n_registered, n_total)`` where ``n_registered`` counts
+    features whose accuracy class parses. Lets a caller report, per dataset, which
+    layers actually carry the class and how complete it is.
+    """
+    n_total = len(gdf)
+    if ACCURACY_CLASS_FIELD not in gdf.columns:
+        return False, 0, n_total
+    n_reg = int(sum(accuracy_class_halfwidth(v) is not None
+                    for v in gdf[ACCURACY_CLASS_FIELD]))
+    return True, n_reg, n_total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 8. MASTER INIT
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -816,3 +853,23 @@ def trench_path_from_vertices(vertices, mode="hull"):
         except Exception as exc:
             print(f"[WARN] Convex hull failed ({exc}); using pick order.")
     return mpath.Path(pts)
+
+
+def load_trench(ply_path):
+    """Read the cached trench footprint for a site without prompting to pick.
+
+    Returns a matplotlib ``Path`` (the footprint polygon) when
+    ``<stem>_trench.json`` exists and is valid, otherwise ``None``. This is the
+    read-only counterpart to :func:`load_or_pick_trench`, for viewers that want
+    to frame or display the trench but must never trigger an interactive pick.
+    """
+    sidecar = _site_sidecar(ply_path, "trench")
+    if not sidecar.is_file():
+        return None
+    try:
+        data = json.loads(sidecar.read_text())
+        return trench_path_from_vertices(data.get("vertices"),
+                                         data.get("mode", "hull"))
+    except Exception as exc:
+        print(f"[WARN] Could not read {sidecar.name}: {exc}")
+        return None
