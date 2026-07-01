@@ -44,3 +44,4 @@ Thumbs.db
 .DS_Store
 *.tex
 make_ler_appendix.py
+*.docx
