@@ -35,8 +35,9 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     forsyningsart_color,
 )
-from core.data_loader import init_site, load_or_pick_ground_level
+from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
+from core.rendering import point_material_flat, mesh_material, setup_scene_lighting
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,20 +445,15 @@ scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
 scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
 
-# Sun light
-scene_widget.scene.scene.set_sun_light([0.0, 0.0, -1.0], [1.0, 1.0, 1.0], 75000)
-scene_widget.scene.scene.enable_sun_light(True)
+# Sun light for the lit utility meshes; post-processing left at the default.
+setup_scene_lighting(scene_widget.scene)
 
-# Add point cloud
-mat_pt = rendering.MaterialRecord()
-mat_pt.shader = "defaultUnlit"
-mat_pt.point_size = 3.0
+# Add point cloud (RGB, rendered flat / unlit)
+mat_pt = point_material_flat(3.0)
 scene_widget.scene.add_geometry("point_cloud", pcd, mat_pt)
 
 # Add utility meshes
-mat_mesh = rendering.MaterialRecord()
-mat_mesh.shader = "defaultLitTransparency"
-mat_mesh.base_color = [1.0, 1.0, 1.0, 0.8]
+mat_mesh = mesh_material(0.8)
 for layer_name, mesh in _util_meshes.items():
     scene_widget.scene.add_geometry(f"util_{layer_name}", mesh, mat_mesh)
 
@@ -595,6 +591,24 @@ def zoom_to_point_cloud():
     d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
     eye = cloud_centroid + np.array([d, -d, d * 0.6])
     scene_widget.look_at(cloud_centroid.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+
+
+_trench_path = load_trench(_ply_path)
+
+
+def top_view():
+    """Bird's-eye view looking straight down, framed on the trench footprint
+    when one is defined, otherwise on the whole scene."""
+    if _trench_path is not None:
+        v = np.asarray(_trench_path.vertices, dtype=float)
+        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
+        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
+    else:
+        cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
+        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+    cz = float(cloud_centroid[2])
+    h = max(1.0, span) * 1.2
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
 
 
 def get_visible_layers():
@@ -759,9 +773,13 @@ def on_key(event):
     if k in (ord('C'), ord('c')):
         zoom_to_point_cloud()
         return HANDLED
+    if k in (ord('T'), ord('t')):
+        top_view()
+        return HANDLED
     if k in (ord('H'), ord('h')):
         print("\n-- Agent Viewer Shortcuts ---------------------------------------")
         print("  C              pivot to point cloud centroid")
+        print("  T              top view of trench (or scene if none)")
         print("  H              show this help")
         print("  Type a question and press Ask or Enter")
         print("----------------------------------------------------------------\n")
