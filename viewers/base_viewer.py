@@ -35,8 +35,12 @@ from core.config import (
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG, DEPTH_STATS_KEY as _STATS_KEY,
     forsyningsart_color,
 )
-from core.data_loader import init_site, load_or_pick_ground_level
+from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import segments_in_rect, point_in_rect, clip_segment_to_rect
+from core.rendering import (
+    point_material_shaded, mesh_material, line_material, flat_material,
+    setup_scene_lighting,
+)
 from core.gui_helpers import make_legend_row
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
@@ -766,26 +770,18 @@ bbox_ls.paint_uniform_color([1.0, 1.0, 0.0])
 # 8.  Material helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
-    mat            = rendering.MaterialRecord()
-    mat.shader     = "defaultLitTransparency"
-    mat.base_color = [1.0, 1.0, 1.0, float(alpha)]
-    return mat
+    return mesh_material(alpha)
 
 
 def make_point_material() -> rendering.MaterialRecord:
-    # `defaultLit` + estimated normals + SSAO post-processing is the closest
-    # Open3D equivalent to an EDL shader. Points near geometric ridges end
-    # up darker, giving a strong depth cue for the class-coloured cloud.
-    mat            = rendering.MaterialRecord()
-    mat.shader     = "defaultLit"
-    mat.point_size = 3.0
-    return mat
+    # Shaded (defaultLit) + estimated normals + SSAO post-processing is the
+    # closest Open3D equivalent to an EDL shader. Points near geometric ridges
+    # end up darker, giving a depth cue for the class-coloured cloud.
+    return point_material_shaded(3.0)
 
 
 def make_frame_material() -> rendering.MaterialRecord:
-    mat        = rendering.MaterialRecord()
-    mat.shader = "defaultUnlit"
-    return mat
+    return flat_material()
 
 
 def linear_to_srgb(c: float) -> float:
@@ -837,19 +833,8 @@ scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
 scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
 
-# Enable post-processing (SSAO + tone-mapping)
-try:
-    scene_widget.scene.view.set_post_processing(True)
-except Exception as _e:
-    print(f"  [warn] could not enable post-processing: {_e}")
-
-# Top-down directional sun light for utility mesh shading
-scene_widget.scene.scene.set_sun_light(
-    [0.0, 0.0, -1.0],        # direction: straight down
-    [1.0, 1.0, 1.0],         # white colour
-    75000,                    # intensity
-)
-scene_widget.scene.scene.enable_sun_light(True)
+# Post-processing (SSAO + tone-mapping) and a top-down sun light for shading.
+setup_scene_lighting(scene_widget.scene, post_processing=True)
 
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
@@ -867,9 +852,7 @@ for _ln, _mesh in _comp_layer_meshes.items():
 scene_widget.scene.add_geometry(FRAME_GEOM, frame, make_frame_material())
 scene_widget.scene.show_geometry(FRAME_GEOM, False)
 
-line_mat            = rendering.MaterialRecord()
-line_mat.shader     = "unlitLine"
-line_mat.line_width = 3.0
+line_mat = line_material(3.0)
 scene_widget.scene.add_geometry(BBOX_GEOM, bbox_ls, line_mat)
 
 bounds = scene_widget.scene.bounding_box
@@ -1257,9 +1240,7 @@ def _place_highlight(centre: np.ndarray):
     marker_wire_src.translate(centre)
     marker_wire = o3d.geometry.LineSet.create_from_triangle_mesh(marker_wire_src)
     marker_wire.paint_uniform_color([1.0, 1.0, 0.0])
-    marker_mat            = rendering.MaterialRecord()
-    marker_mat.shader     = "unlitLine"
-    marker_mat.line_width = 0.5
+    marker_mat = line_material(0.5)
     scene_widget.scene.add_geometry(HIGHLIGHT_GEOM, marker_wire, marker_mat)
 
     axes_pts = [
@@ -1277,9 +1258,7 @@ def _place_highlight(centre: np.ndarray):
         lines=o3d.utility.Vector2iVector(axes_lines),
     )
     axes_ls.paint_uniform_color([1.0, 1.0, 1.0])
-    axes_mat            = rendering.MaterialRecord()
-    axes_mat.shader     = "unlitLine"
-    axes_mat.line_width = 2.0
+    axes_mat = line_material(2.0)
     scene_widget.scene.add_geometry(HIGHLIGHT_AXES_GEOM, axes_ls, axes_mat)
 
     pick_active[0] = True
@@ -1442,6 +1421,24 @@ def _pivot_to(point: np.ndarray):
     scene_widget.look_at(point.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
     print(f"  Pivot -> [{point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}]")
 
+
+_trench_path = load_trench(_ply_path)
+
+
+def _top_view():
+    """Bird's-eye view looking straight down, framed on the trench footprint
+    when one is defined, otherwise on the whole scene."""
+    if _trench_path is not None:
+        v = np.asarray(_trench_path.vertices, dtype=float)
+        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
+        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
+    else:
+        cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
+        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+    cz = float(cloud_centroid[2])
+    h = max(1.0, span) * 1.2
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 13.  Key callbacks
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1472,6 +1469,10 @@ def on_key(event):
         print("Pivot -> world origin")
         _pivot_to(origin_pt)
         return HANDLED
+    if k in (ord('T'), ord('t')):
+        print("Top view of trench")
+        _top_view()
+        return HANDLED
 
     if k in (ord('H'), ord('h')):
         print("\n-- Shortcuts ---------------------------------------------------")
@@ -1479,6 +1480,7 @@ def on_key(event):
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  0              pivot to world origin (0, 0, 0)")
+        print("  T              top view of trench (or scene if none)")
         print("  L              toggle class label colours on/off")
         print("  H              show this help")
         print("----------------------------------------------------------------\n")
