@@ -34,7 +34,7 @@ PLY_BASE_DIR = DATA_DIR / "OpenTrench3D"
 # ─────────────────────────────────────────────────────────────────────────────
 # SITE SELECTION: change these to switch site
 # ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE         = PLY_BASE_DIR / "Water_Area_5" / "Area_5_Site_11.ply"
+PLY_FILE         = PLY_BASE_DIR / "Water_Area_5" / "Area_5_Site_37.ply"
 AREA_REF_GEOJSON = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
 GML_PATH         = DATA_DIR / "Ledningspakke_2803288_Area_4_and_5" / "consolidated.gml"
 
@@ -53,7 +53,7 @@ CROP_MODE = "rect"
 
 # Margin (metres) added around the point-cloud AABB in every dimension (X, Y, Z)
 # when selecting utilities in "rect" mode (the "additional crop distance").
-UTILITY_RECT_BUFFER = 0.0
+UTILITY_RECT_BUFFER = 2.0
 # Circular crop radius (metres) around the point cloud centroid (XY).
 CROP_RADIUS = 2.0
 
@@ -74,17 +74,17 @@ DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]  # magenta, unknown class IDs
 # UTILITY LAYER DEFINITIONS: DLF-recommended colours (RGB 0-1)
 # ─────────────────────────────────────────────────────────────────────────────
 LINE_LAYERS = {
-    "Vandledning":               {"color": [0.000, 0.000, 1.000], "fallback_radius": 0.005},  # DLF blue
-    "Afloebsledning":            {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.005},  # DLF red
-    "Gasledning":                {"color": [1.000, 0.600, 0.000], "fallback_radius": 0.005},  # DLF orange
-    "Elledning":                 {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.005},  # DLF red
-    "Telekommunikationsledning": {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.005},  # DLF orange
-    "Foeringsroer":              {"color": [0.882, 0.882, 0.882], "fallback_radius": 0.005},  # DLF grey
-    "LedningUkendtForsyningsart":{"color": [0.300, 0.800, 0.800], "fallback_radius": 0.005},  # cyan
-    "Ledningstrace":             {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.005},  # DLF trace orange
-    "TermiskLedning":            {"color": [1.000, 0.000, 1.000], "fallback_radius": 0.005},  # DLF violet
-    "Olieledning":               {"color": [0.463, 0.463, 0.463], "fallback_radius": 0.005},  # DLF grey
-    "AndenLedning":              {"color": [0.800, 0.800, 0.800], "fallback_radius": 0.005},  # grey
+    "Vandledning":               {"color": [0.000, 0.000, 1.000], "fallback_radius": 0.010},  # DLF blue
+    "Afloebsledning":            {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.010},  # DLF red
+    "Gasledning":                {"color": [1.000, 0.600, 0.000], "fallback_radius": 0.010},  # DLF orange
+    "Elledning":                 {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.010},  # DLF red
+    "Telekommunikationsledning": {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.010},  # DLF orange
+    "Foeringsroer":              {"color": [0.882, 0.882, 0.882], "fallback_radius": 0.010},  # DLF grey
+    "LedningUkendtForsyningsart":{"color": [0.300, 0.800, 0.800], "fallback_radius": 0.010},  # cyan
+    "Ledningstrace":             {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.010},  # DLF trace orange
+    "TermiskLedning":            {"color": [1.000, 0.000, 1.000], "fallback_radius": 0.010},  # DLF violet
+    "Olieledning":               {"color": [0.463, 0.463, 0.463], "fallback_radius": 0.010},  # DLF grey
+    "AndenLedning":              {"color": [0.800, 0.800, 0.800], "fallback_radius": 0.010},  # grey
 }
 
 # Right-panel legend order: keep Ledningstrace last (dense / low-priority visually)
@@ -247,6 +247,46 @@ DEVIATION_CLASS_LABELS = [
     "Class 4:  <= 2000 mm",
     "Class 5:  > 2000 mm",
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGISTERED ACCURACY CLASS (noejagtighedsklasse) -> 2D buffer half-width
+# ─────────────────────────────────────────────────────────────────────────────
+# The LER registers a horizontal (planimetric) accuracy class per feature. It is
+# text such as "<= 0.50 m" or "> 2.00 m" and maps onto the same class bounds as
+# DEVIATION_THRESHOLDS, so the class directly gives a 2D buffer half-width.
+ACCURACY_CLASS_FIELD = "noejagtighedsklasse"
+
+# Display half-width (metres) for the open top class ("> 2.00 m"), which has no
+# registered upper bound. A display convention only, not a registered value.
+ACCURACY_OPEN_CLASS_WIDTH = 2.00
+
+
+def accuracy_class_halfwidth(value):
+    """Map a registered ``noejagtighedsklasse`` value to a 2D buffer half-width.
+
+    Parses the numeric bound out of the class text (tolerating a decimal comma)
+    and snaps it to the matching DEVIATION_THRESHOLDS class. Returns
+    ``(half_width_m, class_idx)`` with ``class_idx`` in 1..5, or ``None`` when the
+    value is missing or unparseable. The half-width equals the class upper bound
+    (the horizontal tolerance); the open top class uses ACCURACY_OPEN_CLASS_WIDTH.
+    """
+    import re as _re
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() == "nan":
+        return None
+    m = _re.search(r"(\d+(?:[.,]\d+)?)", s)
+    if not m:
+        return None
+    num = float(m.group(1).replace(",", "."))
+    edges = DEVIATION_THRESHOLDS[1:]        # class upper bounds: 0.25 .. 2.00
+    n_classes = len(DEVIATION_THRESHOLDS)   # 5
+    # "> X" with X at/above the last bound is the open top class.
+    if ">" in s and num >= edges[-1] - 1e-9:
+        return ACCURACY_OPEN_CLASS_WIDTH, n_classes
+    j = min(range(len(edges)), key=lambda k: abs(num - edges[k]))
+    return edges[j], j + 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEPTH HIERARCHY: enum, config (used by BASE1 and LABEL1)
