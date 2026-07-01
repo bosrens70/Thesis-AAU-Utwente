@@ -34,6 +34,7 @@ from core.config import (
     MIN_INSTANCE_POINTS,
 )
 from core.data_loader import instance_base_name
+from core.rendering import point_material_shaded, setup_scene_lighting
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. LOAD PLY (lightweight — no GML, no area offset needed)
@@ -223,10 +224,11 @@ class InstanceViewer:
         self.scene = gui.SceneWidget()
         self.scene.scene = rendering.Open3DScene(self.window.renderer)
         self.scene.scene.set_background([0.08, 0.08, 0.08, 1.0])
+        # Clusters are coloured categorically, so use the shaded (lit) material
+        # for a depth cue; a top-down sun light makes the shading consistent.
+        setup_scene_lighting(self.scene.scene)
 
-        self._mat = rendering.MaterialRecord()
-        self._mat.shader     = "defaultLit"
-        self._mat.point_size = POINT_SIZE
+        self._mat = point_material_shaded(POINT_SIZE)
 
         self.scene.scene.add_geometry("bg",        pcd_bg,        self._mat)
         self.scene.scene.add_geometry("instances", pcd_instances, self._mat)
@@ -354,7 +356,22 @@ class InstanceViewer:
                 bounds = pcd_instances.get_axis_aligned_bounding_box()
                 self.scene.setup_camera(60.0, bounds, bounds.get_center())
                 return True
+            if event.key in (ord('t'), ord('T')):
+                self._top_view()
+                return True
         return False
+
+    def _top_view(self):
+        """Bird's-eye view looking straight down, framed on the instances. This
+        viewer has no trench, so it frames the scene."""
+        bb = pcd_instances.get_axis_aligned_bounding_box()
+        c = bb.get_center()
+        ext = bb.get_extent()
+        span = max(float(ext[0]), float(ext[1]))
+        h = max(1.0, span) * 1.2
+        self.scene.look_at([float(c[0]), float(c[1]), float(c[2])],
+                           [float(c[0]), float(c[1]), float(c[2]) + h],
+                           [0.0, 1.0, 0.0])
 
     def _on_bg_toggle(self, checked):
         self.scene.scene.show_geometry("bg", checked)
