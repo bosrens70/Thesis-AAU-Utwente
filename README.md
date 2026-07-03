@@ -86,9 +86,12 @@ python viewers/deviation_viewer.py
 python tools/ply_to_las.py --area 3
 ```
 
-**Switching sites:** edit `PLY_FILE` (and, for a different Ledningspakke,
-`GML_PATH` / `AREA_REF_GEOJSON`) in [`core/config.py`](core/config.py).
-Every script reads its configuration from there.
+**Switching sites:** copy [`core/site_local.example.py`](core/site_local.example.py)
+to `core/site_local.py` (gitignored) and set `SITE` (and, for a different
+Ledningspakke, `LEDNINGSPAKKE_DIR`). This keeps day-to-day site switching out
+of tracked files; `core/config.py` falls back to its committed default when
+`core/site_local.py` is absent or a field is missing. Every script reads its
+configuration from `core/config.py`.
 
 ## Data model
 
