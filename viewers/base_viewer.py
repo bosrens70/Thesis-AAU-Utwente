@@ -831,7 +831,7 @@ em = window.theme.font_size
 
 scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
-scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
+scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
 
 # Post-processing (SSAO + tone-mapping) and a top-down sun light for shading.
 setup_scene_lighting(scene_widget.scene, post_processing=True)

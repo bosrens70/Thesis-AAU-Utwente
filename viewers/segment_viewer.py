@@ -223,7 +223,7 @@ class InstanceViewer:
 
         self.scene = gui.SceneWidget()
         self.scene.scene = rendering.Open3DScene(self.window.renderer)
-        self.scene.scene.set_background([0.08, 0.08, 0.08, 1.0])
+        self.scene.scene.set_background([1.0, 1.0, 1.0, 1.0])
         # Clusters are coloured categorically, so use the shaded (lit) material
         # for a depth cue; a top-down sun light makes the shading consistent.
         setup_scene_lighting(self.scene.scene)

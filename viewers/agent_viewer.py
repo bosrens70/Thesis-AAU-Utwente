@@ -443,7 +443,7 @@ em = window.theme.font_size
 
 scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
-scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
+scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
 
 # Sun light for the lit utility meshes; post-processing left at the default.
 setup_scene_lighting(scene_widget.scene)

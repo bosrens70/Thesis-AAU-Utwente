@@ -37,9 +37,12 @@ from core.config import (
     COMPONENT_SPHERE_RADIUS,
     DepthSource, DepthConfig, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     forsyningsart_color,
+    SIGNATURE_LINE_WIDTH_M, SIGNATURE_TRACE_WIDTH_M, SIGNATURE_COMP_LINE_WIDTH_M,
+    SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
 )
 from core.gui_helpers import make_legend_row
 from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear
+from core import symbology as sym
 from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
     setup_scene_lighting,
@@ -535,6 +538,116 @@ def segment_to_cylinder(p1, p2, radius, color, resolution=_CYL_RESOLUTION):
     return cyl
 
 
+# ── LER signature geometry (flat ribbons in the ground plane) ─────────────────
+# This viewer is a top-down plan: every LER feature is flattened to PLAN_Z and
+# drawn with its cartographic signature. Lines are rendered as thin horizontal
+# ribbon quads (not tubes) so the existing TriangleMesh pipeline — opacity,
+# depth toggle, visibility, picking — keeps working unchanged.
+def _segments_to_ribbon_mesh(points, lines, width, color):
+    """Flat horizontal ribbon quads (two triangles per segment) for the line
+    segments in (points, lines). ``width`` is the ribbon width in metres."""
+    pts = np.asarray(points, dtype=float)
+    lines = np.asarray(lines, dtype=int)
+    if len(lines) == 0:
+        return None
+    hw = width / 2.0
+    up = np.array([0.0, 0.0, 1.0])
+    verts, tris = [], []
+    for a, b in lines:
+        p0 = pts[a]
+        p1 = pts[b]
+        fwd = p1 - p0
+        n = np.linalg.norm(fwd)
+        if n < 1e-9:
+            continue
+        side = np.cross(fwd / n, up)
+        sn = np.linalg.norm(side)
+        side = side / sn * hw if sn > 1e-9 else np.array([hw, 0.0, 0.0])
+        k = len(verts)
+        verts.extend([p0 + side, p0 - side, p1 - side, p1 + side])
+        tris.extend([[k, k + 1, k + 2], [k, k + 2, k + 3]])
+    if not verts:
+        return None
+    m = o3d.geometry.TriangleMesh()
+    m.vertices = o3d.utility.Vector3dVector(np.asarray(verts, dtype=float))
+    m.triangles = o3d.utility.Vector3iVector(np.asarray(tris, dtype=np.int32))
+    m.paint_uniform_color(color)
+    m.compute_vertex_normals()
+    return m
+
+
+def _faces_to_mesh(verts, faces, color):
+    """Build a coloured TriangleMesh from vertex/face arrays (danger triangles)."""
+    faces = np.asarray(faces, dtype=int)
+    if len(faces) == 0:
+        return None
+    m = o3d.geometry.TriangleMesh()
+    m.vertices = o3d.utility.Vector3dVector(np.asarray(verts, dtype=float))
+    m.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    m.paint_uniform_color(color)
+    m.compute_vertex_normals()
+    return m
+
+
+def _feature_signature_meshes(coords, style, color, width, hazard, tick_count):
+    """Ribbon + decorators for one polyline already flattened to PLAN_Z."""
+    coords = np.asarray(coords, dtype=float)
+    meshes = []
+    if len(coords) < 2:
+        return meshes
+    if style == "dashed":
+        p, l = sym.dash_segments(coords)
+    else:
+        p, l = sym.polyline_lines(coords)
+    base = _segments_to_ribbon_mesh(p, l, width, color)
+    if base is not None:
+        meshes.append(base)
+    if tick_count > 0:
+        tp, tl = sym.tick_bars(coords, tick_count)
+        tm = _segments_to_ribbon_mesh(tp, tl, SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR)
+        if tm is not None:
+            meshes.append(tm)
+    if hazard:
+        hv, hf = sym.triangle_markers(coords)
+        hm = _faces_to_mesh(hv, hf, SIGNATURE_HAZARD_COLOR)
+        if hm is not None:
+            meshes.append(hm)
+    return meshes
+
+
+def _ribbon_from_coords(coords_local, width, color, closed=False):
+    """Ribbon for a component line / polygon outline; coords are local XY(Z),
+    flattened to PLAN_Z."""
+    coords = np.asarray(coords_local, dtype=float)
+    if coords.shape[1] == 2:
+        coords = np.column_stack([coords, np.full(len(coords), PLAN_Z)])
+    else:
+        coords = coords.copy()
+        coords[:, 2] = PLAN_Z
+    if closed and len(coords) >= 2 and not np.allclose(coords[0], coords[-1]):
+        coords = np.vstack([coords, coords[0]])
+    p, l = sym.polyline_lines(coords)
+    return _segments_to_ribbon_mesh(p, l, width, color)
+
+
+def _polygon_fill_mesh(ext_local, color):
+    """Flat fill for a component polygon (centroid fan) at PLAN_Z."""
+    pts = np.asarray(ext_local, dtype=float)[:, :2]
+    if len(pts) < 3:
+        return None
+    c = pts.mean(axis=0)
+    verts = [np.array([c[0], c[1], PLAN_Z])]
+    verts.extend(np.array([x, y, PLAN_Z]) for x, y in pts)
+    tris = [[0, i, i + 1] for i in range(1, len(pts))]
+    tris.append([0, len(pts), 1])
+    m = o3d.geometry.TriangleMesh()
+    m.vertices = o3d.utility.Vector3dVector(np.asarray(verts, dtype=float))
+    m.triangles = o3d.utility.Vector3iVector(np.asarray(tris, dtype=np.int32))
+    m.paint_uniform_color(color)
+    m.compute_vertex_normals()
+    return m
+
+
 def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
                               cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
     """
@@ -806,6 +919,12 @@ def _build_depth_mesh(mesh_list, src_list):
     combined.compute_vertex_normals()
     return combined
 
+# Top-view plan: all LER features are flattened to a single horizontal plane
+# placed just above the top of the point cloud, so in the bird's-eye view the
+# utilities always draw on top of (in front of) the point cloud and grave
+# surface. XY is unchanged, so the plan geometry itself is unaffected.
+PLAN_Z = PC_Z_MAX + 1.0
+
 # Track Ledningstrace forsyningsart variants
 _ledningstrace_variants = {}
 
@@ -846,13 +965,20 @@ for layer_name, cfg in LINE_LAYERS.items():
         if is_trace and display_fa and display_fa not in _ledningstrace_variants:
             _ledningstrace_variants[display_fa] = color
 
-        bredde_m = get_bredde_width(row)
-        if is_trace and bredde_m is None:
-            bredde_m = 0.25  # fallback: 25 cm
-
         vejl_dybde = None
         if "vejledendeDybde" in row.index:
             vejl_dybde = row.get("vejledendeDybde", None)
+
+        # LER signature choice (top-view plan): dashed for "under etablering",
+        # red triangles for "meget farlig", El voltage tick marks, thick trace.
+        _sig_style = sym.line_style_from_driftsstatus(
+            row.get("driftsstatus", "") if "driftsstatus" in row.index else "")
+        _sig_hazard = sym.is_hazard(
+            row.get("fareklasse", "") if "fareklasse" in row.index else "")
+        _sig_ticks = (sym.voltage_tick_count(row.get("spaendingsniveau"))
+                      if layer_name == "Elledning" and "spaendingsniveau" in row.index
+                      else 0)
+        _sig_width = SIGNATURE_TRACE_WIDTH_M if is_trace else SIGNATURE_LINE_WIDTH_M
 
         row_attrs = []
         for col in row.index:
@@ -872,28 +998,44 @@ for layer_name, cfg in LINE_LAYERS.items():
             all_pipe_coords.append(coords)
             _layer_z_vals.extend(coords[:, 2].tolist())
             feature_hit = True
+            # Depth source is where the registered depth came from; kept for the
+            # depth-hierarchy toggle even though the plan is drawn flat.
+            _feat_src = (DepthSource(int(max(seg_sources)))
+                         if len(seg_sources) else DepthSource.GROUND_PLANE)
 
+            # Clip to the view bbox and stitch surviving segments back into
+            # polylines, flattened to the ground plane.
+            pieces, cur = [], []
             for i in range(len(coords) - 1):
                 clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
                 if clipped is None:
+                    if cur:
+                        pieces.append(cur)
+                        cur = []
                     continue
-                if bredde_m is not None:
-                    cyl = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
+                a, b = clipped
+                if not cur:
+                    cur = [a, b]
+                elif np.allclose(cur[-1], a, atol=1e-6):
+                    cur.append(b)
                 else:
-                    cyl = segment_to_cylinder(clipped[0], clipped[1], radius, color)
-                if cyl is not None:
-                    # Store with compound key for Ledningstrace variants
-                    storage_key = get_storage_key(layer_name, display_fa)
-                    # Dominant (worst) depth source of the segment's endpoints
-                    _seg_src = DepthSource(max(int(seg_sources[i]),
-                                               int(seg_sources[i + 1])))
-                    layer_mesh_list.append(cyl)
-                    layer_src_list.append(_seg_src)
-                    midpt = (clipped[0] + clipped[1]) / 2.0
-                    pick_seg_midpoints.append(midpt)
-                    pick_seg_attrs.append(row_attrs)
-                    pick_seg_layer.append(layer_name)
-                    n_segments += 1
+                    pieces.append(cur)
+                    cur = [a, b]
+                midpt = (a + b) / 2.0
+                pick_seg_midpoints.append(np.array([midpt[0], midpt[1], PLAN_Z]))
+                pick_seg_attrs.append(row_attrs)
+                pick_seg_layer.append(layer_name)
+                n_segments += 1
+            if cur:
+                pieces.append(cur)
+
+            for piece in pieces:
+                pc = np.asarray(piece, dtype=float)
+                pc[:, 2] = PLAN_Z
+                for m in _feature_signature_meshes(pc, _sig_style, color, _sig_width,
+                                                   _sig_hazard, _sig_ticks):
+                    layer_mesh_list.append(m)
+                    layer_src_list.append(_feat_src)
 
         if feature_hit:
             n_features += 1
@@ -1006,16 +1148,47 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         else:
             _comp_src = DepthSource.REGISTERED
 
-        # Clamp to point cloud Z range
-        pt[2] = np.clip(pt[2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
+        # Top-view plan: flatten the component to the ground plane.
+        pt[2] = PLAN_Z
 
-        sphere = o3d.geometry.TriangleMesh.create_sphere(
-            radius=COMPONENT_SPHERE_RADIUS, resolution=8
-        )
-        sphere.translate(pt)
-        sphere.paint_uniform_color(color)
-        comp_mesh_list.append(sphere)
-        comp_src_list.append(_comp_src)
+        # Build the component signature by geometry type: Point -> dot (sphere),
+        # Polygon -> filled outline, LineString -> thick ribbon line.
+        _cmeshes = []
+        if g.geom_type in ("Point", "PointZ"):
+            sphere = o3d.geometry.TriangleMesh.create_sphere(
+                radius=COMPONENT_SPHERE_RADIUS, resolution=8
+            )
+            sphere.translate(pt)
+            sphere.paint_uniform_color(color)
+            _cmeshes.append(sphere)
+        elif "Polygon" in g.geom_type:
+            parts = list(g.geoms) if g.geom_type.startswith("Multi") else [g]
+            for gp in parts:
+                ext = np.array(gp.exterior.coords, dtype=float)
+                ext[:, 0] -= TX
+                ext[:, 1] -= TY
+                fill = _polygon_fill_mesh(ext, color)
+                if fill is not None:
+                    _cmeshes.append(fill)
+                outline = _ribbon_from_coords(ext[:, :2], SIGNATURE_COMP_LINE_WIDTH_M,
+                                              color, closed=True)
+                if outline is not None:
+                    _cmeshes.append(outline)
+        elif "LineString" in g.geom_type:
+            parts = list(g.geoms) if g.geom_type.startswith("Multi") else [g]
+            for gp in parts:
+                ln = np.array(gp.coords, dtype=float)
+                ln[:, 0] -= TX
+                ln[:, 1] -= TY
+                rib = _ribbon_from_coords(ln[:, :2], SIGNATURE_COMP_LINE_WIDTH_M, color)
+                if rib is not None:
+                    _cmeshes.append(rib)
+
+        if not _cmeshes:
+            continue
+        for m in _cmeshes:
+            comp_mesh_list.append(m)
+            comp_src_list.append(_comp_src)
 
         pick_comp_centres.append(pt.copy())
         comp_row_attrs = []
@@ -1163,6 +1336,17 @@ scene_widget.scene.add_geometry(FRAME_GEOM, frame, make_frame_material())
 
 bounds = scene_widget.scene.bounding_box
 scene_widget.setup_camera(60, bounds, cloud_centroid.tolist())
+
+# This viewer is a flattened top-down plan: open on a bird's-eye view looking
+# straight down (+Y up on screen), framed on the whole scene.
+_cam_ext = bounds.get_extent()
+_cam_ctr = bounds.get_center()
+_cam_h = max(1.0, float(max(_cam_ext[0], _cam_ext[1]))) * 1.2
+scene_widget.look_at(
+    [float(_cam_ctr[0]), float(_cam_ctr[1]), float(_cam_ctr[2])],
+    [float(_cam_ctr[0]), float(_cam_ctr[1]), float(_cam_ctr[2]) + _cam_h],
+    [0.0, 1.0, 0.0],
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 11b. Class label toggle
@@ -1744,12 +1928,16 @@ def on_mouse(event):
             _left_was_down[0]  = True
         return gui.Widget.EventCallbackResult.IGNORED
 
-    if event.type == gui.MouseEvent.Type.MOVE:
+    # Top-view lock: swallow left-button drags so the camera can never orbit.
+    # Right-drag (pan) and the mouse wheel (zoom) fall through to the default
+    # handler, so the plan can still be panned and zoomed but stays top-down.
+    if event.type in (gui.MouseEvent.Type.DRAG, gui.MouseEvent.Type.MOVE):
         if _left_was_down[0] and _mouse_down_pos[0] is not None:
             dx = event.x - _mouse_down_pos[0][0]
             dy = event.y - _mouse_down_pos[0][1]
             if (dx * dx + dy * dy) > DRAG_THRESHOLD * DRAG_THRESHOLD:
                 _mouse_moved[0] = True
+            return gui.Widget.EventCallbackResult.HANDLED
         return gui.Widget.EventCallbackResult.IGNORED
 
     if event.type == gui.MouseEvent.Type.BUTTON_UP:
@@ -1782,10 +1970,12 @@ pc_max = all_pts.max(axis=0)
 
 
 def _pivot_to(point: np.ndarray):
-    d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-    eye = point + np.array([d, -d, d * 0.6])
-    scene_widget.look_at(point.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
-    print(f"  Pivot -> [{point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}]")
+    """Recentre on a point while staying top-down (this viewer is top-view only)."""
+    span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+    h = max(1.0, span) * 1.2
+    cx, cy, cz = float(point[0]), float(point[1]), float(point[2])
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+    print(f"  Pivot -> [{cx:.2f}, {cy:.2f}] (top-down)")
 
 
 def _top_view():
