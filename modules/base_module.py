@@ -5,7 +5,7 @@ Single Point Cloud Viewer with Surrounding Utilities — Indicative Depth
 ========================================================================
 Refactored to use core/ for shared configuration and data loading.
 
-Usage: python viewers/base_module.py
+Usage: python modules/base_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
 

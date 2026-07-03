@@ -4,7 +4,7 @@ LER line signatures as plain geometry arrays.
 =============================================
 Reproduces the cartographic line styles of the LER "Signaturforklaring"
 (solid / dashed lines, danger-class triangles, El voltage tick marks) as plain
-numpy point / line / triangle arrays. The graveforesp top-view builds Open3D
+numpy point / line / triangle arrays. The ERR_module top-view builds Open3D
 ``LineSet`` / ``TriangleMesh`` objects from these arrays.
 
 This module is numpy only (no open3d import) so the geometry generators and the

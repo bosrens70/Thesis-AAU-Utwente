@@ -4,7 +4,7 @@ Single Point Cloud Viewer with Instance Labels + Surrounding Utilities
 ======================================================================
 Refactored to use core/ for shared configuration and data loading.
 
-Usage: python viewers/label_module.py
+Usage: python modules/label_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
 

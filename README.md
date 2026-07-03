@@ -23,12 +23,12 @@ Thesis/
 │   ├── gui_helpers.py        # Shared Open3D GUI widgets (legend swatches, toggles)
 │   └── ledningstrace.py      # Ledningstrace forsyningsart detection & colouring
 │
-├── viewers/              # Interactive Open3D GUI applications (modules)
+├── modules/              # Interactive Open3D GUI applications
 │   ├── base_module.py        # Point cloud + LER overlays, indicative depth, clickable picking
 │   ├── segment_module.py     # HDBSCAN/DBSCAN instance segmentation with live tuning controls
 │   ├── label_module.py       # Assign utility-type labels to instances; saves labelled PLYs
 │   ├── deviation_module.py   # ★ Geometric deviation: labelled instances vs. LER registry
-│   ├── graveforesp_module.py # Multi-site overview: all point clouds + all utilities, toggleable
+│   ├── ERR_module.py         # Multi-site overview: all point clouds + all utilities, toggleable
 │   └── agent_module.py       # Natural-language queries over a site via a Claude AI agent
 │
 ├── tools/                # One-off command-line batch utilities
@@ -81,8 +81,8 @@ All modules and tools are run from the **project root** so that `core` is
 importable:
 
 ```bash
-python viewers/base_module.py
-python viewers/deviation_module.py
+python modules/base_module.py
+python modules/deviation_module.py
 python tools/ply_to_las.py --area 3
 ```
 

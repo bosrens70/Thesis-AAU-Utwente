@@ -4,7 +4,7 @@ Geometric Deviation Viewer — Instances vs LER Utility Registry
 ===============================================================
 Refactored to use core/ for shared configuration and data loading.
 
-Usage: python viewers/deviation_module.py
+Usage: python modules/deviation_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
 

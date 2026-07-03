@@ -1,14 +1,14 @@
 ﻿# -*- coding: utf-8 -*-
 """
-Graveforesp Viewer — All Point Clouds + All Utilities + Toggleable Layers
+ERR Module — All Point Clouds + All Utilities + Toggleable Layers
 ==========================================================================
 Refactored to use core/ for shared configuration.
 
-Note: this viewer does NOT use init_site() because it loads multiple PLYs
+Note: this module does NOT use init_site() because it loads multiple PLYs
 via polygon overlap rather than a single PLY_FILE.  Constants are still
 imported from core/config.
 
-Usage: python viewers/graveforesp_module.py
+Usage: python modules/ERR_module.py
 """
 
 import sys

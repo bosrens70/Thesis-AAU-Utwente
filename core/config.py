@@ -253,11 +253,11 @@ DIAMETER_COLORS = {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LER LINE SIGNATURES (graveforesp top-view plan)
+# LER LINE SIGNATURES (ERR_module top-view plan)
 # ─────────────────────────────────────────────────────────────────────────────
 # Cartographic line styles reproduced from the LER "Signaturforklaring".
 # All sizes are in metres and world-scaled: they zoom with the scene. Consumed
-# by core.symbology and the graveforesp_module top-view.
+# by core.symbology and the ERR_module top-view.
 SIGNATURE_DASH_LEN          = 0.60   # m, dash length for driftsstatus "under etablering"
 SIGNATURE_GAP_LEN           = 0.40   # m, gap between dashes
 # Signatures are drawn as flat horizontal ribbons, so widths are in metres
