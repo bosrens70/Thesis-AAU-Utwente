@@ -34,9 +34,26 @@ PLY_BASE_DIR = DATA_DIR / "OpenTrench3D"
 # ─────────────────────────────────────────────────────────────────────────────
 # SITE SELECTION: change these to switch site
 # ─────────────────────────────────────────────────────────────────────────────
-PLY_FILE         = PLY_BASE_DIR / "Water_Area_5" / "Area_5_Site_37.ply"
+# Switching sites while working (a routine, frequent action) should not dirty
+# a tracked file. The default below is the committed fallback; day-to-day
+# switching instead goes in core/site_local.py, a gitignored override (see
+# core/site_local.example.py for the template). If that file is absent or
+# missing a field, the corresponding default here is used.
+_DEFAULT_SITE_REL          = "Water_Area_5/Area_5_Site_37.ply"
+_DEFAULT_LEDNINGSPAKKE_DIR = "Ledningspakke_2803288_Area_4_and_5"
+
+_site_rel = _DEFAULT_SITE_REL
+_ledningspakke_dir = _DEFAULT_LEDNINGSPAKKE_DIR
+try:
+    from core import site_local as _site_local
+    _site_rel = getattr(_site_local, "SITE", _site_rel)
+    _ledningspakke_dir = getattr(_site_local, "LEDNINGSPAKKE_DIR", _ledningspakke_dir)
+except ImportError:
+    pass
+
+PLY_FILE         = PLY_BASE_DIR / _site_rel
 AREA_REF_GEOJSON = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
-GML_PATH         = DATA_DIR / "Ledningspakke_2803288_Area_4_and_5" / "consolidated.gml"
+GML_PATH         = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
 
 
 
@@ -74,15 +91,15 @@ DEFAULT_CLASS_COLOR = [1.0, 0.0, 1.0]  # magenta, unknown class IDs
 # UTILITY LAYER DEFINITIONS: DLF-recommended colours (RGB 0-1)
 # ─────────────────────────────────────────────────────────────────────────────
 LINE_LAYERS = {
-    "Vandledning":               {"color": [0.000, 0.000, 1.000], "fallback_radius": 0.010},  # DLF blue
-    "Afloebsledning":            {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.010},  # DLF red
-    "Gasledning":                {"color": [1.000, 0.600, 0.000], "fallback_radius": 0.010},  # DLF orange
-    "Elledning":                 {"color": [1.000, 0.000, 0.000], "fallback_radius": 0.010},  # DLF red
-    "Telekommunikationsledning": {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.010},  # DLF orange
-    "Foeringsroer":              {"color": [0.882, 0.882, 0.882], "fallback_radius": 0.010},  # DLF grey
-    "LedningUkendtForsyningsart":{"color": [0.300, 0.800, 0.800], "fallback_radius": 0.010},  # cyan
+    "Vandledning":               {"color": [0.016, 0.184, 0.723], "fallback_radius": 0.010},  # screenshot blue #2277DD
+    "Afloebsledning":            {"color": [0.068, 0.042, 0.005], "fallback_radius": 0.010},  # screenshot dark brown #4A3A0F
+    "Gasledning":                {"color": [0.913, 0.651, 0.000], "fallback_radius": 0.010},  # screenshot yellow #F5D300
+    "Elledning":                 {"color": [0.768, 0.002, 0.007], "fallback_radius": 0.010},  # screenshot red #E30613
+    "Telekommunikationsledning": {"color": [0.038, 0.376, 0.038], "fallback_radius": 0.010},  # screenshot green #37A537
+    "Foeringsroer":              {"color": [0.905, 0.352, 0.254], "fallback_radius": 0.010},  # screenshot salmon #F4A08A
+    "LedningUkendtForsyningsart":{"color": [0.855, 0.184, 0.006], "fallback_radius": 0.010},  # screenshot orange #EE7711
     "Ledningstrace":             {"color": [0.980, 0.588, 0.275], "fallback_radius": 0.010},  # DLF trace orange
-    "TermiskLedning":            {"color": [1.000, 0.000, 1.000], "fallback_radius": 0.010},  # DLF violet
+    "TermiskLedning":            {"color": [0.445, 0.042, 0.445], "fallback_radius": 0.010},  # screenshot magenta #B23AB2
     "Olieledning":               {"color": [0.463, 0.463, 0.463], "fallback_radius": 0.010},  # DLF grey
     "AndenLedning":              {"color": [0.800, 0.800, 0.800], "fallback_radius": 0.010},  # grey
 }
@@ -93,12 +110,12 @@ if "Ledningstrace" in LINE_LAYERS:
     PIPE_LEGEND_UI_ORDER.append("Ledningstrace")
 
 COMPONENT_LAYERS = {
-    "Vandkomponent":                  {"color": [0.000, 0.900, 0.900]},
-    "Afloebskomponent":               {"color": [0.700, 0.400, 0.200]},
-    "Gaskomponent":                   {"color": [1.000, 0.900, 0.300]},
-    "Elkomponent":                    {"color": [1.000, 0.300, 0.300]},
-    "Telekommunikationskomponent":    {"color": [0.400, 1.000, 0.400]},
-    "TermiskKomponent":               {"color": [1.000, 0.500, 0.900]},
+    "Vandkomponent":                  {"color": [0.016, 0.184, 0.723]},  # screenshot blue #2277DD
+    "Afloebskomponent":               {"color": [0.068, 0.042, 0.005]},  # screenshot dark brown #4A3A0F
+    "Gaskomponent":                   {"color": [0.913, 0.651, 0.000]},  # screenshot yellow #F5D300
+    "Elkomponent":                    {"color": [0.768, 0.002, 0.007]},  # screenshot red #E30613
+    "Telekommunikationskomponent":    {"color": [0.038, 0.376, 0.038]},  # screenshot green #37A537
+    "TermiskKomponent":               {"color": [0.445, 0.042, 0.445]},  # screenshot magenta #B23AB2
     "Oliekomponent":                  {"color": [0.463, 0.463, 0.463]},
     "AndenKomponent":                 {"color": [0.800, 0.800, 0.800]},
 }
@@ -121,21 +138,28 @@ COMP_TO_LINE = {
 # FORSYNINGSART keyword -> colour for Ledningstrace sub-groups
 # ─────────────────────────────────────────────────────────────────────────────
 FORSYNINGSART_COLOR_HINTS = [
-    # Check longer/more specific keywords first to avoid substring conflicts
-    # (e.g., "tele" must come before "el" since "telekommunikation" contains "el")
-    ("fjern",  [1.000, 0.000, 1.000]),   # DLF fjernvarme violet
-    ("varme",  [1.000, 0.000, 1.000]),   # DLF varme violet
-    ("tele",   [0.980, 0.588, 0.275]),   # DLF tele orange
-    ("kommu",  [0.980, 0.588, 0.275]),   # DLF kommunikation orange
-    ("afloeb", [1.000, 0.000, 0.000]),   # DLF spildevand red
-    ("spilde", [1.000, 0.000, 0.000]),   # DLF spildevand red
-    ("vejafv", [1.000, 0.000, 0.000]),   # DLF vejafvanding red
-    ("vand",   [0.000, 0.000, 1.000]),   # DLF vand blue
-    ("gas",    [1.000, 0.600, 0.000]),   # DLF gas orange
-    ("el",     [1.000, 0.000, 0.000]),   # DLF el red (checked last to avoid matching "tele")
-    ("olie",   [0.463, 0.463, 0.463]),   # DLF olie grey
-    ("anden",  [0.800, 0.800, 0.800]),   # anden/andet grey
-    ("andet",  [0.800, 0.800, 0.800]),   # anden/andet grey
+    # Screenshot utility colours (linear RGB). Longer/more specific keywords come
+    # first so substrings do not shadow (e.g. "tele" before "el", since
+    # "telekommunikation" contains "el").
+    ("fjern",   [0.445, 0.042, 0.445]),   # termisk / fjernvarme magenta #B23AB2
+    ("varme",   [0.445, 0.042, 0.445]),   # termisk / varme magenta #B23AB2
+    ("termisk", [0.445, 0.042, 0.445]),   # termisk magenta #B23AB2
+    ("tele",    [0.038, 0.376, 0.038]),   # telekom green #37A537
+    ("kommu",   [0.038, 0.376, 0.038]),   # kommunikation green #37A537
+    ("foering", [0.905, 0.352, 0.254]),   # foeringsroer salmon #F4A08A
+    ("foring",  [0.905, 0.352, 0.254]),   # foringsror salmon #F4A08A
+    ("føring",  [0.905, 0.352, 0.254]),   # føringsrør salmon #F4A08A
+    ("afloeb",  [0.068, 0.042, 0.005]),   # afloeb dark brown #4A3A0F
+    ("afl",     [0.068, 0.042, 0.005]),   # afloeb / afløb dark brown #4A3A0F
+    ("spilde",  [0.068, 0.042, 0.005]),   # spildevand dark brown #4A3A0F
+    ("vejafv",  [0.068, 0.042, 0.005]),   # vejafvanding dark brown #4A3A0F
+    ("vand",    [0.016, 0.184, 0.723]),   # vand blue #2277DD
+    ("gas",     [0.913, 0.651, 0.000]),   # gas yellow #F5D300
+    ("el",      [0.768, 0.002, 0.007]),   # el red #E30613 (after "tele")
+    ("olie",    [0.463, 0.463, 0.463]),   # olie grey
+    ("ukendt",  [0.855, 0.184, 0.006]),   # ukendt orange #EE7711
+    ("anden",   [0.800, 0.800, 0.800]),   # anden / andet grey
+    ("andet",   [0.800, 0.800, 0.800]),   # anden / andet grey
 ]
 
 
@@ -179,17 +203,17 @@ UTILITY_TYPE_LABELS = {
 
 # DLF-recommended colours (RGB 0-1), using the primary sub-type per utility
 UTILITY_TYPE_COLORS = {
-    0: [0.50, 0.50, 0.50],   # Unlabeled          - grey
-    1: [1.00, 0.00, 0.00],   # PowerLine           - DLF red
-    2: [1.00, 0.00, 0.00],   # DrainageLine        - DLF red
-    3: [0.46, 0.46, 0.46],   # OilPipeLine         - DLF grey
-    4: [1.00, 0.60, 0.00],   # GasLine             - DLF orange
-    5: [1.00, 0.00, 1.00],   # ThermalLine         - DLF violet
-    6: [0.88, 0.88, 0.88],   # Conduit             - DLF grey
-    7: [0.00, 0.00, 1.00],   # WaterLine           - DLF blue
-    8: [0.98, 0.59, 0.27],   # TelecomunicationLine - DLF orange
-    9: [0.80, 0.80, 0.80],   # OtherLine           - grey
-    10: [0.30, 0.80, 0.80],  # LineUnknownServiceType
+    0: [0.50, 0.50, 0.50],   # Unlabeled           - grey
+    1: [0.768, 0.002, 0.007],# PowerLine            - screenshot red #E30613
+    2: [0.068, 0.042, 0.005],# DrainageLine         - screenshot dark brown #4A3A0F
+    3: [0.46, 0.46, 0.46],   # OilPipeLine          - DLF grey
+    4: [0.913, 0.651, 0.000],# GasLine              - screenshot yellow #F5D300
+    5: [0.445, 0.042, 0.445],# ThermalLine          - screenshot magenta #B23AB2
+    6: [0.905, 0.352, 0.254],# Conduit              - screenshot salmon #F4A08A
+    7: [0.016, 0.184, 0.723],# WaterLine            - screenshot blue #2277DD
+    8: [0.038, 0.376, 0.038],# TelecomunicationLine - screenshot green #37A537
+    9: [0.80, 0.80, 0.80],   # OtherLine            - grey
+    10: [0.855, 0.184, 0.006],# LineUnknownServiceType - screenshot orange #EE7711
 }
 
 INSTANCE_LABEL_OPTIONS = [
@@ -227,6 +251,36 @@ DIAMETER_COLORS = {
     150: [0.000, 0.278, 0.800],
     160: [0.000, 0.180, 0.522],
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LER LINE SIGNATURES (graveforesp top-view plan)
+# ─────────────────────────────────────────────────────────────────────────────
+# Cartographic line styles reproduced from the LER "Signaturforklaring".
+# All sizes are in metres and world-scaled: they zoom with the scene. Consumed
+# by core.symbology and the graveforesp_viewer top-view.
+SIGNATURE_DASH_LEN          = 0.60   # m, dash length for driftsstatus "under etablering"
+SIGNATURE_GAP_LEN           = 0.40   # m, gap between dashes
+# Signatures are drawn as flat horizontal ribbons, so widths are in metres
+# (world-scaled: they zoom with the scene).
+SIGNATURE_LINE_WIDTH_M      = 0.10   # m, ordinary utility line ribbon ("Ledning")
+SIGNATURE_TRACE_WIDTH_M     = 0.30   # m, Ledningstrace ribbon ("Trace")
+SIGNATURE_COMP_LINE_WIDTH_M = 0.20   # m, component line ribbon ("Komponent linje")
+SIGNATURE_TICK_BAR_WIDTH_M  = 0.05   # m, thickness of an El voltage tick bar
+SIGNATURE_TICK_COLOR        = [0.0, 0.0, 0.0]   # linear black (voltage ticks)
+SIGNATURE_Z_LIFT            = 0.03   # m, lift decorators above the base line (avoid z-fight)
+
+# El voltage classes -> number of tick-mark groups (spaendingsniveau in kV).
+# Legend bins: < 1, 1-29, 30-130, > 131 kV  ->  0, 1, 2, 3 ticks.
+VOLTAGE_KV_THRESHOLDS     = [1.0, 30.0, 131.0]
+SIGNATURE_TICK_SPACING    = 1.50   # m between tick groups along the line
+SIGNATURE_TICK_LEN        = 0.50   # m, full width of a tick bar across the line
+SIGNATURE_TICK_GAP        = 0.14   # m between ticks within a 2- or 3-tick group
+
+# Danger class ("fareklasse") that gets the red triangle signature.
+SIGNATURE_HAZARD_VALUES   = ("meget farlig",)
+SIGNATURE_HAZARD_SPACING  = 1.50   # m between triangles along the line
+SIGNATURE_HAZARD_SIZE     = 0.40   # m, triangle edge scale
+SIGNATURE_HAZARD_COLOR    = [0.80, 0.0, 0.0]   # linear red (legend triangles)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEVIATION HEATMAP
