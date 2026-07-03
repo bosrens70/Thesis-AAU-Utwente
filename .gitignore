@@ -45,3 +45,4 @@ Thumbs.db
 *.tex
 make_ler_appendix.py
 *.docx
+/figures
