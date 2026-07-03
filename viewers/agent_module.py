@@ -6,7 +6,7 @@ Loads one point cloud + GML utilities filtered to its bounding box,
 then lets you query the data via a Claude AI agent in the GUI.
 
 Setup:  Place your API key in API-KEY.env in the project root.
-Usage:  python viewers/agent_viewer.py
+Usage:  python viewers/agent_module.py
 """
 
 import sys

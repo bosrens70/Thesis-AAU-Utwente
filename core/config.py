@@ -36,9 +36,9 @@ PLY_BASE_DIR = DATA_DIR / "OpenTrench3D"
 # ─────────────────────────────────────────────────────────────────────────────
 # Switching sites while working (a routine, frequent action) should not dirty
 # a tracked file. The default below is the committed fallback; day-to-day
-# switching instead goes in core/site_local.py, a gitignored override (see
-# core/site_local.example.py for the template). If that file is absent or
-# missing a field, the corresponding default here is used.
+# switching instead goes in core/site_local.py, a gitignored override (fields
+# documented in that file's docstring). If that file is absent or missing a
+# field, the corresponding default here is used.
 _DEFAULT_SITE_REL          = "Water_Area_5/Area_5_Site_37.ply"
 _DEFAULT_LEDNINGSPAKKE_DIR = "Ledningspakke_2803288_Area_4_and_5"
 
@@ -64,7 +64,7 @@ GML_PATH         = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
 #              is expanded by UTILITY_RECT_BUFFER in X, Y and Z, and utilities are
 #              selected and clipped to that box.  CROP_RADIUS is not used here.
 # Honoured by the point-cloud crop (every init_site viewer) and by utility
-# selection in base_viewer / label_viewer / deviation_viewer.  Other viewers keep
+# selection in base_module / label_module / deviation_module.  Other modules keep
 # their own selection logic.  Set to "circle" to restore the legacy disc crop.
 CROP_MODE = "rect"
 
@@ -257,7 +257,7 @@ DIAMETER_COLORS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Cartographic line styles reproduced from the LER "Signaturforklaring".
 # All sizes are in metres and world-scaled: they zoom with the scene. Consumed
-# by core.symbology and the graveforesp_viewer top-view.
+# by core.symbology and the graveforesp_module top-view.
 SIGNATURE_DASH_LEN          = 0.60   # m, dash length for driftsstatus "under etablering"
 SIGNATURE_GAP_LEN           = 0.40   # m, gap between dashes
 # Signatures are drawn as flat horizontal ribbons, so widths are in metres

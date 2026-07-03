@@ -8,7 +8,7 @@ Note: this viewer does NOT use init_site() because it loads multiple PLYs
 via polygon overlap rather than a single PLY_FILE.  Constants are still
 imported from core/config.
 
-Usage: python viewers/graveforesp_viewer.py
+Usage: python viewers/graveforesp_module.py
 """
 
 import sys
@@ -487,7 +487,7 @@ def _ground_z_at(x_local, y_local):
     return float(np.sum(w * _ground_z[idx]) / np.sum(w))
 
 # ── Depth-source colour map (sRGB — used for GUI labels and depth meshes) ────
-# Matches base_viewer so the two viewers read identically.
+# Matches base_module so the two modules read identically.
 _DSRC_COLOR_SRGB = {
     DepthSource.REGISTERED:   [0.4, 1.0, 0.4],   # green
     DepthSource.VEJLEDENDE:   [0.4, 0.8, 1.0],   # light blue
@@ -653,7 +653,7 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
     """
     Translate UTM -> local. For vertices with Z = -99 (sentinel), resolve the
     depth using the ordered DepthSource hierarchy defined in *cfg* — exactly
-    like base_viewer, but the ground level here is the best-fit plane sampled
+    like base_module, but the ground level here is the best-fit plane sampled
     via `_ground_z_at`.
 
     Returns (coords, sources) where `sources` is a DepthSource int8 array
@@ -1056,7 +1056,7 @@ for layer_name, cfg in LINE_LAYERS.items():
 
 pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.empty((0, 3))
 
-# Depth hierarchy stats — counted from rendered segments only (matches base_viewer)
+# Depth hierarchy stats — counted from rendered segments only (matches base_module)
 _depth_stats = {src: 0 for src in DepthSource if src != DepthSource.NONE}
 for _ln, _src_list in _pipe_seg_dsrc.items():
     for _src in _src_list:
@@ -1366,7 +1366,7 @@ def _toggle_class_labels(show_labels: bool):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 12.  Right-side control panel  (matches base_viewer layout)
+# 12.  Right-side control panel  (matches base_module layout)
 # ─────────────────────────────────────────────────────────────────────────────
 PANEL_WIDTH = int(20 * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))

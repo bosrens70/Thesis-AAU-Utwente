@@ -16,20 +16,20 @@ The codebase is organised into three layers:
 
 ```
 Thesis/
-├── core/                 # Shared library, imported by every viewer and tool
+├── core/                 # Shared library, imported by every module and tool
 │   ├── config.py             # Single source of truth: site paths, class labels, layer colours
 │   ├── data_loader.py        # init_site() + PLY/GML loading, cropping, dataclasses
 │   ├── geometry.py           # Stateless Open3D mesh primitives & spatial helpers
 │   ├── gui_helpers.py        # Shared Open3D GUI widgets (legend swatches, toggles)
 │   └── ledningstrace.py      # Ledningstrace forsyningsart detection & colouring
 │
-├── viewers/              # Interactive Open3D GUI applications
-│   ├── base_viewer.py        # Point cloud + LER overlays, indicative depth, clickable picking
-│   ├── segment_viewer.py     # HDBSCAN/DBSCAN instance segmentation with live tuning controls
-│   ├── label_viewer.py       # Assign utility-type labels to instances; saves labelled PLYs
-│   ├── deviation_viewer.py   # ★ Geometric deviation: labelled instances vs. LER registry
-│   ├── graveforesp_viewer.py # Multi-site overview: all point clouds + all utilities, toggleable
-│   └── agent_viewer.py       # Natural-language queries over a site via a Claude AI agent
+├── viewers/              # Interactive Open3D GUI applications (modules)
+│   ├── base_module.py        # Point cloud + LER overlays, indicative depth, clickable picking
+│   ├── segment_module.py     # HDBSCAN/DBSCAN instance segmentation with live tuning controls
+│   ├── label_module.py       # Assign utility-type labels to instances; saves labelled PLYs
+│   ├── deviation_module.py   # ★ Geometric deviation: labelled instances vs. LER registry
+│   ├── graveforesp_module.py # Multi-site overview: all point clouds + all utilities, toggleable
+│   └── agent_module.py       # Natural-language queries over a site via a Claude AI agent
 │
 ├── tools/                # One-off command-line batch utilities
 │   ├── ply_to_las.py         # Convert local-origin PLY → georeferenced LAS (UTM32 / EPSG:25832)
@@ -43,19 +43,19 @@ Thesis/
 └── README.md
 ```
 
-`★ deviation_viewer.py` is the core thesis deliverable; the other viewers
+`★ deviation_module.py` is the core thesis deliverable; the other modules
 prepare the data it consumes (segment → label → reconcile).
 
 ## Typical workflow
 
-1. **Inspect** a site with `base_viewer.py`: point cloud rendered with LER
+1. **Inspect** a site with `base_module.py`: point cloud rendered with LER
    utility overlays, indicative depth estimation, and clickable feature inspection.
-2. **Segment** the point cloud into instances with `segment_viewer.py`
+2. **Segment** the point cloud into instances with `segment_module.py`
    (HDBSCAN, with live `MIN_CLUSTER_SIZE` / `MIN_SAMPLES` tuning).
-3. **Label** each instance with a utility type using `label_viewer.py`
+3. **Label** each instance with a utility type using `label_module.py`
    (saves instances as PLY files carrying a `utility_type` attribute).
 4. **Reconcile** the labelled instances against the LER registry with
-   `deviation_viewer.py` to quantify and visualise depth/geometry deviation.
+   `deviation_module.py` to quantify and visualise depth/geometry deviation.
 
 ## Setup
 
@@ -77,18 +77,18 @@ export THESIS_DATA_DIR=/mnt/thesis_data
 
 ## Running
 
-All viewers and tools are run from the **project root** so that `core` is
+All modules and tools are run from the **project root** so that `core` is
 importable:
 
 ```bash
-python viewers/base_viewer.py
-python viewers/deviation_viewer.py
+python viewers/base_module.py
+python viewers/deviation_module.py
 python tools/ply_to_las.py --area 3
 ```
 
-**Switching sites:** copy [`core/site_local.example.py`](core/site_local.example.py)
-to `core/site_local.py` (gitignored) and set `SITE` (and, for a different
-Ledningspakke, `LEDNINGSPAKKE_DIR`). This keeps day-to-day site switching out
+**Switching sites:** create `core/site_local.py` (gitignored) and set `SITE`
+(and, for a different Ledningspakke, `LEDNINGSPAKKE_DIR`); see the docstring
+in that file for the exact fields. This keeps day-to-day site switching out
 of tracked files; `core/config.py` falls back to its committed default when
 `core/site_local.py` is absent or a field is missing. Every script reads its
 configuration from `core/config.py`.
@@ -105,7 +105,7 @@ configuration from `core/config.py`.
 **OpenTrench3D semantic classes** (point-level): `Main Utility`,
 `Other Utility`, `Trench`, `Inactive Utility`, `Misc`.
 
-**Utility-type labels** (instance-level, assigned in `label_viewer`):
+**Utility-type labels** (instance-level, assigned in `label_module`):
 `PowerLine`, `DrainageLine`, `OilPipeLine`, `GasLine`, `ThermalLine`,
 `Conduit`, `WaterLine`, `TelecomunicationLine`, `OtherLine`,
 `LineUnknownServiceType`.
@@ -122,10 +122,10 @@ Python 3.9+. All dependencies are pinned in
 - `geopandas` / `pyogrio` / `shapely`: reading and filtering GML utility layers
 - `pyproj`: UTM32 / ETRS89 reprojection (`tools/ply_to_las.py`)
 - `numpy`
-- `scikit-learn`: HDBSCAN / DBSCAN segmentation (`segment_viewer`)
+- `scikit-learn`: HDBSCAN / DBSCAN segmentation (`segment_module`)
 - `plyfile`, `laspy`: PLY to LAS conversion (`tools/ply_to_las.py`)
 
-The `agent_viewer` talks to the Anthropic API directly over HTTP (no SDK
+The `agent_module` talks to the Anthropic API directly over HTTP (no SDK
 package needed); it expects an API key in `API-KEY.env` at the project root
 (git-ignored).
 

@@ -4,7 +4,7 @@ Convert "Main Utility" (class 0) points to WaterLine instances.
 ================================================================
 For every PLY site in Water_Area_4 and Water_Area_5, extracts all
 class-0 points and saves them as a single WaterLine instance using
-the same directory layout and PLY format as label_viewer.py.
+the same directory layout and PLY format as label_module.py.
 
 Usage:  python tools/convert_main_utility_to_water_instance.py
 """

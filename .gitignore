@@ -49,3 +49,4 @@ make_ler_appendix.py
 
 # ── Local site override (see core/site_local.example.py) ────────
 core/site_local.py
+core/site_local.example.py

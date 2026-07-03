@@ -2,7 +2,7 @@
 # Versions pinned to the environment the thesis was developed against
 # (conda env "thesis", Python 3.9+). Install with:  pip install -r requirements.txt
 #
-# Note: the agent_viewer talks to the Anthropic API directly over urllib,
+# Note: the agent_module talks to the Anthropic API directly over urllib,
 # so no SDK package is required, only an API key in API-KEY.env.
 
 # ── 3D rendering & GUI ──────────────────────────────────────────────

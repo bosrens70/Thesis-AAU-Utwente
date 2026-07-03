@@ -4,7 +4,7 @@ Geometric Deviation Viewer — Instances vs LER Utility Registry
 ===============================================================
 Refactored to use core/ for shared configuration and data loading.
 
-Usage: python viewers/deviation_viewer.py
+Usage: python viewers/deviation_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
 
@@ -1289,7 +1289,7 @@ def _apply_orig_cloud_mode(mode):
     scene_widget.scene.add_geometry(ORIG_GEOM, base, make_pt_mat_unlit(2.0))
     scene_widget.scene.show_geometry(ORIG_GEOM, _orig_visible[0])
 
-# Crop-region wireframe at ground level (same style as base_viewer): the
+# Crop-region wireframe at ground level (same style as base_module): the
 # AABB + buffer rectangle that bounds utility selection in rect mode, or the
 # disc in circle mode.
 if CROP_MODE == "rect":
