@@ -1050,6 +1050,13 @@ for ln in ler_meshes:
     seg_ids = np.where(_seg_layer_arr == ln)[0]
     if len(seg_ids) == 0:
         continue
+    # Ledningstrace is a registered centerline with a width ("bredde"). In the
+    # LER deviation modes it is drawn as a plain centerline (a dense line of
+    # samples), not the full-width ribbon, so the deviation reads as a single
+    # coloured line. Passing radius = half_width = 0 makes discretize_segment
+    # return the centerline only. The solid-mesh (non-deviation) modes still use
+    # the wide trace plane in ler_meshes, which this does not touch.
+    _is_trace = ln.startswith("Ledningstrace")
     ref_list = _layer_ref_pts.get(ln)
     ref_pts = np.concatenate(ref_list) if ref_list else None
     tree = cKDTree(ref_pts) if ref_pts is not None else None
@@ -1060,9 +1067,14 @@ for ln in ler_meshes:
     xycol_chunks, xycol_cont_chunks = [], []
     dev_chunks, zdev_chunks, xydev_chunks = [], [], []
     for idx in seg_ids:
-        samp = discretize_segment(
-            seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
-            LER_LENGTH_STEP, LER_SURFACE_STEP)
+        if _is_trace:
+            samp = discretize_segment(
+                seg_p1[idx], seg_p2[idx], 0.0, 0.0,
+                LER_LENGTH_STEP, LER_SURFACE_STEP)
+        else:
+            samp = discretize_segment(
+                seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
+                LER_LENGTH_STEP, LER_SURFACE_STEP)
         if tree is not None:
             # 3D-nearest measured point; the Z and XY deviations are the
             # vertical and horizontal components of the displacement to that
@@ -1189,7 +1201,7 @@ em = window.theme.font_size
 
 scene_widget = gui.SceneWidget()
 scene_widget.scene = rendering.Open3DScene(window.renderer)
-scene_widget.scene.set_background([0.10, 0.10, 0.10, 1.0])
+scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
 setup_scene_lighting(scene_widget.scene, post_processing=True)
 
 
