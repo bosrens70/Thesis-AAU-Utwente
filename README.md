@@ -21,12 +21,13 @@ Thesis/
 │   ├── data_loader.py        # init_site() + PLY/GML loading, cropping, dataclasses
 │   ├── geometry.py           # Stateless Open3D mesh primitives & spatial helpers
 │   ├── gui_helpers.py        # Shared Open3D GUI widgets (legend swatches, toggles)
-│   └── ledningstrace.py      # Ledningstrace forsyningsart detection & colouring
+│   ├── ledningstrace.py      # Ledningstrace forsyningsart detection & colouring
+│   └── ler_matching.py       # Heuristic instance <-> LER feature match suggestion
 │
 ├── modules/              # Interactive Open3D GUI applications
 │   ├── base_module.py        # Point cloud + LER overlays, indicative depth, clickable picking
 │   ├── segment_module.py     # HDBSCAN/DBSCAN instance segmentation with live tuning controls
-│   ├── label_module.py       # Assign utility-type labels to instances; saves labelled PLYs
+│   ├── label_module.py       # Assign utility-type labels to instances (and optionally link one to a specific LER feature); saves labelled PLYs
 │   ├── deviation_module.py   # ★ Geometric deviation: labelled instances vs. LER registry
 │   ├── ERR_module.py         # Multi-site overview: all point clouds + all utilities, toggleable
 │   └── agent_module.py       # Natural-language queries over a site via a Claude AI agent
@@ -54,8 +55,20 @@ prepare the data it consumes (segment → label → reconcile).
    (HDBSCAN, with live `MIN_CLUSTER_SIZE` / `MIN_SAMPLES` tuning).
 3. **Label** each instance with a utility type using `label_module.py`
    (saves instances as PLY files carrying a `utility_type` attribute).
+   Optionally, left-click a LER utility line while an instance is active to
+   link it to that one specific registered feature, use "Suggest LER match"
+   to have the most likely nearby feature proposed automatically (ranked by
+   proximity, direction, diameter and colour similarity — see
+   `core/ler_matching.py`), or click "Mark as NOT in LER" if the instance has
+   no counterpart anywhere in the registry (saved to `ler_matches.json` next
+   to the labelled PLYs).
 4. **Reconcile** the labelled instances against the LER registry with
    `deviation_module.py` to quantify and visualise depth/geometry deviation.
+   An instance with a recorded LER link (step 3) is measured against only
+   that one feature; an instance confirmed absent from LER is never measured
+   at all (avoiding a false match to an unrelated nearby feature of the same
+   type); otherwise it is measured against every nearby feature whose layer
+   matches its utility type (nearest-distance).
 
 ## Setup
 
