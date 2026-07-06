@@ -4,6 +4,18 @@ Single Point Cloud Viewer with Instance Labels + Surrounding Utilities
 ======================================================================
 Refactored to use core/ for shared configuration and data loading.
 
+Besides assigning a utility-type label to an instance, an instance can also
+be linked to one specific LER line feature: left-click a utility line while
+that instance is active to record the match (layer + gml_id), or use
+"Suggest LER match" to have the closest/best-aligned nearby feature proposed
+automatically (ranked by proximity, direction, diameter and colour
+similarity — see core/ler_matching.py) and accept or cycle through it.
+"Mark as NOT in LER" records that an instance has no registry counterpart at
+all. Matches are saved to ler_matches.json next to the labelled PLYs;
+deviation_module.py reads it and, when a match exists, measures that
+instance against only its linked LER feature instead of every nearby feature
+of the same utility type.
+
 Usage: python modules/label_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
@@ -23,6 +35,7 @@ import geopandas as gpd
 import numpy as np
 import re
 import time
+import json
 import glob as _globmod
 from datetime import datetime
 
@@ -32,11 +45,12 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
-    TARGET_CLASS,
+    TARGET_CLASS, UTILITY_TO_LER_MATCH,
     forsyningsart_color,
 )
 from core.data_loader import init_site, discover_instances, pick_ground_level, load_trench
 from core.gui_helpers import make_legend_row, make_master_pipe_toggle, make_master_comp_toggle
+from core.ler_matching import build_feature_index, score_candidates
 from core.geometry import (
     segment_to_plane,
     segments_in_rect, point_in_rect, clip_segment_to_rect,
@@ -157,6 +171,7 @@ INSTANCE_LABEL_OPTIONS = [
 ]
 
 _instance_labels = {}
+_instance_ler_match = {}  # idx -> {"layer": str, "gml_id": str} — exclusive LER link
 _current_inst_idx = [0]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -381,6 +396,7 @@ pick_seg_p2        = []   # list of np.array([x,y,z])  — segment end
 pick_seg_midpoints = []   # list of np.array([x,y,z])  — for highlight placement
 pick_seg_attrs     = []   # list of [(label, value), ...]
 pick_seg_layer     = []   # layer name per segment
+pick_seg_gml_id    = []   # GML gml_id per segment (identifies the whole feature)
 
 # Store per-utility-type average depth for component fallback
 _layer_avg_depth_local = {}
@@ -448,6 +464,8 @@ for layer_name, cfg in LINE_LAYERS.items():
             val_str = str(val) if (val is not None and str(val) != "nan") else "—"
             row_attrs.append((col, val_str))
 
+        gml_id_val = str(row.get("gml_id", "") or "")
+
         feature_hit = False
         for sub_geom in sub_geoms:
             coords_raw = np.array(sub_geom.coords, dtype=float)
@@ -485,6 +503,7 @@ for layer_name, cfg in LINE_LAYERS.items():
                     pick_seg_midpoints.append(midpt)
                     pick_seg_attrs.append(row_attrs)
                     pick_seg_layer.append(storage_key)
+                    pick_seg_gml_id.append(gml_id_val)
                     n_segments += 1
 
         if feature_hit:
@@ -499,6 +518,11 @@ for layer_name, cfg in LINE_LAYERS.items():
 pick_seg_p1        = np.array(pick_seg_p1)        if pick_seg_p1        else np.empty((0, 3))
 pick_seg_p2        = np.array(pick_seg_p2)        if pick_seg_p2        else np.empty((0, 3))
 pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.empty((0, 3))
+
+# One record per LER feature (grouped by gml_id), used to suggest the most
+# likely instance <-> LER feature match (see "Suggest LER match" below).
+_ler_feature_index = build_feature_index(
+    pick_seg_p1, pick_seg_p2, pick_seg_layer, pick_seg_gml_id, pick_seg_attrs)
 
 print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments")
 print(f"\n  Depth estimation stats:")
@@ -1122,6 +1146,37 @@ if instance_data:
     _inst_assigned_lbl.text_color = gui.Color(0.3, 1.0, 0.3, 1.0)
     _inst_assigned_lbl.visible = False
     left_panel.add_child(_inst_assigned_lbl)
+    left_panel.add_fixed(int(0.3 * em))
+
+    _suggest_btn = gui.Button("Suggest LER match")
+    _suggest_btn.set_on_clicked(lambda: _suggest_ler_match())
+    left_panel.add_child(_suggest_btn)
+
+    _suggest_lbl = gui.Label("")
+    _suggest_lbl.text_color = gui.Color(0.6, 0.6, 0.6, 1.0)
+    left_panel.add_child(_suggest_lbl)
+
+    _suggest_nav_row = gui.Horiz(int(0.3 * em))
+    _accept_suggest_btn = gui.Button("Accept")
+    _accept_suggest_btn.set_on_clicked(lambda: _accept_suggestion())
+    _suggest_nav_row.add_child(_accept_suggest_btn)
+    _next_suggest_btn = gui.Button("Next candidate")
+    _next_suggest_btn.set_on_clicked(lambda: _next_suggestion())
+    _suggest_nav_row.add_child(_next_suggest_btn)
+    left_panel.add_child(_suggest_nav_row)
+    left_panel.add_fixed(int(0.4 * em))
+
+    _ler_match_lbl = gui.Label("LER match: none (click a line)")
+    _ler_match_lbl.text_color = gui.Color(0.6, 0.6, 0.6, 1.0)
+    left_panel.add_child(_ler_match_lbl)
+
+    _no_ler_btn = gui.Button("Mark as NOT in LER")
+    _no_ler_btn.set_on_clicked(lambda: _mark_no_ler())
+    left_panel.add_child(_no_ler_btn)
+
+    _clear_match_btn = gui.Button("Clear LER match")
+    _clear_match_btn.set_on_clicked(lambda: _clear_ler_match())
+    left_panel.add_child(_clear_match_btn)
     left_panel.add_fixed(int(0.4 * em))
 
     left_panel.add_child(gui.Label("Assign label (or press 1-0):"))
@@ -1134,6 +1189,26 @@ if _labeled_output_dir and not _labeled_output_dir.exists():
 
 
 _LABEL_TO_ID = {name: i + 1 for i, name in enumerate(INSTANCE_LABEL_OPTIONS)}
+
+
+def _write_ler_matches_json():
+    """Persist idx -> {layer, gml_id} for every labelled instance that has an
+    exclusive LER link, keyed by the saved PLY filename. Rewritten in full each
+    time so relabelling (which changes the filename) never leaves a stale key."""
+    if not _labeled_output_dir:
+        return
+    out = {}
+    for idx, match in _instance_ler_match.items():
+        if idx not in _instance_labels:
+            continue
+        label_id = _LABEL_TO_ID.get(_instance_labels[idx], 0)
+        fname = f"{TARGET_CLASS}_instance_{idx}_type_{label_id}.ply"
+        out[fname] = match
+    if not out:
+        return
+    out_path = _labeled_output_dir / "ler_matches.json"
+    with open(str(out_path), "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
 
 
 def _save_instance_ply(idx, label_name):
@@ -1180,6 +1255,7 @@ def _save_instance_ply(idx, label_name):
             f.write(" ".join(parts) + "\n")
 
     print(f"  [saved] {out_path}  (utility_type={label_id}: {label_name})")
+    _write_ler_matches_json()
 
 
 def _show_instance(idx):
@@ -1199,6 +1275,18 @@ def _show_instance(idx):
         _inst_assigned_lbl.visible = True
     else:
         _inst_assigned_lbl.visible = False
+    _refresh_ler_match_label(idx)
+    _m = _instance_ler_match.get(idx)
+    _gid = _m.get("gml_id") if _m else None
+    if _gid and _gid in pick_seg_gml_id:
+        _gi = pick_seg_gml_id.index(_gid)
+        _place_ler_match_highlight(pick_seg_p1[_gi], pick_seg_p2[_gi])
+    else:
+        _clear_ler_match_highlight()
+    _suggestion_state["candidates"] = []
+    _suggestion_state["idx"] = 0
+    _suggest_lbl.text = ""
+    _clear_suggestion_highlight()
     obb_center = np.asarray(inst["obb"].center)
     _pivot_to(obb_center)
     window.set_needs_layout()
@@ -1288,6 +1376,265 @@ left_panel.add_stretch()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 11b.  Exclusive LER matching — left-click a utility line to link it to the
+# current instance, so deviation_module.py measures that instance against only
+# this one registered feature instead of every nearby feature of the same type.
+# ─────────────────────────────────────────────────────────────────────────────
+LER_MATCH_PICK_RADIUS = 0.30  # m — same tolerance as base_module's segment picking
+LER_MATCH_HIGHLIGHT_GEOM = "ler_match_highlight"
+
+
+def _clear_ler_match_highlight():
+    try:
+        scene_widget.scene.remove_geometry(LER_MATCH_HIGHLIGHT_GEOM)
+    except Exception:
+        pass
+
+
+def _place_ler_match_highlight(p1, p2):
+    _clear_ler_match_highlight()
+    ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.array([p1, p2])),
+        lines=o3d.utility.Vector2iVector([[0, 1]]),
+    )
+    ls.paint_uniform_color([1.0, 0.0, 1.0])  # magenta — distinct from any LER layer colour
+    mat = line_material(6.0)
+    try:
+        mat.depth_func = "always"  # stay visible through occluding pipe meshes
+    except AttributeError:
+        pass
+    scene_widget.scene.add_geometry(LER_MATCH_HIGHLIGHT_GEOM, ls, mat)
+
+
+def _refresh_ler_match_label(idx):
+    m = _instance_ler_match.get(idx)
+    if m and m.get("no_ler"):
+        _ler_match_lbl.text = "LER match: confirmed NOT in LER"
+        _ler_match_lbl.text_color = gui.Color(1.0, 0.55, 0.15, 1.0)
+    elif m:
+        gid = m.get("gml_id", "")
+        gid_short = gid[-28:] if len(gid) > 28 else gid
+        _ler_match_lbl.text = f"LER match: {m['layer']}\n({gid_short})"
+        _ler_match_lbl.text_color = gui.Color(0.3, 1.0, 1.0, 1.0)
+    else:
+        _ler_match_lbl.text = "LER match: none (click a line)"
+        _ler_match_lbl.text_color = gui.Color(0.6, 0.6, 0.6, 1.0)
+
+
+def _mark_no_ler():
+    """Confirm this instance has no counterpart anywhere in LER, so
+    deviation_module.py skips the nearest-of-type fallback for it entirely
+    instead of risking a match against an unrelated nearby same-type feature."""
+    idx = _current_inst_idx[0]
+    _instance_ler_match[idx] = {"no_ler": True}
+    _refresh_ler_match_label(idx)
+    _clear_ler_match_highlight()
+    _clear_suggestion_highlight()
+    _write_ler_matches_json()
+    window.post_redraw()
+
+
+def _clear_ler_match():
+    idx = _current_inst_idx[0]
+    if idx in _instance_ler_match:
+        del _instance_ler_match[idx]
+    _refresh_ler_match_label(idx)
+    _clear_ler_match_highlight()
+    _clear_suggestion_highlight()
+    _write_ler_matches_json()
+    window.post_redraw()
+
+
+# ── "Suggest LER match": rank nearby LER features by proximity, direction,
+# diameter and colour similarity to the current instance, so the user can
+# accept a proposed link instead of hunting for the right line to click.
+# The suggestion is only a starting point — Accept just records the same
+# match a manual click would, and the user can pick "Next candidate" or fall
+# back to clicking a different line themselves if the top guess is wrong.
+LER_SUGGEST_HIGHLIGHT_GEOM = "ler_suggest_highlight"
+_suggestion_state = {"candidates": [], "idx": 0}
+
+
+def _clear_suggestion_highlight():
+    try:
+        scene_widget.scene.remove_geometry(LER_SUGGEST_HIGHLIGHT_GEOM)
+    except Exception:
+        pass
+
+
+def _place_suggestion_highlight(p1, p2):
+    _clear_suggestion_highlight()
+    ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.array([p1, p2])),
+        lines=o3d.utility.Vector2iVector([[0, 1]]),
+    )
+    ls.paint_uniform_color([1.0, 0.85, 0.0])  # yellow — tentative, vs. magenta for a confirmed match
+    mat = line_material(6.0)
+    try:
+        mat.depth_func = "always"
+    except AttributeError:
+        pass
+    scene_widget.scene.add_geometry(LER_SUGGEST_HIGHLIGHT_GEOM, ls, mat)
+
+
+def _show_current_suggestion():
+    cands = _suggestion_state["candidates"]
+    i = _suggestion_state["idx"]
+    if not cands:
+        _suggest_lbl.text = "No nearby LER candidates found"
+        _suggest_lbl.text_color = gui.Color(0.9, 0.5, 0.4, 1.0)
+        _clear_suggestion_highlight()
+        return
+    c = cands[i]
+    parts_str = ", ".join(f"{k}={v:.2f}" for k, v in c["breakdown"].items())
+    _suggest_lbl.text = (f"Suggestion {i + 1}/{len(cands)}: {c['layer']}\n"
+                        f"score={c['score']:.2f}  ({parts_str})")
+    _suggest_lbl.text_color = gui.Color(1.0, 0.85, 0.2, 1.0)
+    _place_suggestion_highlight(*c["rep_segment"])
+    window.post_redraw()
+
+
+def _suggest_ler_match():
+    if not instance_data:
+        return
+    idx = _current_inst_idx[0]
+    inst = instance_data[idx]
+    pts = np.asarray(inst["pcd"].points)
+    colors = np.asarray(inst["pcd"].colors) if inst["pcd"].has_colors() else None
+
+    allowed_layers = None
+    label_name = _instance_labels.get(idx)
+    if label_name:
+        match_cfg = UTILITY_TO_LER_MATCH.get(_LABEL_TO_ID.get(label_name))
+        if match_cfg:
+            allowed_layers = match_cfg["layers"]
+
+    candidates = score_candidates(pts, colors, _ler_feature_index, allowed_layers=allowed_layers)
+    _suggestion_state["candidates"] = candidates
+    _suggestion_state["idx"] = 0
+    _show_current_suggestion()
+
+
+def _next_suggestion():
+    cands = _suggestion_state["candidates"]
+    if not cands:
+        return
+    _suggestion_state["idx"] = (_suggestion_state["idx"] + 1) % len(cands)
+    _show_current_suggestion()
+
+
+def _accept_suggestion():
+    cands = _suggestion_state["candidates"]
+    if not cands:
+        return
+    c = cands[_suggestion_state["idx"]]
+    idx = _current_inst_idx[0]
+    _instance_ler_match[idx] = {"layer": c["layer"], "gml_id": c["gml_id"]}
+    print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
+          f"-> {c['layer']}  gml_id={c['gml_id']}  (accepted suggestion, score={c['score']:.2f})")
+    _refresh_ler_match_label(idx)
+    _place_ler_match_highlight(*c["rep_segment"])
+    _clear_suggestion_highlight()
+    _write_ler_matches_json()
+    window.post_redraw()
+
+
+_ler_last_click = [None]
+
+
+def _do_pick_ler(depth_image):
+    if _ler_last_click[0] is None or not instance_data:
+        return
+    ex, ey = _ler_last_click[0]
+    _ler_last_click[0] = None
+
+    sx = int(ex - scene_widget.frame.x)
+    sy = int(ey - scene_widget.frame.y)
+    depth_arr = np.asarray(depth_image)
+    h, w = depth_arr.shape[:2]
+    px = int(np.clip(sx, 0, w - 1))
+    py = int(np.clip(sy, 0, h - 1))
+    depth = float(depth_arr[py, px])
+    if depth >= 1.0 or len(pick_seg_p1) == 0:
+        return
+
+    world = scene_widget.scene.camera.unproject(
+        sx, sy, depth, scene_widget.frame.width, scene_widget.frame.height,
+    )
+    hit = np.array(world[:3], dtype=float)
+
+    seg_dists = _batch_point_to_segment_dists(hit, pick_seg_p1, pick_seg_p2)
+    for _si, _sl in enumerate(pick_seg_layer):
+        if not _layer_visible.get(_sl, True) or not ler_utilities_visible[0]:
+            seg_dists[_si] = np.inf
+    best_i = int(np.argmin(seg_dists))
+    best_d = float(seg_dists[best_i])
+    if best_d > LER_MATCH_PICK_RADIUS:
+        return
+
+    idx = _current_inst_idx[0]
+    layer_name = pick_seg_layer[best_i]
+    gml_id = pick_seg_gml_id[best_i]
+    _instance_ler_match[idx] = {"layer": layer_name, "gml_id": gml_id}
+    print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
+          f"-> {layer_name}  gml_id={gml_id}")
+
+    def _update():
+        _place_ler_match_highlight(pick_seg_p1[best_i], pick_seg_p2[best_i])
+        _clear_suggestion_highlight()
+        _refresh_ler_match_label(idx)
+        _write_ler_matches_json()
+        window.post_redraw()
+    gui.Application.instance.post_to_main_thread(window, _update)
+
+
+# Distinguish a genuine click (pick) from a drag-to-orbit, same approach as
+# base_module.py's segment picking.
+_LER_DRAG_THRESHOLD = 8  # pixels
+_ler_mouse_down_pos = [None]
+_ler_mouse_moved = [False]
+_ler_left_was_down = [False]
+
+
+def _on_mouse_ler(event):
+    if event.type == gui.MouseEvent.Type.BUTTON_DOWN:
+        if int(event.buttons) & int(gui.MouseButton.LEFT):
+            _ler_mouse_down_pos[0] = (event.x, event.y)
+            _ler_mouse_moved[0] = False
+            _ler_left_was_down[0] = True
+        return gui.Widget.EventCallbackResult.IGNORED
+
+    if event.type == gui.MouseEvent.Type.MOVE:
+        if _ler_left_was_down[0] and _ler_mouse_down_pos[0] is not None:
+            dx = event.x - _ler_mouse_down_pos[0][0]
+            dy = event.y - _ler_mouse_down_pos[0][1]
+            if (dx * dx + dy * dy) > _LER_DRAG_THRESHOLD * _LER_DRAG_THRESHOLD:
+                _ler_mouse_moved[0] = True
+        return gui.Widget.EventCallbackResult.IGNORED
+
+    if event.type == gui.MouseEvent.Type.BUTTON_UP:
+        if not _ler_left_was_down[0]:
+            return gui.Widget.EventCallbackResult.IGNORED
+        _ler_left_was_down[0] = False
+        if _ler_mouse_moved[0] or _ler_mouse_down_pos[0] is None:
+            _ler_mouse_down_pos[0] = None
+            return gui.Widget.EventCallbackResult.IGNORED
+
+        click_pos = _ler_mouse_down_pos[0]
+        _ler_mouse_down_pos[0] = None
+        _ler_last_click[0] = click_pos
+        scene_widget.scene.scene.render_to_depth_image(_do_pick_ler)
+        # HANDLED so Open3D does not also pan/translate the view on this click
+        return gui.Widget.EventCallbackResult.HANDLED
+
+    return gui.Widget.EventCallbackResult.IGNORED
+
+
+if instance_data:
+    scene_widget.set_on_mouse(_on_mouse_ler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 12.  Camera helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _pivot_to(point: np.ndarray):
@@ -1357,6 +1704,10 @@ def on_key(event):
     if k in (ord('H'), ord('h')):
         print("\n-- Shortcuts ---------------------------------------------------")
         print("  1-0            assign label to current instance (1-10)")
+        print("  Left-click     link a utility line to the current instance")
+        print("                 (exclusive LER match, see left panel)")
+        print("                 or use 'Mark as NOT in LER' if it isn't registered")
+        print("                 or try 'Suggest LER match' for a proposed link")
         print("  C              pivot to point cloud centroid")
         print("  P              pivot to pipe centroid (all utilities)")
         print("  T              top view of trench (or scene if none)")
