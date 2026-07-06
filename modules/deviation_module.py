@@ -4,6 +4,14 @@ Geometric Deviation Viewer — Instances vs LER Utility Registry
 ===============================================================
 Refactored to use core/ for shared configuration and data loading.
 
+If label_module.py recorded an exclusive LER match for an instance
+(ler_matches.json next to its labelled PLYs, keyed by gml_id), that instance
+is measured against only its linked LER feature, in both directions: the
+instance's own deviation stats/colouring, and that feature's discretized
+LER-surface deviation clouds. Instances without a recorded match keep the
+original behaviour of measuring against every nearby LER feature whose layer
+matches the instance's utility type.
+
 Usage: python modules/deviation_module.py
   Change the site by editing PLY_FILE in core/config.py.
 """
@@ -23,6 +31,7 @@ import geopandas as gpd
 import numpy as np
 import re
 import time
+import json
 from shapely.geometry import LineString as ShapelyLine, Point as ShapelyPoint, box as shapely_box
 from shapely.ops import unary_union
 
@@ -115,6 +124,7 @@ all_seg_layer = []
 all_seg_active = []       # True = "i drift", False = "permanent ude af drift"
 all_seg_half_width = []   # half-width for plane segments (ledningstrace), 0 for cylinders
 all_seg_radius = []       # cylinder radius per segment (used to sample the tube surface)
+all_seg_gml_id = []       # GML gml_id per segment — identifies the whole feature
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
@@ -278,6 +288,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
             color = default_color
 
         vejl = row.get("vejledendeDybde", None) if "vejledendeDybde" in row.index else None
+        gml_id_val = str(row.get("gml_id", "") or "")
 
         hit = False
         for sub in subs:
@@ -298,6 +309,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_active.append(is_active)
                 all_seg_half_width.append(bredde_m / 2.0 if bredde_m is not None else 0.0)
                 all_seg_radius.append(radius)
+                all_seg_gml_id.append(gml_id_val)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
@@ -369,6 +381,7 @@ seg_p2 = np.array(all_seg_p2) if all_seg_p2 else np.empty((0, 3))
 seg_active = np.array(all_seg_active, dtype=bool) if all_seg_active else np.empty(0, dtype=bool)
 seg_half_width = np.array(all_seg_half_width, dtype=float) if all_seg_half_width else np.empty(0, dtype=float)
 seg_radius = np.array(all_seg_radius, dtype=float) if all_seg_radius else np.empty(0, dtype=float)
+seg_gml_id = np.array(all_seg_gml_id, dtype=object) if all_seg_gml_id else np.empty(0, dtype=object)
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
@@ -708,6 +721,27 @@ print(f"  {len(_inst_files)} PLY files ({_src_label})")
 if not _inst_files:
     raise SystemExit("[ERROR] No instance PLY files found.")
 
+# Exclusive instance -> LER feature links recorded by label_module.py, keyed by
+# PLY filename: {"layer": <display name>, "gml_id": <GML gml_id>}. When present
+# for an instance, that instance is measured against only this one feature
+# instead of every nearby feature whose layer matches the instance's type.
+# ler_matches.json lives next to the PLYs it describes; _inst_files can mix
+# files from more than one directory (e.g. top-level water instances plus a
+# labeled_* subfolder), so every distinct parent directory is checked.
+_ler_matches = {}
+for _matches_dir in dict.fromkeys(p.parent for p in _inst_files):
+    _matches_path = _matches_dir / "ler_matches.json"
+    if not _matches_path.is_file():
+        continue
+    try:
+        with open(_matches_path, "r", encoding="utf-8") as f:
+            _loaded = json.load(f)
+        _ler_matches.update(_loaded)
+        print(f"\nLoaded {len(_loaded)} exclusive LER match(es) from "
+              f"{_matches_dir.name}/{_matches_path.name}")
+    except Exception as e:
+        print(f"\n[warn] failed to read {_matches_path}: {e}")
+
 print("\n--- Computing deviations: instances vs LER ---")
 class_instances = {}
 
@@ -724,10 +758,34 @@ for inst_path in _inst_files:
         utility_type = utility_type_from_filename(inst_path.name)
     ut_label = UTILITY_TYPE_LABELS.get(utility_type, f"Unknown({utility_type})")
 
-    # Compute distances: all matching segments (active + inactive combined for heatmap)
-    seg_mask_all = _get_matching_segment_mask(utility_type)
-    seg_mask_act = _get_matching_segment_mask(utility_type, active_only=True)
-    seg_mask_inact = _get_matching_segment_mask(utility_type, active_only=False)
+    ler_match = _ler_matches.get(inst_path.name)
+    match_gml_id = ler_match.get("gml_id") if ler_match else None
+    confirmed_no_ler = bool(ler_match and ler_match.get("no_ler"))
+
+    # Compute distances: all matching segments (active + inactive combined for
+    # heatmap).
+    #   - confirmed_no_ler: label_module recorded that this instance has no
+    #     counterpart anywhere in LER, so no segment is ever measured against
+    #     it (has_ler stays False) rather than falling back to the nearest
+    #     same-type feature, which could be an unrelated, already-registered
+    #     utility that merely happens to sit nearby.
+    #   - match_gml_id: an exclusive match restricts this to the one linked
+    #     feature (identified by gml_id, covering all of its clipped
+    #     sub-segments) instead of every segment whose layer matches the
+    #     instance's utility type.
+    #   - otherwise: the original nearest-of-type behaviour.
+    if confirmed_no_ler:
+        seg_mask_all = np.zeros(len(seg_p1), dtype=bool)
+        seg_mask_act = seg_mask_all
+        seg_mask_inact = seg_mask_all
+    elif match_gml_id:
+        seg_mask_all = (seg_gml_id == match_gml_id)
+        seg_mask_act = seg_mask_all & seg_active
+        seg_mask_inact = seg_mask_all & ~seg_active
+    else:
+        seg_mask_all = _get_matching_segment_mask(utility_type)
+        seg_mask_act = _get_matching_segment_mask(utility_type, active_only=True)
+        seg_mask_inact = _get_matching_segment_mask(utility_type, active_only=False)
     n_act = int(seg_mask_act.sum())
     n_inact = int(seg_mask_inact.sum())
     n_matched = n_act + n_inact
@@ -824,6 +882,7 @@ for inst_path in _inst_files:
         "utility_type": utility_type,
         "label": ut_label,
         "has_ler": has_ler,
+        "ler_match": ler_match,
         "n_active_segs": n_act,
         "n_inactive_segs": n_inact,
         "pcd_dev": pcd_dev,
@@ -844,6 +903,12 @@ for inst_path in _inst_files:
     class_instances.setdefault(utility_type, []).append(inst_data)
 
     _ti1 = time.perf_counter()
+    if confirmed_no_ler:
+        match_tag = "  [confirmed: not in LER]"
+    elif match_gml_id:
+        match_tag = f"  [exclusive match: {ler_match['layer']}]"
+    else:
+        match_tag = ""
     if has_ler:
         tag = f"active={n_act} inactive={n_inact}"
         print(f"  {inst_path.stem}: {len(pts_inst):,} pts  "
@@ -852,11 +917,11 @@ for inst_path in _inst_files:
               f"mean={stats['mean']*1000:.1f}mm  "
               f"P95={stats['p95']*1000:.1f}mm  "
               f"max={stats['max']*1000:.1f}mm  "
-              f"[{_ti1 - _ti0:.2f}s]")
+              f"[{_ti1 - _ti0:.2f}s]{match_tag}")
     else:
         print(f"  {inst_path.stem}: {len(pts_inst):,} pts  "
               f"type={ut_label}  "
-              f"** No matching LER utility **  [{_ti1 - _ti0:.2f}s]")
+              f"** No matching LER utility **  [{_ti1 - _ti0:.2f}s]{match_tag}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Per-class summary
@@ -1013,12 +1078,29 @@ _NO_DATA_COLOR = [0.5, 0.5, 0.5]
 LER_LENGTH_STEP = 0.02    # m — sample spacing along each segment
 LER_SURFACE_STEP = 0.02   # m — surface sample spacing (ribbon width / tube ring)
 
+# Instances with an exclusive LER match (see label_module.py) contribute only
+# to their linked feature's own reference set, keyed by gml_id, so that
+# feature's discretized deviation is measured against just that one instance.
+_matched_feature_pts = {}
+for _instances in class_instances.values():
+    for _inst in _instances:
+        _mi = _inst.get("ler_match")
+        if not _mi or not _mi.get("gml_id"):
+            continue
+        _pts_full = np.asarray(_inst["pcd_dev"].points)
+        if len(_pts_full):
+            _matched_feature_pts.setdefault(_mi["gml_id"], []).append(_pts_full)
+_matched_feature_pts = {gid: np.concatenate(v) for gid, v in _matched_feature_pts.items()}
+
 # Instance points each layer is compared against: the union over all utility
 # types whose LER match covers a segment in that layer. Only utility types with
 # an explicit LER match contribute; unlabelled / unmatched instances (whose
 # match mask would otherwise cover every segment) are skipped so that
 # unsegmented LER layers, e.g. Gasledning or Foeringsroer, get no reference
-# points and therefore no deviation.
+# points and therefore no deviation. Instances already claimed by an exclusive
+# match are excluded from this generic per-type pool (they feed
+# _matched_feature_pts instead), so an unmatched nearby feature of the same
+# type does not pick up an already-claimed instance as its neighbour.
 _layer_ref_pts = {}
 for ut, instances in class_instances.items():
     if UTILITY_TO_LER_MATCH.get(ut) is None:
@@ -1026,8 +1108,11 @@ for ut, instances in class_instances.items():
     mask = _get_matching_segment_mask(ut)   # combined active + inactive
     if not mask.any() or not instances:
         continue
+    unmatched = [inst for inst in instances if not inst.get("ler_match")]
+    if not unmatched:
+        continue
     pts_ut = np.concatenate(
-        [np.asarray(inst["pcd_dev"].points) for inst in instances])
+        [np.asarray(inst["pcd_dev"].points) for inst in unmatched])
     if len(pts_ut) == 0:
         continue
     for ln in set(_seg_layer_arr[mask]):
@@ -1058,8 +1143,19 @@ for ln in ler_meshes:
     # the wide trace plane in ler_meshes, which this does not touch.
     _is_trace = ln.startswith("Ledningstrace")
     ref_list = _layer_ref_pts.get(ln)
-    ref_pts = np.concatenate(ref_list) if ref_list else None
-    tree = cKDTree(ref_pts) if ref_pts is not None else None
+    _generic_ref_pts = np.concatenate(ref_list) if ref_list else None
+    _generic_tree = cKDTree(_generic_ref_pts) if _generic_ref_pts is not None else None
+    _feature_trees = {}  # gml_id -> (cKDTree, ref_pts), built lazily per feature
+
+    def _tree_for_gid(gid):
+        """Exclusive per-feature tree when this gml_id has a matched instance,
+        else the generic per-type tree shared by every unmatched feature."""
+        if gid and gid in _matched_feature_pts:
+            if gid not in _feature_trees:
+                _fp = _matched_feature_pts[gid]
+                _feature_trees[gid] = (cKDTree(_fp), _fp)
+            return _feature_trees[gid]
+        return (_generic_tree, _generic_ref_pts)
 
     samp_chunks = []
     col_chunks, col_cont_chunks = [], []
@@ -1075,6 +1171,7 @@ for ln in ler_meshes:
             samp = discretize_segment(
                 seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
                 LER_LENGTH_STEP, LER_SURFACE_STEP)
+        tree, ref_pts = _tree_for_gid(seg_gml_id[idx] if idx < len(seg_gml_id) else "")
         if tree is not None:
             # 3D-nearest measured point; the Z and XY deviations are the
             # vertical and horizontal components of the displacement to that
