@@ -124,6 +124,8 @@ all_seg_layer = []
 all_seg_active = []       # True = "i drift", False = "permanent ude af drift"
 all_seg_half_width = []   # half-width for plane segments (ledningstrace), 0 for cylinders
 all_seg_radius = []       # cylinder radius per segment (used to sample the tube surface)
+all_seg_crown_offset = [] # top->axis lowering per segment: the tube radius for every
+                          # pipe (registered or fallback diameter), 0 for traces
 all_seg_gml_id = []       # GML gml_id per segment — identifies the whole feature
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
@@ -309,11 +311,22 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_active.append(is_active)
                 all_seg_half_width.append(bredde_m / 2.0 if bredde_m is not None else 0.0)
                 all_seg_radius.append(radius)
+                # The registered vertical coordinate is the crown (top) of the
+                # utility, not its axis, for every LER utility (featurekatalog,
+                # geometri attribute: "Vertikale koordinater af geometrien angives
+                # for overkanten af ledningen"). crown_offset is how far to lower
+                # the registered line so the built cylinder's crown sits on it: the
+                # tube radius for every pipe (whether the diameter is registered or
+                # a fallback is used), and 0 for traces, which are flat ribbons
+                # already at the registered top level.
+                crown_offset = radius if bredde_m is None else 0.0
+                all_seg_crown_offset.append(crown_offset)
                 all_seg_gml_id.append(gml_id_val)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
-                    mesh = segment_to_cylinder(cp1, cp2, radius, color)
+                    _dz = np.array([0.0, 0.0, crown_offset])
+                    mesh = segment_to_cylinder(cp1 - _dz, cp2 - _dz, radius, color)
                 if mesh is not None:
                     if is_trace:
                         _trace_sub_cyls.setdefault(display_name, []).append(mesh)
@@ -381,6 +394,7 @@ seg_p2 = np.array(all_seg_p2) if all_seg_p2 else np.empty((0, 3))
 seg_active = np.array(all_seg_active, dtype=bool) if all_seg_active else np.empty(0, dtype=bool)
 seg_half_width = np.array(all_seg_half_width, dtype=float) if all_seg_half_width else np.empty(0, dtype=float)
 seg_radius = np.array(all_seg_radius, dtype=float) if all_seg_radius else np.empty(0, dtype=float)
+seg_crown_offset = np.array(all_seg_crown_offset, dtype=float) if all_seg_crown_offset else np.empty(0, dtype=float)
 seg_gml_id = np.array(all_seg_gml_id, dtype=object) if all_seg_gml_id else np.empty(0, dtype=object)
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
@@ -444,7 +458,10 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12)
-        sphere.translate(pt)
+        # Registered Z is the top of the component (featurekatalog: "Dybden
+        # angives for overkant af komponent"); lower the marker so its top sits
+        # on the registered point rather than its centre.
+        sphere.translate(pt - np.array([0.0, 0.0, COMPONENT_SPHERE_RADIUS]))
         sphere.paint_uniform_color(color)
         spheres.append(sphere)
         n_comp += 1
@@ -1168,8 +1185,13 @@ for ln in ler_meshes:
                 seg_p1[idx], seg_p2[idx], 0.0, 0.0,
                 LER_LENGTH_STEP, LER_SURFACE_STEP)
         else:
+            # Lower the axis by the tube radius so the sampled tube's crown sits on
+            # the registered line (the pipe top, not the axis), for every pipe. This
+            # makes the per-sample Z deviation a true top-to-top depth difference.
+            # seg_crown_offset is 0 only for traces, which are handled above.
+            _dz = np.array([0.0, 0.0, seg_crown_offset[idx]])
             samp = discretize_segment(
-                seg_p1[idx], seg_p2[idx], seg_radius[idx], seg_half_width[idx],
+                seg_p1[idx] - _dz, seg_p2[idx] - _dz, seg_radius[idx], seg_half_width[idx],
                 LER_LENGTH_STEP, LER_SURFACE_STEP)
         tree, ref_pts = _tree_for_gid(seg_gml_id[idx] if idx < len(seg_gml_id) else "")
         if tree is not None:
