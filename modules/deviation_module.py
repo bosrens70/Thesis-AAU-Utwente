@@ -458,10 +458,7 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12)
-        # Registered Z is the top of the component (featurekatalog: "Dybden
-        # angives for overkant af komponent"); lower the marker so its top sits
-        # on the registered point rather than its centre.
-        sphere.translate(pt - np.array([0.0, 0.0, COMPONENT_SPHERE_RADIUS]))
+        sphere.translate(pt)
         sphere.paint_uniform_color(color)
         spheres.append(sphere)
         n_comp += 1

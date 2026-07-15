@@ -646,9 +646,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12
         )
-        # Registered Z is the top of the component; lower the marker so its top
-        # sits on the registered point rather than its centre.
-        sphere.translate(pt - np.array([0.0, 0.0, COMPONENT_SPHERE_RADIUS]))
+        sphere.translate(pt)
         sphere.paint_uniform_color(color)
         all_comp_meshes.append(sphere)
         _comp_layer_spheres.setdefault(layer_name, []).append(sphere)
