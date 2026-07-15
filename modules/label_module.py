@@ -485,7 +485,11 @@ for layer_name, cfg in LINE_LAYERS.items():
                 if bredde_m is not None:
                     mesh = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
                 else:
-                    mesh = segment_to_cylinder(clipped[0], clipped[1], radius, color)
+                    # Registered Z is the pipe crown (top), not its axis; lower the
+                    # drawn cylinder by its radius so its crown sits on the line.
+                    # The pick line (below) stays on the registered crown.
+                    _dz = np.array([0.0, 0.0, radius])
+                    mesh = segment_to_cylinder(clipped[0] - _dz, clipped[1] - _dz, radius, color)
                 if mesh is not None:
                     all_pipe_meshes.append(mesh)
                     storage_key = get_storage_key(layer_name, display_fa)
@@ -642,7 +646,9 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12
         )
-        sphere.translate(pt)
+        # Registered Z is the top of the component; lower the marker so its top
+        # sits on the registered point rather than its centre.
+        sphere.translate(pt - np.array([0.0, 0.0, COMPONENT_SPHERE_RADIUS]))
         sphere.paint_uniform_color(color)
         all_comp_meshes.append(sphere)
         _comp_layer_spheres.setdefault(layer_name, []).append(sphere)
