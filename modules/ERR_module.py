@@ -32,6 +32,8 @@ import re
 import time
 from core.config import (
     GML_PATH, AREA_REF_GEOJSON, PLY_BASE_DIR, CROP_RADIUS,
+    PANEL_WIDTH_EM,
+    LEDNINGSPAKKE_NAME,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
@@ -41,7 +43,7 @@ from core.config import (
     SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
 )
 from core.gui_helpers import make_legend_row
-from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear
+from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear, linear_to_srgb
 from core import symbology as sym
 from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
@@ -1247,12 +1249,6 @@ def make_frame_material() -> rendering.MaterialRecord:
     return flat_material()
 
 
-def linear_to_srgb(c: float) -> float:
-    if c <= 0.0031308:
-        return 12.92 * c
-    return 1.055 * (c ** (1.0 / 2.4)) - 0.055
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # 11.  Build GUI
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1368,7 +1364,7 @@ def _toggle_class_labels(show_labels: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 # 12.  Right-side control panel  (matches base_module layout)
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_WIDTH = int(20 * em)
+PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Area: {AREA_NAME}  |  Sites: {len(all_pcd_filtered)}"))
@@ -1484,11 +1480,6 @@ panel.add_child(grave_visible_cb)
 panel.add_fixed(int(0.2 * em))
 
 grave_opacity_label = gui.Label(f"{grave_opacity[0]:.2f}")
-grave_opacity_row = gui.Horiz(int(0.25 * em))
-grave_opacity_row.add_child(gui.Label("Opacity"))
-grave_opacity_row.add_child(gui.Slider(gui.Slider.DOUBLE))
-grave_opacity_row = gui.Horiz(int(0.25 * em))
-grave_opacity_row.add_child(gui.Label("Opacity"))
 
 grave_slider = gui.Slider(gui.Slider.DOUBLE)
 grave_slider.set_limits(0.0, 1.0)
@@ -1510,16 +1501,18 @@ def _apply_grave_opacity(val):
 grave_slider.set_on_value_changed(lambda v: _apply_grave_opacity(v))
 
 grave_slider_row = gui.Horiz(int(0.25 * em))
-grave_slider_row.add_child(gui.Label("Opacity"))
+grave_slider_row.add_child(gui.Label("Graveforesp opacity"))
 grave_slider_row.add_child(grave_slider)
+grave_slider_row.add_child(grave_opacity_label)
 panel.add_child(grave_slider_row)
 
 panel.add_fixed(int(0.8 * em))
 
 # ── Utility Legend (with per-layer visibility toggles) ────────────────────
-_gml_folder = Path(GML_PATH).parent.name
-_ler_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _gml_folder, re.IGNORECASE)
-_ler_label = f"{_ler_match.group(1)} {_ler_match.group(2)}" if _ler_match else _gml_folder
+# The package name comes from core.config (derived from the site selection), so
+# this label cannot disagree with the data actually loaded, or with the other
+# modules showing the same toggle.
+_ler_label = LEDNINGSPAKKE_NAME
 
 _ler_active = [True]
 pipe_opacity_val = [1.0]
@@ -1537,7 +1530,7 @@ opacity_slider.set_limits(0.0, 1.0)
 opacity_slider.double_value = 1.0
 
 slider_row = gui.Horiz(int(0.25 * em))
-slider_row.add_child(gui.Label("Opacity"))
+slider_row.add_child(gui.Label("LER opacity"))
 slider_row.add_child(opacity_slider)
 
 

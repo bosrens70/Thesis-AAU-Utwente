@@ -17,7 +17,7 @@ instance against only its linked LER feature instead of every nearby feature
 of the same utility type.
 
 Usage: python modules/label_module.py
-  Change the site by editing PLY_FILE in core/config.py.
+  Change the site in core/site_local.py.
 """
 
 import sys
@@ -41,19 +41,23 @@ from datetime import datetime
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PANEL_WIDTH_EM,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
+    LEDNINGSPAKKE_NAME,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
     TARGET_CLASS, UTILITY_TO_LER_MATCH,
     forsyningsart_color,
 )
-from core.data_loader import init_site, discover_instances, pick_ground_level, load_trench
+from core.data_loader import (
+    init_site, discover_instances, load_or_pick_ground_level, load_trench,
+)
 from core.gui_helpers import make_legend_row, make_master_pipe_toggle, make_master_comp_toggle
 from core.ler_matching import build_feature_index, score_candidates
 from core.geometry import (
     segment_to_plane,
-    segments_in_rect, point_in_rect, clip_segment_to_rect,
+    segments_in_rect, point_in_rect, clip_segment_to_rect, linear_to_srgb,
 )
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 from core.rendering import (
@@ -175,9 +179,11 @@ _instance_ler_match = {}  # idx -> {"layer": str, "gml_id": str} — exclusive L
 _current_inst_idx = [0]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  Pick ground-level points (shared function from core/)
+# 3.  Ground level: cached per site in <stem>_ground.json next to the PLY, so it
+#     is picked once and then shared with the other modules. Delete that file to
+#     re-pick.
 # ─────────────────────────────────────────────────────────────────────────────
-GROUND_Z = pick_ground_level(site.pc)
+GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)
 print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 
 _ground_normal = np.array([0.0, 0.0, 1.0])
@@ -819,12 +825,6 @@ def make_frame_material() -> rendering.MaterialRecord:
     return flat_material()
 
 
-def linear_to_srgb(c: float) -> float:
-    if c <= 0.0031308:
-        return 12.92 * c
-    return 1.055 * (c ** (1.0 / 2.4)) - 0.055
-
-
 def _add_mesh(scene, name, mesh, mat):
     """Add a TriangleMesh to the scene, ensuring vertex normals exist first."""
     if not mesh.has_vertex_normals():
@@ -936,7 +936,7 @@ scene_widget.look_at(cloud_centroid.tolist(), _init_eye.tolist(), [0.0, 1.0, 0.0
 # ─────────────────────────────────────────────────────────────────────────────
 # 10.  Right-side control panel
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_WIDTH = int(20 * em)
+PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 # Title
@@ -963,7 +963,7 @@ panel.add_child(origin_toggle_cb)
 panel.add_fixed(int(0.5 * em))
 
 # ── Utility Legend (Ledningspakke_2803288) ───────────────────────────────────
-ler_toggle_cb = gui.Checkbox("Ledningspakke_2803288")
+ler_toggle_cb = gui.Checkbox(LEDNINGSPAKKE_NAME)
 ler_toggle_cb.checked = True
 
 
@@ -1082,7 +1082,7 @@ panel.add_fixed(int(0.8 * em))
 
 opacity_value_label = gui.Label("1.00")
 lbl_row = gui.Horiz(int(0.25 * em))
-lbl_row.add_child(gui.Label("Utility Opacity"))
+lbl_row.add_child(gui.Label("LER opacity"))
 lbl_row.add_stretch()
 lbl_row.add_child(opacity_value_label)
 panel.add_child(lbl_row)
@@ -1114,16 +1114,6 @@ opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
 panel.add_child(opacity_slider)
 panel.add_fixed(int(0.4 * em))
 
-panel.add_child(gui.Label("Quick set"))
-btn_row = gui.Horiz(int(0.2 * em))
-for pct in (0, 25, 50, 75, 100):
-    btn = gui.Button(f"{pct}%")
-    def _make_cb(a):
-        def _cb(): _apply_opacity(a)
-        return _cb
-    btn.set_on_clicked(_make_cb(pct / 100.0))
-    btn_row.add_child(btn)
-panel.add_child(btn_row)
 
 panel.add_stretch()
 

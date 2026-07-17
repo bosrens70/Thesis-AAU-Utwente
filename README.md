@@ -99,12 +99,14 @@ python modules/deviation_module.py
 python tools/ply_to_las.py --area 3
 ```
 
-**Switching sites:** create `core/site_local.py` (gitignored) and set `SITE`
-(and, for a different Ledningspakke, `LEDNINGSPAKKE_DIR`); see the docstring
-in that file for the exact fields. This keeps day-to-day site switching out
-of tracked files; `core/config.py` falls back to its committed default when
-`core/site_local.py` is absent or a field is missing. Every script reads its
-configuration from `core/config.py`.
+**Switching sites:** the active site lives in `core/site_local.py` (gitignored),
+which sets `SITE` (the `.ply` path) and `LEDNINGSPAKKE_DIR` (the GML package).
+This is the single place to change the site, and it keeps day-to-day switching
+out of tracked files. There is no committed default: `core/config.py` reads
+both fields from `core/site_local.py` and raises a clear error if the file is
+missing, so it must be created once per machine (see the docstring in that file
+for the exact fields). Every script then reads its configuration from
+`core/config.py`.
 
 ## Data model
 

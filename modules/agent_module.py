@@ -31,6 +31,7 @@ import json as _json
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
+    PANEL_WIDTH_EM,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     forsyningsart_color,
@@ -620,7 +621,7 @@ def get_visible_layers():
 # 8.  Right panel — site info + chat
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_WIDTH = int(24 * em)
+PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 # Site info

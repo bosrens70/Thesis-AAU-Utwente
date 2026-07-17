@@ -6,7 +6,7 @@ Single Point Cloud Viewer with Surrounding Utilities — Indicative Depth
 Refactored to use core/ for shared configuration and data loading.
 
 Usage: python modules/base_module.py
-  Change the site by editing PLY_FILE in core/config.py.
+  Change the site in core/site_local.py.
 """
 
 import sys
@@ -28,6 +28,7 @@ import time
 import copy
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PANEL_WIDTH_EM,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
@@ -36,7 +37,9 @@ from core.config import (
     forsyningsart_color,
 )
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
-from core.geometry import segments_in_rect, point_in_rect, clip_segment_to_rect
+from core.geometry import (
+    segments_in_rect, point_in_rect, clip_segment_to_rect, linear_to_srgb,
+)
 from core.rendering import (
     point_material_shaded, mesh_material, line_material, flat_material,
     setup_scene_lighting,
@@ -788,12 +791,6 @@ def make_frame_material() -> rendering.MaterialRecord:
     return flat_material()
 
 
-def linear_to_srgb(c: float) -> float:
-    if c <= 0.0031308:
-        return 12.92 * c
-    return 1.055 * (c ** (1.0 / 2.4)) - 0.055
-
-
 def _add_mesh(scene, name, mesh, mat):
     """Add a TriangleMesh to the scene, ensuring vertex normals exist first."""
     if not mesh.has_vertex_normals():
@@ -890,7 +887,7 @@ def _toggle_class_labels(show_labels: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 # 10.  Right-side control panel
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_WIDTH = int(20 * em)
+PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Points: {len(pts):,}"))
@@ -1014,7 +1011,7 @@ opacity_slider.set_limits(0.0, 1.0)
 opacity_slider.double_value = 1.0
 
 slider_row = gui.Horiz(int(0.25 * em))
-slider_row.add_child(gui.Label("Opacity"))
+slider_row.add_child(gui.Label("LER opacity"))
 slider_row.add_child(opacity_slider)
 
 

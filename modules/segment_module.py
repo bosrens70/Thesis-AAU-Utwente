@@ -30,6 +30,7 @@ from datetime import datetime
 
 from core.config import (
     PLY_FILE, PLY_HEADER_ROWS, CLASS_COLUMN, TARGET_CLASS,
+    PANEL_WIDTH_EM,
     VOXEL_SIZE, MIN_CLUSTER_SIZE, MIN_SAMPLES, POINT_SIZE,
     MIN_INSTANCE_POINTS,
 )
@@ -207,7 +208,6 @@ pcd_bg.colors = o3d.utility.Vector3dVector(rgb_bg)
 # 5. GUI VIEWER
 # ─────────────────────────────────────────────────────────────────────────────
 class InstanceViewer:
-    _PANEL_WIDTH = 300
     _MAX_SLOTS   = 30
 
     def __init__(self):
@@ -220,6 +220,11 @@ class InstanceViewer:
         gui.Application.instance.initialize()
         self.window = gui.Application.instance.create_window(
             f"HDBSCAN Instance Viewer — {ply_path.name} ", 1440, 900)
+
+        # Panel width is em-based like every other module, so it scales with the
+        # theme font. It can only be resolved once the window (and its theme)
+        # exists, hence an instance attribute rather than a class one.
+        self._PANEL_WIDTH = int(PANEL_WIDTH_EM * self.window.theme.font_size)
 
         self.scene = gui.SceneWidget()
         self.scene.scene = rendering.Open3DScene(self.window.renderer)

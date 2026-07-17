@@ -2,9 +2,9 @@
 """
 Centralised configuration for all viewers and tools.
 =====================================================
-Change the site by editing PLY_FILE (and optionally GML_PATH /
-AREA_REF_GEOJSON if working with a different Ledningspakke).
-All other scripts import from here, nothing is duplicated.
+The active site and Ledningspakke are set in core/site_local.py (gitignored);
+everything else is defined here. All other scripts import from here, nothing
+is duplicated.
 """
 
 import os
@@ -32,28 +32,37 @@ DATA_DIR     = Path(os.environ.get("THESIS_DATA_DIR", PROJECT_ROOT / "Data"))
 PLY_BASE_DIR = DATA_DIR / "OpenTrench3D"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SITE SELECTION: change these to switch site
+# SITE SELECTION: set in core/site_local.py (gitignored)
 # ─────────────────────────────────────────────────────────────────────────────
-# Switching sites while working (a routine, frequent action) should not dirty
-# a tracked file. The default below is the committed fallback; day-to-day
-# switching instead goes in core/site_local.py, a gitignored override (fields
-# documented in that file's docstring). If that file is absent or missing a
-# field, the corresponding default here is used.
-_DEFAULT_SITE_REL          = "Water_Area_5/Area_5_Site_37.ply"
-_DEFAULT_LEDNINGSPAKKE_DIR = "Ledningspakke_2803288_Area_4_and_5"
-
-_site_rel = _DEFAULT_SITE_REL
-_ledningspakke_dir = _DEFAULT_LEDNINGSPAKKE_DIR
+# The active site and Ledningspakke are the single responsibility of
+# core/site_local.py, a gitignored file, so switching sites never dirties a
+# tracked file. There is deliberately no committed default here: site_local.py
+# is the one source of truth, and its absence (or a missing field) raises a
+# clear error rather than silently falling back to some other site.
 try:
     from core import site_local as _site_local
-    _site_rel = getattr(_site_local, "SITE", _site_rel)
-    _ledningspakke_dir = getattr(_site_local, "LEDNINGSPAKKE_DIR", _ledningspakke_dir)
-except ImportError:
-    pass
+except ImportError as _e:
+    raise RuntimeError(
+        "core/site_local.py is missing. It is gitignored, so each machine sets "
+        "its own active site there. Create core/site_local.py with:\n"
+        '    SITE = "Water_Area_5/Area_5_Site_11.ply"\n'
+        '    LEDNINGSPAKKE_DIR = "Ledningspakke_2803288_Area_4_and_5"'
+    ) from _e
 
-PLY_FILE         = PLY_BASE_DIR / _site_rel
-AREA_REF_GEOJSON = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
-GML_PATH         = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
+try:
+    _site_rel = _site_local.SITE
+    _ledningspakke_dir = _site_local.LEDNINGSPAKKE_DIR
+except AttributeError as _e:
+    raise RuntimeError(
+        f"core/site_local.py must define both SITE and LEDNINGSPAKKE_DIR ({_e})."
+    ) from _e
+
+PLY_FILE          = PLY_BASE_DIR / _site_rel
+AREA_REF_GEOJSON  = DATA_DIR / "Translation_coordinates" / "area_points_utm32_etrs89.geojson"
+GML_PATH          = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
+# Name of the active Ledningspakke, for display in the viewers. Derived from the
+# site selection above, so a GUI label can never disagree with the loaded data.
+LEDNINGSPAKKE_NAME = _ledningspakke_dir
 
 
 
@@ -121,6 +130,12 @@ COMPONENT_LAYERS = {
 }
 
 COMPONENT_SPHERE_RADIUS = 0.05
+
+# Width of the right-hand control panel in every GUI module, in multiples of the
+# theme font size (em). Kept here so the panels line up across modules; each
+# module derives its pixel width as int(PANEL_WIDTH_EM * em) rather than
+# hardcoding one, so the panel scales with the font/DPI.
+PANEL_WIDTH_EM = 20
 
 # Map component layer -> corresponding line layer for depth estimation
 COMP_TO_LINE = {
@@ -287,19 +302,40 @@ SIGNATURE_HAZARD_COLOR    = [0.80, 0.0, 0.0]   # linear red (legend triangles)
 # ─────────────────────────────────────────────────────────────────────────────
 DEVIATION_THRESHOLDS = [0.00, 0.25, 0.50, 1.00, 2.00]
 DEVIATION_COLORS = [
-    [0.0, 0.7, 0.2],   # Class 1: ≤ 250 mm  - green
-    [0.6, 0.9, 0.0],   # Class 2: ≤ 500 mm  - yellow-green
-    [1.0, 0.8, 0.0],   # Class 3: ≤ 1000 mm - yellow
-    [1.0, 0.4, 0.0],   # Class 4: ≤ 2000 mm - orange
-    [0.8, 0.0, 0.0],   # Class 5: > 2000 mm - red
+    [0.0, 0.7, 0.2],   # Class 1: <= 0.25 m - green
+    [0.6, 0.9, 0.0],   # Class 2: <= 0.50 m - yellow-green
+    [1.0, 0.8, 0.0],   # Class 3: <= 1.00 m - yellow
+    [1.0, 0.4, 0.0],   # Class 4: <= 2.00 m - orange
+    [0.8, 0.0, 0.0],   # Class 5: > 2.00 m  - red
 ]
 
 DEVIATION_CLASS_LABELS = [
-    "Class 1:  <= 250 mm",
-    "Class 2:  <= 500 mm",
-    "Class 3:  <= 1000 mm",
-    "Class 4:  <= 2000 mm",
-    "Class 5:  > 2000 mm",
+    "Class 1:  <= 0.25 m",
+    "Class 2:  <= 0.50 m",
+    "Class 3:  <= 1.00 m",
+    "Class 4:  <= 2.00 m",
+    "Class 5:  > 2.00 m",
+]
+
+# Continuous gradient legend ticks (metres): the DEVIATION_THRESHOLDS anchors
+# plus interpolated midpoints, so the gradient legend shows the smooth
+# interpolation between the five accuracy-class anchor colours.
+DEVIATION_GRADIENT_TICKS = [0.00, 0.25, 0.50, 0.75, 1.00, 1.50, 2.00]
+
+# Two-class pass/fail scheme for the "KLIC XY deviation (discrete)" colour
+# mode, matching Dutch KLIC/WIBON excavation practice: a 1 m horizontal
+# deviation is treated as a single pass/fail threshold rather than a graded
+# accuracy scale (see the WIBON minimum-tolerance discussion in the thesis
+# background chapter). Reuses the same green/red as classes 1 and 5 of
+# DEVIATION_COLORS for visual consistency with the 5-class scheme.
+KLIC_XY_THRESHOLDS = [0.00, 1.00]
+KLIC_XY_COLORS = [
+    [0.0, 0.7, 0.2],   # Class 1: <= 1.00 m - green (within KLIC tolerance)
+    [0.8, 0.0, 0.0],   # Class 2: > 1.00 m  - red (exceeds KLIC tolerance)
+]
+KLIC_XY_CLASS_LABELS = [
+    "Class 1:  <= 1.00 m",
+    "Class 2:  > 1.00 m",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

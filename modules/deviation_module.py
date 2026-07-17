@@ -13,7 +13,7 @@ original behaviour of measuring against every nearby LER feature whose layer
 matches the instance's utility type.
 
 Usage: python modules/deviation_module.py
-  Change the site by editing PLY_FILE in core/config.py.
+  Change the site in core/site_local.py.
 """
 
 import sys
@@ -37,10 +37,13 @@ from shapely.ops import unary_union
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PANEL_WIDTH_EM,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
     DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
+    DEVIATION_GRADIENT_TICKS,
+    KLIC_XY_THRESHOLDS, KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS,
     FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
 )
@@ -54,12 +57,13 @@ from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
     batch_point_to_plane_segment_components,
     discretize_segment,
-    deviation_to_color, deviation_to_color_continuous, linear_to_srgb,
+    deviation_to_color, deviation_to_color_continuous,
     segment_to_cylinder, segment_to_plane,
     segments_in_rect, point_in_rect, clip_segment_to_rect,
     accuracy_buffer_polygon, polygon_to_o3d_mesh, polygon_to_o3d_lineset,
     merge_linesets, drape_z_from_polylines,
 )
+from core.gui_helpers import make_legend_row
 from core.ledningstrace import get_bredde_width
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
@@ -861,13 +865,13 @@ for inst_path in _inst_files:
     pcd_dev_cont.colors = o3d.utility.Vector3dVector(
         deviation_to_color_continuous(dists) if has_ler else _grey)
 
-    def _dev_pcd(values, continuous):
+    def _dev_pcd(values, continuous, thresholds=None, palette=None):
         """Instance cloud coloured by a deviation metric (grey if no LER)."""
         pc = o3d.geometry.PointCloud()
         pc.points = o3d.utility.Vector3dVector(pts_inst)
         if has_ler:
             fn = deviation_to_color_continuous if continuous else deviation_to_color
-            pc.colors = o3d.utility.Vector3dVector(fn(values))
+            pc.colors = o3d.utility.Vector3dVector(fn(values, thresholds, palette))
         else:
             pc.colors = o3d.utility.Vector3dVector(_grey)
         return pc
@@ -1138,6 +1142,7 @@ ler_pcd_zdev = {}         # layer -> PointCloud, |Z| deviation, discrete colours
 ler_pcd_zdev_cont = {}    # layer -> PointCloud, |Z| deviation, continuous colours
 ler_pcd_xydev = {}        # layer -> PointCloud, horizontal deviation, discrete colours
 ler_pcd_xydev_cont = {}   # layer -> PointCloud, horizontal deviation, continuous colours
+ler_pcd_xydev_klic = {}   # layer -> PointCloud, horizontal deviation, 2-class KLIC colours
 # Raw deviation values per layer, retained for the QGIS LAS export (the
 # point clouds above only keep baked colours). None where no measured
 # neighbour exists (no LER match), matching the no-data colouring.
@@ -1175,6 +1180,7 @@ for ln in ler_meshes:
     col_chunks, col_cont_chunks = [], []
     zcol_chunks, zcol_cont_chunks = [], []
     xycol_chunks, xycol_cont_chunks = [], []
+    xycol_klic_chunks = []
     dev_chunks, zdev_chunks, xydev_chunks = [], [], []
     for idx in seg_ids:
         if _is_trace:
@@ -1204,9 +1210,15 @@ for ln in ler_meshes:
             zcols_cont = deviation_to_color_continuous(zdev)
             xycols = deviation_to_color(xydev)
             xycols_cont = deviation_to_color_continuous(xydev)
+            # Same horizontal distances, binned into the 2-class KLIC/WIBON
+            # pass-fail scheme instead of the 5-class LER accuracy scheme.
+            xycols_klic = deviation_to_color(xydev, KLIC_XY_THRESHOLDS, KLIC_XY_COLORS)
         else:
             cols = np.tile(_NO_DATA_COLOR, (len(samp), 1))
-            cols_cont = zcols = zcols_cont = xycols = xycols_cont = cols
+            # No measured neighbour: stays grey in every scheme. The KLIC cloud
+            # must not fall back to its first class here, since green asserts
+            # "within tolerance" and nothing was measured to support that.
+            cols_cont = zcols = zcols_cont = xycols = xycols_cont = xycols_klic = cols
             dev = zdev = xydev = np.full(len(samp), np.nan)
         samp_chunks.append(samp)
         col_chunks.append(cols)
@@ -1215,6 +1227,7 @@ for ln in ler_meshes:
         zcol_cont_chunks.append(zcols_cont)
         xycol_chunks.append(xycols)
         xycol_cont_chunks.append(xycols_cont)
+        xycol_klic_chunks.append(xycols_klic)
         dev_chunks.append(dev)
         zdev_chunks.append(zdev)
         xydev_chunks.append(xydev)
@@ -1234,6 +1247,7 @@ for ln in ler_meshes:
     ler_pcd_zdev_cont[ln] = _make_pc(zcol_cont_chunks)
     ler_pcd_xydev[ln] = _make_pc(xycol_chunks)
     ler_pcd_xydev_cont[ln] = _make_pc(xycol_cont_chunks)
+    ler_pcd_xydev_klic[ln] = _make_pc(xycol_klic_chunks)
     ler_raw_xyz[ln] = np.concatenate(dev_chunks)
     ler_raw_xy[ln] = np.concatenate(xydev_chunks)
     ler_raw_z[ln] = np.concatenate(zdev_chunks)
@@ -1279,6 +1293,7 @@ _MODE_NAMES = [
     "LER XY deviation (continuous)",             # 11
     "LER Z deviation (discrete)",                # 12
     "LER Z deviation (continuous)",              # 13
+    "KLIC XY deviation (discrete)",              # 14
 ]
 # Instance point cloud shown per mode. In the LER deviation modes the heatmap
 # lives on the LER segments, so the instance points fall back to original RGB.
@@ -1286,7 +1301,8 @@ _MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont",
                   "pcd_dev_xy", "pcd_dev_xy_cont",
                   "pcd_dev_z", "pcd_dev_z_cont",
                   "pcd_rgb", "pcd_class",
-                  "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb"]
+                  "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb",
+                  "pcd_rgb"]
 # LER deviation modes: the LER layers become deviation-coloured point clouds.
 # Each maps to the precomputed cloud carrying the right metric + colouring.
 _LER_MODE_PCD = {
@@ -1296,15 +1312,18 @@ _LER_MODE_PCD = {
     11: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
     12: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
     13: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
+    14: ler_pcd_xydev_klic,   # XY deviation, 2-class KLIC/WIBON pass-fail colours
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
 # Instance-deviation modes (the measured points themselves are deviation
 # coloured); these are the modes whose instance clouds the trench restricts.
 _PC_DEV_MODES = (0, 1, 2, 3, 4, 5)
-# Modes that show the discrete accuracy-class heatmap legend
+# Modes that show the discrete accuracy-class heatmap legend (5-class LER scheme)
 _HEATMAP_MODES = (0, 2, 4, 8, 10, 12)
 # Modes that show the continuous deviation-gradient legend
 _GRADIENT_MODES = (1, 3, 5, 9, 11, 13)
+# Modes that show the 2-class KLIC/WIBON pass-fail legend
+_KLIC_MODES = (14,)
 
 app = gui.Application.instance
 app.initialize()
@@ -1625,7 +1644,7 @@ def _apply_color_mode(mode):
 # ─────────────────────────────────────────────────────────────────────────────
 # 8.  Right panel
 # ─────────────────────────────────────────────────────────────────────────────
-PANEL_W = int(22 * em)
+PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
 panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 panel.add_child(gui.Label(f"Original: {len(pts_orig):,} pts"))
@@ -1633,6 +1652,10 @@ total_inst = sum(inst["stats"]["n_pts"] for v in class_instances.values() for in
 n_inst = sum(len(v) for v in class_instances.values())
 panel.add_child(gui.Label(f"Instances: {n_inst} ({total_inst:,} pts)"))
 panel.add_child(gui.Label(f"LER segments: {n_total_segs:,} ({n_active_segs}a, {n_inactive_segs}i)"))
+if CROP_MODE == "rect":
+    panel.add_child(gui.Label(f"Crop: cloud AABB + {UTILITY_RECT_BUFFER:.0f} m (rect)"))
+else:
+    panel.add_child(gui.Label(f"Crop radius: {CROP_RADIUS} m (circular)"))
 panel.add_fixed(int(0.5 * em))
 
 # Colour mode
@@ -1645,45 +1668,33 @@ combo.selected_index = 0
 _heatmap_legend = gui.Vert(0)
 _heatmap_legend.add_child(gui.Label("Accuracy class:"))
 for i, (col, lbl) in enumerate(zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS)):
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-    row = gui.Horiz(int(0.3 * em))
-    sw = gui.Button(" ")
-    sw.background_color = gui.Color(sr, sg, sb, 1.0)
-    sw.toggleable = False
-    sw.vertical_padding_em = 0.0
-    sw.horizontal_padding_em = 0.3
-    row.add_child(sw)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(gui.Label(lbl))
-    _heatmap_legend.add_child(row)
+    _heatmap_legend.add_child(make_legend_row(col, gui.Label(lbl), em))
 
 # Continuous gradient legend: same anchor colours as the accuracy classes, but
 # sampled at intermediate ticks to show the smooth interpolation between them.
 _gradient_legend = gui.Vert(0)
 _gradient_legend.add_child(gui.Label("Deviation (gradient):"))
-_grad_ticks_mm = [0, 250, 500, 750, 1000, 1500, 2000]
-_grad_tick_cols = deviation_to_color_continuous(
-    np.asarray(_grad_ticks_mm, dtype=float) / 1000.0)
-for _mm, _col in zip(_grad_ticks_mm, _grad_tick_cols):
-    sr, sg, sb = (linear_to_srgb(c) for c in _col)
-    row = gui.Horiz(int(0.3 * em))
-    sw = gui.Button(" ")
-    sw.background_color = gui.Color(sr, sg, sb, 1.0)
-    sw.toggleable = False
-    sw.vertical_padding_em = 0.0
-    sw.horizontal_padding_em = 0.3
-    row.add_child(sw)
-    row.add_fixed(int(0.4 * em))
-    _lbl = f">= {_mm} mm" if _mm == _grad_ticks_mm[-1] else f"{_mm} mm"
-    row.add_child(gui.Label(_lbl))
-    _gradient_legend.add_child(row)
+_grad_ticks_m = DEVIATION_GRADIENT_TICKS
+_grad_tick_cols = deviation_to_color_continuous(np.asarray(_grad_ticks_m, dtype=float))
+for _tick_m, _col in zip(_grad_ticks_m, _grad_tick_cols):
+    _lbl = f">= {_tick_m:.2f} m" if _tick_m == _grad_ticks_m[-1] else f"{_tick_m:.2f} m"
+    _gradient_legend.add_child(make_legend_row(_col, gui.Label(_lbl), em))
 _gradient_legend.visible = False
+
+# KLIC/WIBON pass-fail legend: separate 2-swatch widget so the 5-class
+# heatmap legend is not reused (and shown incorrectly) for this 2-class scheme.
+_klic_legend = gui.Vert(0)
+_klic_legend.add_child(gui.Label("KLIC tolerance (1 m):"))
+for i, (col, lbl) in enumerate(zip(KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS)):
+    _klic_legend.add_child(make_legend_row(col, gui.Label(lbl), em))
+_klic_legend.visible = False
 
 
 def _on_mode(val, idx):
     _apply_color_mode(idx)
     _heatmap_legend.visible = (idx in _HEATMAP_MODES)
     _gradient_legend.visible = (idx in _GRADIENT_MODES)
+    _klic_legend.visible = (idx in _KLIC_MODES)
     window.set_needs_layout()
 
 
@@ -1691,6 +1702,7 @@ combo.set_on_selection_changed(_on_mode)
 panel.add_child(combo)
 panel.add_child(_heatmap_legend)
 panel.add_child(_gradient_legend)
+panel.add_child(_klic_legend)
 panel.add_fixed(int(0.5 * em))
 
 # Original cloud toggle
@@ -1912,7 +1924,6 @@ for ln in LINE_LAYERS:
     if ln not in ler_meshes:
         continue
     col = LINE_LAYERS[ln]["color"]
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
     st = ler_stats.get(ln, (0, 0, 0, 0))
     nf_act = st[0]
     nf_inact = st[2] if len(st) > 2 else 0
@@ -1925,13 +1936,6 @@ for ln in LINE_LAYERS:
         parts.append(f"{nf_inact}i")
     count_str = ", ".join(parts) if parts else "0"
 
-    row = gui.Horiz(int(0.3 * em))
-    sw = gui.Button(" ")
-    sw.background_color = gui.Color(sr, sg, sb, 1.0)
-    sw.toggleable = False
-    sw.vertical_padding_em = 0.0
-    sw.horizontal_padding_em = 0.3
-
     def _make_ler_cb(layer):
         def _cb(checked):
             _ler_visible[layer] = checked
@@ -1942,10 +1946,7 @@ for ln in LINE_LAYERS:
     cb = gui.Checkbox(f"{ln} ({count_str})")
     cb.checked = True
     cb.set_on_checked(_make_ler_cb(ln))
-    row.add_child(sw)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    panel.add_child(row)
+    panel.add_child(make_legend_row(col, cb, em))
 
 # LER component toggles
 if comp_meshes:
@@ -1955,15 +1956,7 @@ if comp_meshes:
         if comp_ln not in comp_meshes:
             continue
         comp_col = COMPONENT_LAYERS[comp_ln]["color"]
-        csr, csg, csb = (linear_to_srgb(c) for c in comp_col)
         n_c = comp_stats.get(comp_ln, 0)
-
-        crow = gui.Horiz(int(0.3 * em))
-        csw = gui.Button(" ")
-        csw.background_color = gui.Color(csr, csg, csb, 1.0)
-        csw.toggleable = False
-        csw.vertical_padding_em = 0.0
-        csw.horizontal_padding_em = 0.3
 
         def _make_comp_cb(layer):
             def _cb(checked):
@@ -1975,9 +1968,7 @@ if comp_meshes:
         ccb = gui.Checkbox(f"{comp_ln} ({n_c})")
         ccb.checked = False
         ccb.set_on_checked(_make_comp_cb(comp_ln))
-        crow.add_child(csw)
-        crow.add_fixed(int(0.4 * em))
-        crow.add_child(ccb)
+        crow = make_legend_row(comp_col, ccb, em)
         panel.add_child(crow)
 
 # Instance class toggles + stats
@@ -1988,14 +1979,6 @@ panel.add_fixed(int(0.3 * em))
 for ut in sorted(class_summaries.keys()):
     s = class_summaries[ut]
     col = UTILITY_TYPE_COLORS.get(ut, [0.5, 0.5, 0.5])
-    sr, sg, sb = (linear_to_srgb(c) for c in col)
-
-    row = gui.Horiz(int(0.3 * em))
-    sw = gui.Button(" ")
-    sw.background_color = gui.Color(sr, sg, sb, 1.0)
-    sw.toggleable = False
-    sw.vertical_padding_em = 0.0
-    sw.horizontal_padding_em = 0.3
 
     def _make_cls_cb(u):
         def _cb(checked):
@@ -2022,10 +2005,7 @@ for ut in sorted(class_summaries.keys()):
     cb.checked = True
     cb.set_on_checked(_make_cls_cb(ut))
     _class_checkboxes[ut] = cb
-    row.add_child(sw)
-    row.add_fixed(int(0.4 * em))
-    row.add_child(cb)
-    panel.add_child(row)
+    panel.add_child(make_legend_row(col, cb, em))
     panel.add_fixed(int(0.3 * em))
 
 panel.add_stretch()
@@ -2080,8 +2060,8 @@ scene_widget.set_on_key(on_key)
 
 def on_layout(ctx):
     r = window.content_rect
-    scene_widget.frame = gui.Rect(r.x, r.y, r.width - PANEL_W, r.height)
-    panel.frame = gui.Rect(r.x + r.width - PANEL_W, r.y, PANEL_W, r.height)
+    scene_widget.frame = gui.Rect(r.x, r.y, r.width - PANEL_WIDTH, r.height)
+    panel.frame = gui.Rect(r.x + r.width - PANEL_WIDTH, r.y, PANEL_WIDTH, r.height)
 
 
 window.set_on_layout(on_layout)
