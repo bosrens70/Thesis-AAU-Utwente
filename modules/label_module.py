@@ -48,6 +48,7 @@ from core.config import (
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
     TARGET_CLASS, UTILITY_TO_LER_MATCH,
+    DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
     forsyningsart_color,
 )
 from core.data_loader import (
@@ -56,9 +57,11 @@ from core.data_loader import (
 from core.gui_helpers import make_legend_row, make_master_pipe_toggle, make_master_comp_toggle
 from core.ler_matching import build_feature_index, score_candidates
 from core.geometry import (
-    segment_to_plane,
-    segments_in_rect, point_in_rect, clip_segment_to_rect, linear_to_srgb,
+    segment_to_cylinder, segment_to_plane, point_to_segment_dists,
+    linear_to_srgb,
 )
+from core.crop import CropRegion
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
@@ -68,7 +71,9 @@ from core.rendering import (
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, GML, and instances via core/
 # ─────────────────────────────────────────────────────────────────────────────
-site = init_site(load_instances=True)
+# GML is read layer-by-layer below (the loop needs per-feature control), so
+# init_site must not pre-load it a second time.
+site = init_site(load_gml=False, load_instances=True)
 
 # Unpack area info
 TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
@@ -198,193 +203,22 @@ def _ground_z_at(x_local, y_local):
 _depth_stats = {"estimated": 0, "fallback_feature_mean": 0, "fallback_global": 0}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  Geometry helpers
+# 4.  Geometry helpers (shared implementations in core/)
 # ─────────────────────────────────────────────────────────────────────────────
-def segment_to_cylinder(p1, p2, radius, color, resolution=12): # define a function to convert a segment to a cylinder
-    vec    = p2 - p1 # calculate the vector between the two points
-    length = np.linalg.norm(vec)
-    if length < 1e-6: # if the length is less than 1e-6, return None
-        return None
-
-    cyl = o3d.geometry.TriangleMesh.create_cylinder( 
-        radius=radius, height=length, resolution=resolution, split=1) # create a cylinder   
-    z_axis    = np.array([0.0, 0.0, 1.0]) # define the z-axis
-    direction = vec / length # calculate the direction of the vector
-    cross     = np.cross(z_axis, direction) # calculate the cross product of the z-axis and the direction
-    cross_norm = np.linalg.norm(cross) # calculate the norm of the cross product
-    dot        = np.dot(z_axis, direction) # calculate the dot product of the z-axis and the direction
-
-    if cross_norm > 1e-6:
-        axis  = cross / cross_norm # calculate the axis of the cylinder
-        angle = np.arctan2(cross_norm, dot) # calculate the angle of the cylinder
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle) # calculate the rotation matrix
-        cyl.rotate(R, center=[0.0, 0.0, 0.0]) # rotate the cylinder
-    elif dot < 0:
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(
-            np.array([1.0, 0.0, 0.0]) * np.pi # define the rotation matrix for a 180 degree rotation around the x-axis
-        )
-        cyl.rotate(R, center=[0.0, 0.0, 0.0]) # rotate the cylinder
-
-    cyl.translate((p1 + p2) / 2.0) # translate the cylinder to the midpoint of the segment
-    cyl.paint_uniform_color(color) # paint the cylinder with the color
-    return cyl # return the cylinder
+# Crop-region selection/clipping: one shared implementation in core.crop.
+_crop_region = CropRegion.from_pointcloud(site.pc, TX, TY)
+_point_in_bbox        = _crop_region.contains_utm
+_pt_in_local_bbox     = _crop_region.contains_local
+_segments_in_bbox     = _crop_region.polyline_in_region_utm
+_clip_segment_to_bbox = _crop_region.clip_local
 
 
-def _batch_point_to_segment_dists(p, p1s, p2s): # define a function to calculate the minimum distance from a point to a segment
-    """ 
-    Vectorised minimum distances from point p to each segment p1s[i]->p2s[i].
-    p   : (3,)
-    p1s : (N, 3)
-    p2s : (N, 3)
-    Returns dists : (N,) # return the distances
-    """
-    d     = p2s - p1s                        # (N, 3) # calculate the vector between the two points
-    denom = np.einsum('ij,ij->i', d, d)      # (N,)  squared lengths # calculate the squared lengths of the vector
-    v     = p - p1s                          # (N, 3) # calculate the vector from the point to the segment
-    t     = np.einsum('ij,ij->i', v, d)     # (N,)  dot products # calculate the dot products of the vector and the segment
-    # avoid divide-by-zero for degenerate segments
-    safe  = denom > 1e-12 # avoid divide-by-zero for degenerate segments
-    t_clamped        = np.where(safe, np.clip(t / np.where(safe, denom, 1.0), 0.0, 1.0), 0.0) # calculate the clamped values
-    closest = p1s + t_clamped[:, None] * d       # (N, 3) nearest points on segments
-    diff    = p - closest                         # (N, 3)
-    dists   = np.sqrt(np.einsum('ij,ij->i', diff, diff))  # (N,)
-    return dists
-
-
-def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm): # define a function to clean the coordinates with depth
-    """
-    Translate UTM -> local.  For vertices with Z = -99 (no reliable
-    measurement), estimate depth using:
-        Z = ground_level(XY) - vejledendeDybde / 1000
-    If vejledendeDybde is not available, fall back to mean of valid Z
-    on the same feature, or the global ground level.
-    """
-    coords = coords_raw.copy().astype(float) # convert the coordinates to float if the shape of the coordinates is 2, add a zero column to the coordinates
-    if coords.shape[1] == 2:
-        coords = np.hstack([coords, np.zeros((len(coords), 1))]) # add a zero column to the coordinates
-
-    # Translate XY to local first (Z stays in absolute UTM for now)
-    coords[:, 0] -= TX # subtract the translation from the x-coordinates
-    coords[:, 1] -= TY # subtract the translation from the y-coordinates
-
-    bad = coords[:, 2] == -99 # check if the z-coordinates are -99
-    if bad.any():
-        # Parse indicative depth (mm -> m)
-        ind_depth_m = None # initialize the indicative depth
-        if vejledende_dybde_mm is not None:
-            try:
-                d = float(vejledende_dybde_mm) # convert the indicative depth to float
-                if d > 0:
-                    ind_depth_m = d / 1000.0 # convert the indicative depth to meters
-            except (ValueError, TypeError):
-                pass
-
-        # Mean of valid Z on this feature (absolute UTM Z)
-        good_z = coords[~bad, 2] # get the valid z-coordinates
-        feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
-
-        for idx in np.where(bad)[0]:
-            local_x = coords[idx, 0]
-            local_y = coords[idx, 1]
-            ground_z_here = _ground_z_at(local_x, local_y)
-            if ind_depth_m is not None:
-                coords[idx, 2] = (ground_z_here + TZ) - ind_depth_m
-                _depth_stats["estimated"] += 1
-            elif feature_mean_z is not None:
-                coords[idx, 2] = feature_mean_z
-                _depth_stats["fallback_feature_mean"] += 1
-            else:
-                coords[idx, 2] = ground_z_here + TZ
-                _depth_stats["fallback_global"] += 1
-
-    # Now translate Z to local
-    coords[:, 2] -= TZ
-    return coords
-
-
-def _segments_in_bbox(coords_utm):
-    """Conservative check: any part of the polyline within the crop region (UTM)."""
-    if CROP_MODE == "rect":
-        return segments_in_rect(coords_utm, _rect_min_x_utm, _rect_min_y_utm,
-                                _rect_max_x_utm, _rect_max_y_utm)
-    dx = coords_utm[:, 0] - _crop_cx_utm
-    dy = coords_utm[:, 1] - _crop_cy_utm
-    d2 = dx * dx + dy * dy
-    if (d2 <= _crop_r2).any():
-        return True
-    # Fallback AABB overlap — catches segments that cross the disc but
-    # have no vertex inside it; the segment clipper makes the final call.
-    xs, ys = coords_utm[:, 0], coords_utm[:, 1]
-    if xs.max() < _crop_cx_utm - CROP_RADIUS: return False
-    if xs.min() > _crop_cx_utm + CROP_RADIUS: return False
-    if ys.max() < _crop_cy_utm - CROP_RADIUS: return False
-    if ys.min() > _crop_cy_utm + CROP_RADIUS: return False
-    return True
-
-
-def _point_in_bbox(x, y):
-    if CROP_MODE == "rect":
-        return point_in_rect(x, y, _rect_min_x_utm, _rect_min_y_utm,
-                             _rect_max_x_utm, _rect_max_y_utm)
-    dx = x - _crop_cx_utm
-    dy = y - _crop_cy_utm
-    return (dx * dx + dy * dy) <= _crop_r2
-
-
-def _pt_in_local_bbox(x, y):
-    if CROP_MODE == "rect":
-        return point_in_rect(x, y, _rect_min_x, _rect_min_y,
-                             _rect_max_x, _rect_max_y)
-    dx = x - _crop_cx_local
-    dy = y - _crop_cy_local
-    return (dx * dx + dy * dy) <= _crop_r2
-
-
-def _clip_segment_to_bbox(p1, p2):
-    """
-    Clip a 3D line segment (p1 -> p2) to the local circular crop in XY.
-    Circle: center = (_crop_cx_local, _crop_cy_local), radius = CROP_RADIUS.
-    Returns (clipped_p1, clipped_p2) or None if entirely outside.
-
-    Z is linearly interpolated along the segment parameter, matching how
-    the previous Liang-Barsky rectangular clipper handled it.
-    """
-    if CROP_MODE == "rect":
-        return clip_segment_to_rect(p1, p2, _rect_min_x, _rect_min_y,
-                                    _rect_max_x, _rect_max_y)
-    x1 = p1[0] - _crop_cx_local
-    y1 = p1[1] - _crop_cy_local
-    x2 = p2[0] - _crop_cx_local
-    y2 = p2[1] - _crop_cy_local
-
-    dx = x2 - x1
-    dy = y2 - y1
-    a  = dx * dx + dy * dy
-
-    if a < 1e-12:
-        # Degenerate — segment is a single point
-        if x1 * x1 + y1 * y1 <= _crop_r2:
-            return p1, p2
-        return None
-
-    b = 2.0 * (x1 * dx + y1 * dy)
-    c = x1 * x1 + y1 * y1 - _crop_r2
-    disc = b * b - 4.0 * a * c
-    if disc < 0:
-        return None
-
-    sq      = np.sqrt(disc)
-    t_enter = (-b - sq) / (2.0 * a)
-    t_exit  = (-b + sq) / (2.0 * a)
-
-    t0 = max(0.0, t_enter)
-    t1 = min(1.0, t_exit)
-    if t0 > t1:
-        return None
-
-    c1 = p1 + t0 * (p2 - p1)
-    c2 = p1 + t1 * (p2 - p1)
-    return c1, c2
+def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
+    """UTM -> local translation + DepthSource fallback (core.depth), bound to
+    this viewer's flat ground level. Returns (coords, sources); the caller
+    counts the fallback statistics from ``sources``."""
+    return _core_clean_coords(coords_raw, vejledende_dybde_mm,
+                              TX=TX, TY=TY, TZ=TZ, ground_z_at=_ground_z_at)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Load utility lines (pipes / cables) within bbox
@@ -478,7 +312,11 @@ for layer_name, cfg in LINE_LAYERS.items():
             if not _segments_in_bbox(coords_raw):
                 continue
 
-            coords = _clean_coords_with_depth(coords_raw, vejl_dybde)
+            coords, _seg_srcs = _clean_coords_with_depth(coords_raw, vejl_dybde)
+            for _src in _seg_srcs:
+                _key = _STATS_KEY.get(DepthSource(_src))
+                if _key in _depth_stats:
+                    _depth_stats[_key] += 1
             all_pipe_coords.append(coords)
             _layer_z_vals.extend(coords[:, 2].tolist())
             feature_hit = True
@@ -1557,7 +1395,7 @@ def _do_pick_ler(depth_image):
     )
     hit = np.array(world[:3], dtype=float)
 
-    seg_dists = _batch_point_to_segment_dists(hit, pick_seg_p1, pick_seg_p2)
+    seg_dists = point_to_segment_dists(hit, pick_seg_p1, pick_seg_p2)
     for _si, _sl in enumerate(pick_seg_layer):
         if not _layer_visible.get(_sl, True) or not ler_utilities_visible[0]:
             seg_dists[_si] = np.inf

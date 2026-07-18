@@ -59,10 +59,11 @@ from core.geometry import (
     discretize_segment,
     deviation_to_color, deviation_to_color_continuous,
     segment_to_cylinder, segment_to_plane,
-    segments_in_rect, point_in_rect, clip_segment_to_rect,
     accuracy_buffer_polygon, polygon_to_o3d_mesh, polygon_to_o3d_lineset,
     merge_linesets, drape_z_from_polylines,
 )
+from core.crop import CropRegion
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.gui_helpers import make_legend_row
 from core.ledningstrace import get_bredde_width
 from core.rendering import (
@@ -73,7 +74,9 @@ from core.rendering import (
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
 # ─────────────────────────────────────────────────────────────────────────────
-site = init_site(load_instances=True)
+# GML is read layer-by-layer below (the loop needs per-feature control), so
+# init_site must not pre-load it a second time.
+site = init_site(load_gml=False, load_instances=True)
 
 # Unpack area info
 TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
@@ -136,100 +139,19 @@ _layer_avg_depth_local = {}  # layer_name -> float (average local Z for componen
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
 
-def _in_crop_utm(coords):
-    """Conservative check: any part of the polyline within the crop region (UTM).
-    First checks whether any vertex is inside the circle.
-    Falls back to an AABB overlap test to catch segments that cross the disc
-    but have no vertex inside it — the segment clipper makes the final call.
-    """
-    if CROP_MODE == "rect":
-        return segments_in_rect(coords, _rect_min_x_utm, _rect_min_y_utm,
-                                _rect_max_x_utm, _rect_max_y_utm)
-    dx = coords[:, 0] - _cx_utm
-    dy = coords[:, 1] - _cy_utm
-    if (dx * dx + dy * dy <= _crop_r2).any():
-        return True
-    # AABB fallback
-    xs, ys = coords[:, 0], coords[:, 1]
-    if xs.max() < _cx_utm - CROP_RADIUS:
-        return False
-    if xs.min() > _cx_utm + CROP_RADIUS:
-        return False
-    if ys.max() < _cy_utm - CROP_RADIUS:
-        return False
-    if ys.min() > _cy_utm + CROP_RADIUS:
-        return False
-    return True
+# Crop-region selection/clipping: one shared implementation in core.crop.
+_crop_region = CropRegion.from_pointcloud(site.pc, TX, TY)
+_in_crop_utm          = _crop_region.polyline_in_region_utm
+_clip_segment_to_crop = _crop_region.clip_local
 
 
 def _to_local(coords_utm, vejl_dybde_mm=None):
-    c = coords_utm.copy().astype(float)
-    if c.shape[1] == 2:
-        c = np.hstack([c, np.zeros((len(c), 1))])
-    c[:, 0] -= TX
-    c[:, 1] -= TY
-    bad = c[:, 2] == -99
-    if bad.any():
-        ind_m = None
-        if vejl_dybde_mm is not None:
-            try:
-                d = float(vejl_dybde_mm)
-                if d > 0:
-                    ind_m = d / 1000.0
-            except (ValueError, TypeError):
-                pass
-        good_z = c[~bad, 2]
-        feat_mean = float(good_z.mean()) if len(good_z) > 0 else None
-        for idx in np.where(bad)[0]:
-            if ind_m is not None:
-                c[idx, 2] = (GROUND_Z + TZ) - ind_m
-            elif feat_mean is not None:
-                c[idx, 2] = feat_mean
-            else:
-                c[idx, 2] = GROUND_Z + TZ
-    c[:, 2] -= TZ
-    return c
-
-
-def _clip_segment_to_crop(p1, p2):
-    """
-    Clip a 3D segment to the crop region in XY.
-    Circle: centre (_cx, _cy), radius CROP_RADIUS, or the rectangle in rect mode.
-    Returns (clipped_p1, clipped_p2) or None if entirely outside.
-    """
-    if CROP_MODE == "rect":
-        return clip_segment_to_rect(p1, p2, _rect_min_x, _rect_min_y,
-                                    _rect_max_x, _rect_max_y)
-    x1 = p1[0] - _cx
-    y1 = p1[1] - _cy
-    x2 = p2[0] - _cx
-    y2 = p2[1] - _cy
-
-    dx = x2 - x1
-    dy = y2 - y1
-    a = dx * dx + dy * dy
-
-    if a < 1e-12:
-        if x1 * x1 + y1 * y1 <= _crop_r2:
-            return p1, p2
-        return None
-
-    b = 2.0 * (x1 * dx + y1 * dy)
-    c = x1 * x1 + y1 * y1 - _crop_r2
-    disc = b * b - 4.0 * a * c
-    if disc < 0:
-        return None
-
-    sq = np.sqrt(disc)
-    t_enter = (-b - sq) / (2.0 * a)
-    t_exit = (-b + sq) / (2.0 * a)
-
-    t0 = max(0.0, t_enter)
-    t1 = min(1.0, t_exit)
-    if t0 > t1:
-        return None
-
-    return p1 + t0 * (p2 - p1), p1 + t1 * (p2 - p1)
+    """UTM -> local translation + DepthSource fallback (core.depth), bound to
+    this viewer's flat ground level. Per-vertex sources are discarded."""
+    coords, _ = _core_clean_coords(coords_utm, vejl_dybde_mm,
+                                   TX=TX, TY=TY, TZ=TZ,
+                                   ground_z_at=lambda x, y: GROUND_Z)
+    return coords
 
 
 for layer_name, cfg in list(LINE_LAYERS.items()):
@@ -435,23 +357,12 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         g = row.geometry
         if g is None or g.geom_type not in ("Point", "PointZ"):
             continue
-        if CROP_MODE == "rect":
-            if not point_in_rect(g.x, g.y, _rect_min_x_utm, _rect_min_y_utm,
-                                 _rect_max_x_utm, _rect_max_y_utm):
-                continue
-        else:
-            dx = g.x - _cx_utm
-            dy = g.y - _cy_utm
-            if dx * dx + dy * dy > _crop_r2:
-                continue
+        if not _crop_region.contains_utm(g.x, g.y):
+            continue
 
         pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
 
-        if CROP_MODE == "rect":
-            if not point_in_rect(pt[0], pt[1], _rect_min_x, _rect_min_y,
-                                 _rect_max_x, _rect_max_y):
-                continue
-        elif (pt[0] - _cx) ** 2 + (pt[1] - _cy) ** 2 > _crop_r2:
+        if not _crop_region.contains_local(pt[0], pt[1]):
             continue
 
         if g.z == -99 or pt[2] <= -98:

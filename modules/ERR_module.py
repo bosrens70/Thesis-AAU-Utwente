@@ -43,7 +43,9 @@ from core.config import (
     SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
 )
 from core.gui_helpers import make_legend_row
-from core.geometry import fit_plane_z, segment_to_plane, srgb_to_linear, linear_to_srgb
+from core.geometry import fit_plane_z, srgb_to_linear, linear_to_srgb
+from core.crop import clip_segment_to_rect
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core import symbology as sym
 from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
@@ -109,9 +111,6 @@ print("Config paths OK.\n")
 # VIEWER-SPECIFIC CODE — OPTIMIZED DATA LOADING PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 _t0 = time.perf_counter()
-
-# Cylinder resolution: lower = fewer triangles (6 vs 12 = half the geometry)
-_CYL_RESOLUTION = 6
 
 # Read only every Nth point from each PLY file.
 # 10 = keep 1 in 10 points → ~10× faster I/O, ~10× fewer points.
@@ -506,40 +505,6 @@ def _dsrc_linear(src):
     return [srgb_to_linear(c) for c in s]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 4.  Geometry helpers
-# ─────────────────────────────────────────────────────────────────────────────
-def segment_to_cylinder(p1, p2, radius, color, resolution=_CYL_RESOLUTION):
-    vec = p2 - p1
-    length = np.linalg.norm(vec)
-    if length < 1e-6:
-        return None
-
-    cyl = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=radius, height=length, resolution=resolution, split=1
-    )
-    z_axis = np.array([0.0, 0.0, 1.0])
-    direction = vec / length
-    cross = np.cross(z_axis, direction)
-    cross_norm = np.linalg.norm(cross)
-    dot = np.dot(z_axis, direction)
-
-    if cross_norm > 1e-6:
-        axis = cross / cross_norm
-        angle = np.arctan2(cross_norm, dot)
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(axis * angle)
-        cyl.rotate(R, center=[0.0, 0.0, 0.0])
-    elif dot < 0:
-        R = o3d.geometry.get_rotation_matrix_from_axis_angle(
-            np.array([1.0, 0.0, 0.0]) * np.pi
-        )
-        cyl.rotate(R, center=[0.0, 0.0, 0.0])
-
-    cyl.translate((p1 + p2) / 2.0)
-    cyl.paint_uniform_color(color)
-    return cyl
-
-
 # ── LER signature geometry (flat ribbons in the ground plane) ─────────────────
 # This viewer is a top-down plan: every LER feature is flattened to PLAN_Z and
 # drawn with its cartographic signature. Lines are rendered as thin horizontal
@@ -652,93 +617,14 @@ def _polygon_fill_mesh(ext_local, color):
 
 def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
                               cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
-    """
-    Translate UTM -> local. For vertices with Z = -99 (sentinel), resolve the
-    depth using the ordered DepthSource hierarchy defined in *cfg* — exactly
-    like base_module, but the ground level here is the best-fit plane sampled
-    via `_ground_z_at`.
-
-    Returns (coords, sources) where `sources` is a DepthSource int8 array
-    (one entry per vertex).
-    """
-    coords = coords_raw.copy().astype(float)
-    if coords.shape[1] == 2:
-        coords = np.hstack([coords, np.zeros((len(coords), 1))])
-
-    coords[:, 0] -= TX
-    coords[:, 1] -= TY
-
-    n = len(coords)
-    sources = np.full(n, DepthSource.NONE, dtype=np.int8)
-
-    # Catch -99 and any near-sentinel values (float imprecision)
-    bad = coords[:, 2] <= -98
-    sources[~bad] = DepthSource.REGISTERED
-
-    if bad.any():
-        ind_depth_m = None
-        if vejledende_dybde_mm is not None:
-            try:
-                d = float(vejledende_dybde_mm)
-                if d > 0:
-                    ind_depth_m = d / 1000.0
-            except (ValueError, TypeError):
-                pass
-
-        good_z = coords[~bad, 2]
-        feature_mean_z = float(good_z.mean()) if len(good_z) > 0 else None
-
-        # Resolver table: level -> callable(idx) -> float | None (absolute UTM Z)
-        def _resolve_vejledende(idx):
-            if ind_depth_m is None:
-                return None
-            g = _ground_z_at(coords[idx, 0], coords[idx, 1])
-            return (g + TZ) - ind_depth_m
-
-        def _resolve_feature_mean(idx):
-            return feature_mean_z
-
-        def _resolve_layer_mean(idx):
-            # parent_avg_z is local; convert to absolute UTM so the final
-            # coords[:, 2] -= TZ brings it back to local.
-            if parent_avg_z is None:
-                return None
-            return parent_avg_z + TZ
-
-        def _resolve_ground_plane(idx):
-            return _ground_z_at(coords[idx, 0], coords[idx, 1]) + TZ
-
-        _RESOLVERS = {
-            DepthSource.VEJLEDENDE:   _resolve_vejledende,
-            DepthSource.FEATURE_MEAN: _resolve_feature_mean,
-            DepthSource.LAYER_MEAN:   _resolve_layer_mean,
-            DepthSource.GROUND_PLANE: _resolve_ground_plane,
-        }
-
-        ordered_levels = sorted(
-            lv for lv in cfg.enabled_levels if lv != DepthSource.REGISTERED
-        )
-
-        for idx in np.where(bad)[0]:
-            for level in ordered_levels:
-                resolver = _RESOLVERS.get(level)
-                if resolver is None:
-                    continue
-                z = resolver(idx)
-                if z is not None:
-                    coords[idx, 2] = z
-                    sources[idx] = level
-                    break
-
-    coords[:, 2] -= TZ
-
-    # Clamp Z to the range of the actual point cloud.
-    # This catches any unresolved sentinels, bogus Z=0 values, and
-    # wildly wrong depth estimates.  For an overview viewer the utilities
-    # should sit within the point cloud's vertical extent.
-    coords[:, 2] = np.clip(coords[:, 2], PC_Z_MIN - 2.0, PC_Z_MAX + 2.0)
-
-    return coords, sources
+    """UTM -> local translation + DepthSource fallback (core.depth), bound to
+    this viewer's IDW ground model. Z is clamped to the point-cloud range:
+    for an overview viewer the utilities should sit within the clouds'
+    vertical extent (catches unresolved sentinels and bogus estimates)."""
+    return _core_clean_coords(coords_raw, vejledende_dybde_mm,
+                              TX=TX, TY=TY, TZ=TZ, ground_z_at=_ground_z_at,
+                              cfg=cfg, parent_avg_z=parent_avg_z,
+                              clamp_z=(PC_Z_MIN - 2.0, PC_Z_MAX + 2.0))
 
 
 def _segments_in_bbox(coords_utm):
@@ -757,32 +643,7 @@ def _pt_in_local_bbox(x, y):
 
 
 def _clip_segment_to_bbox(p1, p2):
-    x0, y0 = p1[0], p1[1]
-    dx = p2[0] - x0
-    dy = p2[1] - y0
-
-    t0, t1 = 0.0, 1.0
-    for p_val, q_val in [
-        (-dx, (x0 - gx_min)),
-        (dx, -(x0 - gx_max)),
-        (-dy, (y0 - gy_min)),
-        (dy, -(y0 - gy_max)),
-    ]:
-        if abs(p_val) < 1e-12:
-            if q_val < 0:
-                return None
-        else:
-            r = q_val / p_val
-            if p_val < 0:
-                t0 = max(t0, r)
-            else:
-                t1 = min(t1, r)
-            if t0 > t1:
-                return None
-
-    c1 = p1 + t0 * (p2 - p1)
-    c2 = p1 + t1 * (p2 - p1)
-    return c1, c2
+    return clip_segment_to_rect(p1, p2, gx_min, gy_min, gx_max, gy_max)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
