@@ -37,7 +37,7 @@ from shapely.ops import unary_union
 
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
-    PANEL_WIDTH_EM,
+    PANEL_WIDTH_EM, LEDNINGSPAKKE_LABEL, layer_display_name,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
@@ -64,7 +64,10 @@ from core.geometry import (
 )
 from core.crop import CropRegion
 from core.depth import clean_coords_with_depth as _core_clean_coords
-from core.gui_helpers import make_legend_row
+from core.gui_helpers import (
+    make_legend_row, LerLegendSection,
+    pivot_oblique, top_view, trench_or_scene_frame,
+)
 from core.ledningstrace import get_bredde_width
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
@@ -1379,6 +1382,7 @@ if _trench_path_obj is not None:
 
 # Add LER pipe meshes
 _ler_visible = {}
+_ler_master_on = [True]   # Ledningspakke master checkbox state (legend section)
 for ln, mesh in ler_meshes.items():
     gn = f"ler_{ln}"
     if not mesh.has_vertex_normals():
@@ -1530,7 +1534,7 @@ def _apply_ler_color_mode(mode):
                                             make_ler_pt_mat(6.0, _ler_opacity[0]))
         else:
             scene_widget.scene.add_geometry(gn, ler_meshes[ln], make_mesh_mat(_ler_opacity[0]))
-        scene_widget.scene.show_geometry(gn, _ler_visible.get(ln, True))
+        scene_widget.scene.show_geometry(gn, _ler_master_on[0] and _ler_visible.get(ln, True))
 
 
 def _apply_color_mode(mode):
@@ -1725,7 +1729,7 @@ def _apply_utility_filter(sel):
         else:
             vis = ln in matching_ler if matching_ler else False
         _ler_visible[ln] = vis
-        scene_widget.scene.show_geometry(f"ler_{ln}", vis)
+        scene_widget.scene.show_geometry(f"ler_{ln}", vis and _ler_master_on[0])
 
     # Accuracy buffers follow the same per-utility matching as the LER layers.
     matching_acc = _get_matching_accbuf_keys(sel_ut) if sel_ut is not None else None
@@ -1753,14 +1757,10 @@ def _on_filter(val, idx):
 filter_combo.set_on_selection_changed(_on_filter)
 panel.add_child(filter_combo)
 
-# LER opacity slider
+# ── Utility Legend (uniform LerLegendSection, see core/gui_helpers.py) ───────
 panel.add_fixed(int(0.3 * em))
 _ler_opacity = [0.6]
-ler_row = gui.Horiz(int(0.25 * em))
-ler_row.add_child(gui.Label("LER opacity"))
-ler_slider = gui.Slider(gui.Slider.DOUBLE)
-ler_slider.set_limits(0.0, 1.0)
-ler_slider.double_value = 0.6
+_ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL, opacity=0.6)
 
 
 def _on_ler_opacity(val):
@@ -1779,9 +1779,22 @@ def _on_ler_opacity(val):
     window.post_redraw()
 
 
-ler_slider.set_on_value_changed(_on_ler_opacity)
-ler_row.add_child(ler_slider)
-panel.add_child(ler_row)
+_ler_section.set_on_opacity(_on_ler_opacity)
+
+
+def _on_ler_master(checked):
+    """Show/hide all LER geometry at once, remembering per-layer states."""
+    _ler_master_on[0] = checked
+    for ln in ler_meshes:
+        scene_widget.scene.show_geometry(f"ler_{ln}",
+                                         checked and _ler_visible.get(ln, True))
+    for c_ln in comp_meshes:
+        scene_widget.scene.show_geometry(f"comp_{c_ln}",
+                                         checked and _comp_visible.get(c_ln, False))
+
+
+_ler_section.set_on_master(window, _on_ler_master)
+_ler_section.add_to(panel)
 
 # Export the trench-restricted discrete LER deviation modes (XYZ, XY, Z) to LAS
 # for QGIS. Only the samples inside the picked trench are written; with no
@@ -1827,9 +1840,20 @@ _export_btn.set_on_clicked(_on_export_ler_las)
 panel.add_child(_export_btn)
 panel.add_child(_export_status)
 
-# LER layer toggles
-panel.add_fixed(int(0.3 * em))
-panel.add_child(gui.Label("LER layers:"))
+# LER layer toggles (rows live in the legend section)
+_ler_layer_cbs = []
+_comp_layer_cbs = []
+
+
+def _on_toggle_all_ler(checked):
+    for _ln, _cb in _ler_layer_cbs:
+        _cb.checked = checked
+        _ler_visible[_ln] = checked
+        scene_widget.scene.show_geometry(f"ler_{_ln}", checked and _ler_master_on[0])
+    window.post_redraw()
+
+
+_ler_section.add_all_segments(True, _on_toggle_all_ler)
 
 for ln in LINE_LAYERS:
     if ln not in ler_meshes:
@@ -1850,19 +1874,26 @@ for ln in LINE_LAYERS:
     def _make_ler_cb(layer):
         def _cb(checked):
             _ler_visible[layer] = checked
-            scene_widget.scene.show_geometry(f"ler_{layer}", checked)
+            scene_widget.scene.show_geometry(f"ler_{layer}", checked and _ler_master_on[0])
             window.post_redraw()
         return _cb
 
-    cb = gui.Checkbox(f"{ln} ({count_str})")
-    cb.checked = True
-    cb.set_on_checked(_make_ler_cb(ln))
-    panel.add_child(make_legend_row(col, cb, em))
+    cb = _ler_section.add_layer_row(col, f"{layer_display_name(ln)} ({count_str})",
+                                    True, _make_ler_cb(ln))
+    _ler_layer_cbs.append((ln, cb))
+
+
+def _on_toggle_all_ler_comps(checked):
+    for _ln, _cb in _comp_layer_cbs:
+        _cb.checked = checked
+        _comp_visible[_ln] = checked
+        scene_widget.scene.show_geometry(f"comp_{_ln}", checked and _ler_master_on[0])
+    window.post_redraw()
+
 
 # LER component toggles
 if comp_meshes:
-    panel.add_fixed(int(0.3 * em))
-    panel.add_child(gui.Label("LER components:"))
+    _ler_section.add_all_components(False, _on_toggle_all_ler_comps)
     for comp_ln in COMPONENT_LAYERS:
         if comp_ln not in comp_meshes:
             continue
@@ -1872,15 +1903,14 @@ if comp_meshes:
         def _make_comp_cb(layer):
             def _cb(checked):
                 _comp_visible[layer] = checked
-                scene_widget.scene.show_geometry(f"comp_{layer}", checked)
+                scene_widget.scene.show_geometry(f"comp_{layer}", checked and _ler_master_on[0])
                 window.post_redraw()
             return _cb
 
-        ccb = gui.Checkbox(f"{comp_ln} ({n_c})")
-        ccb.checked = False
-        ccb.set_on_checked(_make_comp_cb(comp_ln))
-        crow = make_legend_row(comp_col, ccb, em)
-        panel.add_child(crow)
+        ccb = _ler_section.add_layer_row(comp_col,
+                                         f"{layer_display_name(comp_ln)} ({n_c})",
+                                         False, _make_comp_cb(comp_ln))
+        _comp_layer_cbs.append((comp_ln, ccb))
 
 # Instance class toggles + stats
 panel.add_fixed(int(0.8 * em))
@@ -1909,7 +1939,7 @@ for ut in sorted(class_summaries.keys()):
             _ler_name = "no LER"
     else:
         _ler_name = "no LER"
-    _cls_label = (f"{s['label']} -> {_ler_name} ({s['n_instances']})"
+    _cls_label = (f"{s['label']} -> {layer_display_name(_ler_name)} ({s['n_instances']})"
                   if _ler_name != "no LER"
                   else f"{s['label']} (no LER) ({s['n_instances']})")
     cb = gui.Checkbox(_cls_label)
@@ -1929,25 +1959,14 @@ IGNORED = gui.Widget.EventCallbackResult.IGNORED
 
 
 def _pivot_to(pt):
-    d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-    eye = pt + np.array([d, -d, d * 0.6])
-    scene_widget.look_at(pt.tolist(), eye.tolist(), [0, 0, 1])
+    pivot_oblique(scene_widget, pt, np.linalg.norm(pc_max - pc_min))
 
 
 def _top_view():
     """Bird's-eye view looking straight down, framed on the trench footprint
     when one is defined, otherwise on the whole scene."""
-    if _trench_path_obj is not None:
-        v = np.asarray(_trench_path_obj.vertices, dtype=float)
-        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
-        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
-        cz = float(GROUND_Z)
-    else:
-        cx, cy, cz = (float(cloud_centroid[0]), float(cloud_centroid[1]),
-                      float(cloud_centroid[2]))
-        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
-    h = max(1.0, span) * 1.2
-    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+    top_view(scene_widget, *trench_or_scene_frame(_trench_path_obj, cloud_centroid,
+                                                  pc_min, pc_max, trench_z=GROUND_Z))
 
 
 def on_key(event):

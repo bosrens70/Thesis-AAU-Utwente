@@ -23,7 +23,6 @@ import open3d.visualization.rendering as rendering
 o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
 import geopandas as gpd
 import numpy as np
-import re
 import time
 import copy
 from core.config import (
@@ -31,7 +30,8 @@ from core.config import (
     PANEL_WIDTH_EM,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
-    COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
+    COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER, LEDNINGSPAKKE_LABEL,
+    layer_display_name,
     DepthSource, DepthConfig,
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     forsyningsart_color,
@@ -47,7 +47,10 @@ from core.rendering import (
     point_material_shaded, mesh_material, line_material, flat_material,
     setup_scene_lighting,
 )
-from core.gui_helpers import make_legend_row
+from core.gui_helpers import (
+    make_legend_row, LerLegendSection,
+    pivot_oblique, top_view, trench_or_scene_frame,
+)
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -755,33 +758,18 @@ panel.add_child(_class_legend_container)
 
 panel.add_fixed(int(0.8 * em))
 
-# ── Utility Legend (with per-layer visibility toggles) ───────────────────────
-_gml_folder = Path(GML_PATH).parent.name
-_ler_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _gml_folder, re.IGNORECASE)
-_ler_label = f"{_ler_match.group(1)} {_ler_match.group(2)}" if _ler_match else _gml_folder
-
+# ── Utility Legend (uniform LerLegendSection, see core/gui_helpers.py) ───────
 _ler_active = [True]
-ler_toggle_cb = gui.Checkbox(_ler_label)
-ler_toggle_cb.checked = True
-
-_ler_legend_container = gui.Vert(int(0.3 * em))
-
-# Opacity slider (label + slider + value on one row)
-opacity_value_label = gui.Label("1.00")
-opacity_slider = gui.Slider(gui.Slider.DOUBLE)
-opacity_slider.set_limits(0.0, 1.0)
-opacity_slider.double_value = 1.0
-
-slider_row = gui.Horiz(int(0.25 * em))
-slider_row.add_child(gui.Label("LER opacity"))
-slider_row.add_child(opacity_slider)
+_ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL)
+ler_toggle_cb = _ler_section.master_cb
+_ler_legend_container = _ler_section.container
+opacity_slider = _ler_section.opacity_slider
 
 
 def _apply_opacity(val: float):
     val = max(0.0, min(1.0, val))
     pipe_opacity[0] = val
     opacity_slider.double_value = val
-    opacity_value_label.text    = f"{val:.2f}"
 
     for ln in _pipe_layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
@@ -794,8 +782,7 @@ def _apply_opacity(val: float):
     window.post_redraw()
 
 
-opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
-_ler_legend_container.add_child(slider_row)
+_ler_section.set_on_opacity(_apply_opacity)
 
 _pipe_checkboxes = []   # (layer_name, checkbox) for "toggle all" control
 _comp_checkboxes = []
@@ -822,9 +809,6 @@ def _make_comp_toggle(ln):
 
 
 # "Toggle all segments" master checkbox
-_all_pipes_cb = gui.Checkbox("All segments")
-_all_pipes_cb.checked = True
-
 def _on_toggle_all_pipes(checked):
     for ln, cb in _pipe_checkboxes:
         cb.checked = checked
@@ -834,8 +818,7 @@ def _on_toggle_all_pipes(checked):
             scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
     window.post_redraw()
 
-_all_pipes_cb.set_on_checked(_on_toggle_all_pipes)
-_ler_legend_container.add_child(_all_pipes_cb)
+_all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
 
 # Line layers — only show legend entry if the layer produced actual geometry
 for layer_name in PIPE_LEGEND_UI_ORDER:
@@ -847,30 +830,24 @@ for layer_name in PIPE_LEGEND_UI_ORDER:
     cfg = LINE_LAYERS[layer_name]
     n_feat, _ = layer_stats.get(layer_name, (0, 0))
 
-    cb = gui.Checkbox(f"{layer_name} ({n_feat})")
-    cb.checked = _layer_visible.get(layer_name, True)
-    cb.set_on_checked(_make_pipe_toggle(layer_name))
+    cb = _ler_section.add_layer_row(cfg["color"],
+                                    f"{layer_display_name(layer_name)} ({n_feat})",
+                                    _layer_visible.get(layer_name, True),
+                                    _make_pipe_toggle(layer_name))
     _pipe_checkboxes.append((layer_name, cb))
-
-    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 # Ledningstrace variants — create separate entry for each forsyningsart
 if _ledningstrace_variants:
-    n_trace_feat, _ = layer_stats.get("Ledningstrace", (0, 0))
     for fa, fa_color in sorted(_ledningstrace_variants.items()):
         variant_key = f"Ledningstrace ({fa})"
         if variant_key not in _pipe_layer_meshes:
             continue
-        cb = gui.Checkbox(f"Ledningstrace ({fa})")
-        cb.checked = _layer_visible.get(variant_key, True)
-        cb.set_on_checked(_make_pipe_toggle(variant_key))
+        cb = _ler_section.add_layer_row(fa_color, layer_display_name(variant_key),
+                                        _layer_visible.get(variant_key, True),
+                                        _make_pipe_toggle(variant_key))
         _pipe_checkboxes.append((variant_key, cb))
-        _ler_legend_container.add_child(make_legend_row(fa_color, cb, em))
 
 # "Toggle all components" master checkbox
-_all_comps_cb = gui.Checkbox("All components")
-_all_comps_cb.checked = False
-
 def _on_toggle_all_comps(checked):
     for ln, cb in _comp_checkboxes:
         cb.checked = checked
@@ -880,8 +857,7 @@ def _on_toggle_all_comps(checked):
             scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
     window.post_redraw()
 
-_all_comps_cb.set_on_checked(_on_toggle_all_comps)
-_ler_legend_container.add_child(_all_comps_cb)
+_all_comps_cb = _ler_section.add_all_components(False, _on_toggle_all_comps)
 
 # Component layers — only show legend entry if the layer produced actual geometry
 for layer_name, cfg in COMPONENT_LAYERS.items():
@@ -889,39 +865,26 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         continue
     n_comp = comp_stats.get(layer_name, 0)
 
-    cb = gui.Checkbox(f"{layer_name} ({n_comp})")
-    cb.checked = False
     _layer_visible[layer_name] = False
-    cb.set_on_checked(_make_comp_toggle(layer_name))
+    cb = _ler_section.add_layer_row(cfg["color"],
+                                    f"{layer_display_name(layer_name)} ({n_comp})",
+                                    False, _make_comp_toggle(layer_name))
     _comp_checkboxes.append((layer_name, cb))
-
-    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 
 def _on_ler_toggle(checked):
     _ler_active[0] = checked
-    _ler_legend_container.visible = checked
-    # Show/hide all utility geometry
+    # Show/hide all utility geometry (legend collapse is handled by the section)
     for ln in _pipe_layer_meshes:
-        if checked:
-            # Restore per-layer visibility state
-            alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
-        else:
-            alpha = 0.0
+        alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
     for ln in _comp_layer_meshes:
-        if checked:
-            alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
-        else:
-            alpha = 0.0
+        alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
-    window.set_needs_layout()
-    window.post_redraw()
 
 
-ler_toggle_cb.set_on_checked(_on_ler_toggle)
-panel.add_child(ler_toggle_cb)
-panel.add_child(_ler_legend_container)
+_ler_section.set_on_master(window, _on_ler_toggle)
+_ler_section.add_to(panel)
 
 panel.add_stretch()
 
@@ -1096,7 +1059,7 @@ def _do_pick(depth_image):
     if best_comp_d < best_seg_d and best_comp_d < PICK_RADIUS_COMP:
         centre = pick_comp_centres[best_comp_i].copy()
         attrs  = pick_comp_attrs[best_comp_i]
-        label  = f"{pick_comp_layer[best_comp_i]} (component)"
+        label  = f"{layer_display_name(pick_comp_layer[best_comp_i])} (component)"
         print(f"\n[pick] -> {label}")
         for k, v in attrs:
             print(f"    {k:<30} = {v}")
@@ -1104,7 +1067,7 @@ def _do_pick(depth_image):
     elif best_seg_d < PICK_RADIUS_SEG:
         centre = pick_seg_midpoints[best_seg_i].copy()
         attrs  = pick_seg_attrs[best_seg_i]
-        label  = f"{pick_seg_layer[best_seg_i]} (pipe segment)"
+        label  = f"{layer_display_name(pick_seg_layer[best_seg_i])} (pipe segment)"
         print(f"\n[pick] -> {label}")
         for k, v in attrs:
             print(f"    {k:<30} = {v}")
@@ -1179,9 +1142,7 @@ scene_widget.set_on_mouse(on_mouse)
 # 12.  Camera helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _pivot_to(point: np.ndarray):
-    d   = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-    eye = point + np.array([d, -d, d * 0.6])
-    scene_widget.look_at(point.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+    pivot_oblique(scene_widget, point, np.linalg.norm(pc_max - pc_min))
     print(f"  Pivot -> [{point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f}]")
 
 
@@ -1191,16 +1152,8 @@ _trench_path = load_trench(_ply_path)
 def _top_view():
     """Bird's-eye view looking straight down, framed on the trench footprint
     when one is defined, otherwise on the whole scene."""
-    if _trench_path is not None:
-        v = np.asarray(_trench_path.vertices, dtype=float)
-        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
-        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
-    else:
-        cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
-        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
-    cz = float(cloud_centroid[2])
-    h = max(1.0, span) * 1.2
-    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+    top_view(scene_widget, *trench_or_scene_frame(_trench_path, cloud_centroid,
+                                                  pc_min, pc_max))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 13.  Key callbacks

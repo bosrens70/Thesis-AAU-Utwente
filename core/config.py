@@ -8,6 +8,7 @@ is duplicated.
 """
 
 import os
+import re
 from pathlib import Path
 from enum import IntEnum
 from dataclasses import dataclass
@@ -63,6 +64,12 @@ GML_PATH          = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
 # Name of the active Ledningspakke, for display in the viewers. Derived from the
 # site selection above, so a GUI label can never disagree with the loaded data.
 LEDNINGSPAKKE_NAME = _ledningspakke_dir
+
+# Short display form ("Ledningspakke 2803288") for the legend headers, so every
+# viewer shows the same compact title. Falls back to the raw directory name.
+_lp_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _ledningspakke_dir, re.IGNORECASE)
+LEDNINGSPAKKE_LABEL = (f"{_lp_match.group(1)} {_lp_match.group(2)}"
+                       if _lp_match else _ledningspakke_dir)
 
 
 
@@ -205,6 +212,72 @@ FORSYNINGSART_TO_LINE = {
     "anden":               "AndenLedning",
     "andet":               "AndenLedning",
 }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENGLISH DISPLAY NAMES (GUI legends; the thesis report is in English)
+# ─────────────────────────────────────────────────────────────────────────────
+# Keys are the real GML layer names, which stay Danish everywhere in code and
+# data access (gpd.read_file layer names, dict keys, geometry names, JSON);
+# only the text shown in the GUI is translated. Terms follow the thesis
+# manuscript ("water pipe", "conduit", "district heating"); "Ledningstrace" is
+# itself used as a term in the report and is kept as-is.
+LAYER_DISPLAY_EN = {
+    "Vandledning":                 "Water pipe",
+    "Afloebsledning":              "Drainage pipe",
+    "Gasledning":                  "Gas pipe",
+    "Elledning":                   "Power line",
+    "Telekommunikationsledning":   "Telecommunication line",
+    "Foeringsroer":                "Conduit",
+    "LedningUkendtForsyningsart":  "Unknown-type line",
+    "Ledningstrace":               "Ledningstrace",
+    "TermiskLedning":              "District heating pipe",
+    "Olieledning":                 "Oil pipe",
+    "AndenLedning":                "Other line",
+    "Vandkomponent":               "Water component",
+    "Afloebskomponent":            "Drainage component",
+    "Gaskomponent":                "Gas component",
+    "Elkomponent":                 "Power component",
+    "Telekommunikationskomponent": "Telecom component",
+    "TermiskKomponent":            "District heating component",
+    "Oliekomponent":               "Oil component",
+    "AndenKomponent":              "Other component",
+}
+
+# forsyningsart attribute values (Danish, straight from the GML) -> English,
+# for the "Ledningstrace (<forsyningsart>)" legend variants.
+FORSYNINGSART_DISPLAY_EN = {
+    "vand":              "water",
+    "afloeb":            "drainage",
+    "afløb":             "drainage",
+    "spildevand":        "wastewater",
+    "vejafvanding":      "road drainage",
+    "gas":               "gas",
+    "el":                "power",
+    "telekommunikation": "telecommunication",
+    "fjernvarme":        "district heating",
+    "fjernkoeling":      "district cooling",
+    "fjernkøling":       "district cooling",
+    "varme":             "heating",
+    "termisk":           "thermal",
+    "olie":              "oil",
+    "anden":             "other",
+    "andet":             "other",
+    "ukendt":            "unknown",
+}
+
+
+def layer_display_name(key):
+    """English display text for a layer key, including compound
+    ``"Ledningstrace (<forsyningsart>)"`` storage keys. Unknown keys are
+    returned unchanged, so data-driven values never crash the GUI."""
+    key = str(key)
+    m = re.match(r"^Ledningstrace \((.+)\)$", key)
+    if m:
+        fa = m.group(1)
+        fa_en = FORSYNINGSART_DISPLAY_EN.get(fa.strip().lower(), fa)
+        return f"{LAYER_DISPLAY_EN['Ledningstrace']} ({fa_en})"
+    return LAYER_DISPLAY_EN.get(key, key)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

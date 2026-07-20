@@ -1,11 +1,12 @@
 """
 core/gui_helpers.py
 ─────────────────────────────────────────────────────────────────────────────
-Shared Open3D GUI widget builders.
+Shared Open3D GUI widget builders and camera helpers.
 
 Single source of truth for the LER utility legend look-and-feel (the little
 coloured swatch boxes and the swatch+label/checkbox rows) so every viewer
-renders the legend identically.
+renders the legend identically, and for the camera moves (oblique / top-down
+pivot, trench-framed top view) that every viewer binds to its shortcut keys.
 
 Usage
 -----
@@ -28,6 +29,7 @@ Usage
     all_pipes_cb.set_on_checked(callback)
 """
 
+import numpy as np
 import open3d.visualization.gui as gui
 
 from core.geometry import linear_to_srgb
@@ -184,3 +186,123 @@ def make_master_comp_toggle(comp_checkboxes, layer_visible, comp_layer_meshes,
                                                              make_mesh_material(alpha))
         window.post_redraw()
     return _on_toggle_all_comps
+
+
+# ── LER legend section ───────────────────────────────────────────────────────
+
+class LerLegendSection:
+    """The uniform LER legend block shared by every viewer (base_module look).
+
+    Structure: a Ledningspakke master checkbox above a collapsible container
+    holding the "LER opacity" slider row, the "All segments" /
+    "All components" master checkboxes, and swatch+checkbox layer rows, in
+    that order. Owns the look and ordering only; every callback (per layer,
+    master, opacity) stays with the calling module, so viewer semantics
+    differ only where they mean to.
+    """
+
+    def __init__(self, em, title, *, master_checked=True, opacity=1.0):
+        self._em = em
+        self.master_cb = gui.Checkbox(title)
+        self.master_cb.checked = master_checked
+        self.container = gui.Vert(int(0.3 * em))
+        self.opacity_slider = gui.Slider(gui.Slider.DOUBLE)
+        self.opacity_slider.set_limits(0.0, 1.0)
+        self.opacity_slider.double_value = float(opacity)
+        row = gui.Horiz(int(0.25 * em))
+        row.add_child(gui.Label("LER opacity"))
+        row.add_child(self.opacity_slider)
+        self.container.add_child(row)
+
+    def set_on_master(self, window, callback):
+        """Wire the master checkbox: collapse/expand the legend, then run the
+        module's geometry callback."""
+        def _cb(checked):
+            self.container.visible = checked
+            callback(checked)
+            window.set_needs_layout()
+            window.post_redraw()
+        self.master_cb.set_on_checked(_cb)
+
+    def set_on_opacity(self, callback):
+        self.opacity_slider.set_on_value_changed(callback)
+
+    def _add_master(self, text, checked, callback):
+        cb = gui.Checkbox(text)
+        cb.checked = checked
+        cb.set_on_checked(callback)
+        self.container.add_child(cb)
+        return cb
+
+    def add_all_segments(self, checked, callback):
+        return self._add_master("All segments", checked, callback)
+
+    def add_all_components(self, checked, callback):
+        return self._add_master("All components", checked, callback)
+
+    def add_layer_row(self, color, text, checked, callback):
+        """One swatch+checkbox layer row inside the legend; returns the checkbox."""
+        cb = gui.Checkbox(text)
+        cb.checked = checked
+        cb.set_on_checked(callback)
+        self.container.add_child(make_legend_row(color, cb, self._em))
+        return cb
+
+    def add_to(self, panel):
+        """Attach the section (master checkbox + legend container) to a panel."""
+        panel.add_child(self.master_cb)
+        panel.add_child(self.container)
+
+
+# ── Camera helpers ───────────────────────────────────────────────────────────
+# Shared camera moves for the viewers' shortcut keys. Logging stays in the
+# module wrappers (each viewer prints its own message, or none).
+
+def pivot_oblique(scene_widget, point, scene_diag):
+    """Recentre the camera on ``point`` from the standard oblique angle.
+
+    ``scene_diag`` is the scene's 3D diagonal (e.g. ``norm(pc_max - pc_min)``);
+    the eye sits at ``point + (d, -d, 0.6 d)`` with ``d = max(1, 0.6 * diag)``,
+    up = +Z. Used by the perspective viewers (base, deviation).
+    """
+    point = np.asarray(point, dtype=float)
+    d = max(1.0, float(scene_diag) * 0.6)
+    eye = point + np.array([d, -d, d * 0.6])
+    scene_widget.look_at(point.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+
+
+def pivot_top_down(scene_widget, point, height):
+    """Recentre the camera straight above ``point`` at ``height`` metres,
+    up = +Y, keeping a top-down orientation (label, ERR)."""
+    cx, cy, cz = (float(point[0]), float(point[1]), float(point[2]))
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + float(height)], [0.0, 1.0, 0.0])
+
+
+def trench_or_scene_frame(trench_path, cloud_centroid, pc_min, pc_max, *,
+                          trench_z=None):
+    """Return ``(cx, cy, cz, span)`` framing the trench footprint when one is
+    defined, otherwise the whole scene.
+
+    ``trench_path`` is the matplotlib Path from ``load_trench`` (or ``None``).
+    ``trench_z`` overrides the look-at height in the trench branch (the
+    deviation viewer passes the ground level); the default is the cloud
+    centroid Z. Feed the result to :func:`top_view`.
+    """
+    if trench_path is not None:
+        v = np.asarray(trench_path.vertices, dtype=float)
+        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
+        # np.ptp(): the ndarray .ptp() method was removed in NumPy 2.0
+        span = max(float(np.ptp(v[:, 0])), float(np.ptp(v[:, 1])))
+        cz = float(cloud_centroid[2]) if trench_z is None else float(trench_z)
+    else:
+        cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
+        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
+        cz = float(cloud_centroid[2])
+    return cx, cy, cz, span
+
+
+def top_view(scene_widget, cx, cy, cz, span):
+    """Bird's-eye view looking straight down at ``(cx, cy, cz)`` from a height
+    of ``1.2 * span`` (at least 1.2 m), up = +Y."""
+    h = max(1.0, span) * 1.2
+    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])

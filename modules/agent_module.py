@@ -38,6 +38,9 @@ from core.config import (
 )
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
+from core.gui_helpers import (
+    pivot_oblique, top_view as _shared_top_view, trench_or_scene_frame,
+)
 from core.rendering import point_material_flat, mesh_material, setup_scene_lighting
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 
@@ -578,10 +581,8 @@ def show_all_layers():
 def pivot_to(x_local, y_local, z_local):
     """Move camera to look at a local coordinate."""
     target = np.array([float(x_local), float(y_local), float(z_local)])
-    d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-    eye = target + np.array([d, -d, d * 0.6])
     def _pivot():
-        scene_widget.look_at(target.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+        pivot_oblique(scene_widget, target, np.linalg.norm(pc_max - pc_min))
     _pending_gui_actions.append(_pivot)
 
 
@@ -589,9 +590,7 @@ def zoom_to_point_cloud():
     """Frame the camera on the point cloud centroid, ignoring the far-below
     -99 (unregistered-depth) utilities that otherwise distort the view.
     Safe to call directly from a GUI callback (button or key)."""
-    d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
-    eye = cloud_centroid + np.array([d, -d, d * 0.6])
-    scene_widget.look_at(cloud_centroid.tolist(), eye.tolist(), [0.0, 0.0, 1.0])
+    pivot_oblique(scene_widget, cloud_centroid, np.linalg.norm(pc_max - pc_min))
 
 
 _trench_path = load_trench(_ply_path)
@@ -600,16 +599,8 @@ _trench_path = load_trench(_ply_path)
 def top_view():
     """Bird's-eye view looking straight down, framed on the trench footprint
     when one is defined, otherwise on the whole scene."""
-    if _trench_path is not None:
-        v = np.asarray(_trench_path.vertices, dtype=float)
-        cx, cy = float(v[:, 0].mean()), float(v[:, 1].mean())
-        span = max(float(v[:, 0].ptp()), float(v[:, 1].ptp()))
-    else:
-        cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
-        span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
-    cz = float(cloud_centroid[2])
-    h = max(1.0, span) * 1.2
-    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+    _shared_top_view(scene_widget, *trench_or_scene_frame(_trench_path, cloud_centroid,
+                                                          pc_min, pc_max))
 
 
 def get_visible_layers():

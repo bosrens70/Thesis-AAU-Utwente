@@ -33,7 +33,7 @@ import time
 from core.config import (
     GML_PATH, AREA_REF_GEOJSON, PLY_BASE_DIR, CROP_RADIUS,
     PANEL_WIDTH_EM,
-    LEDNINGSPAKKE_NAME,
+    LEDNINGSPAKKE_LABEL, layer_display_name,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
@@ -42,7 +42,10 @@ from core.config import (
     SIGNATURE_LINE_WIDTH_M, SIGNATURE_TRACE_WIDTH_M, SIGNATURE_COMP_LINE_WIDTH_M,
     SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
 )
-from core.gui_helpers import make_legend_row
+from core.gui_helpers import (
+    make_legend_row, LerLegendSection,
+    pivot_top_down, top_view, trench_or_scene_frame,
+)
 from core.geometry import fit_plane_z, srgb_to_linear, linear_to_srgb
 from core.crop import clip_segment_to_rect
 from core.depth import clean_coords_with_depth as _core_clean_coords
@@ -1369,37 +1372,24 @@ panel.add_child(grave_slider_row)
 
 panel.add_fixed(int(0.8 * em))
 
-# ── Utility Legend (with per-layer visibility toggles) ────────────────────
-# The package name comes from core.config (derived from the site selection), so
-# this label cannot disagree with the data actually loaded, or with the other
+# ── Utility Legend (uniform LerLegendSection, see core/gui_helpers.py) ─────
+# The package label comes from core.config (derived from the site selection),
+# so it cannot disagree with the data actually loaded, or with the other
 # modules showing the same toggle.
-_ler_label = LEDNINGSPAKKE_NAME
-
 _ler_active = [True]
 pipe_opacity_val = [1.0]
 _layer_visible = {}
 
-ler_toggle_cb = gui.Checkbox(_ler_label)
-ler_toggle_cb.checked = True
-
-_ler_legend_container = gui.Vert(int(0.3 * em))
-
-# Global opacity slider
-opacity_value_label = gui.Label("1.00")
-opacity_slider = gui.Slider(gui.Slider.DOUBLE)
-opacity_slider.set_limits(0.0, 1.0)
-opacity_slider.double_value = 1.0
-
-slider_row = gui.Horiz(int(0.25 * em))
-slider_row.add_child(gui.Label("LER opacity"))
-slider_row.add_child(opacity_slider)
+_ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL)
+ler_toggle_cb = _ler_section.master_cb
+_ler_legend_container = _ler_section.container
+opacity_slider = _ler_section.opacity_slider
 
 
 def _apply_opacity(val: float):
     val = max(0.0, min(1.0, val))
     pipe_opacity_val[0] = val
     opacity_slider.double_value = val
-    opacity_value_label.text = f"{val:.2f}"
     for ln in layer_opacity:
         layer_opacity[ln][0] = val
     for ln in layer_meshes:
@@ -1415,8 +1405,7 @@ def _apply_opacity(val: float):
     window.post_redraw()
 
 
-opacity_slider.set_on_value_changed(lambda val: _apply_opacity(val))
-_ler_legend_container.add_child(slider_row)
+_ler_section.set_on_opacity(_apply_opacity)
 
 _pipe_checkboxes = []
 _comp_checkboxes = []
@@ -1445,9 +1434,6 @@ def _make_comp_toggle(ln):
 
 
 # "Toggle all segments" master checkbox
-_all_pipes_cb = gui.Checkbox("All segments")
-_all_pipes_cb.checked = True
-
 def _on_toggle_all_pipes(checked):
     for ln, cb in _pipe_checkboxes:
         cb.checked = checked
@@ -1458,8 +1444,7 @@ def _on_toggle_all_pipes(checked):
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     window.post_redraw()
 
-_all_pipes_cb.set_on_checked(_on_toggle_all_pipes)
-_ler_legend_container.add_child(_all_pipes_cb)
+_all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
 
 # Line layers
 for layer_name in LINE_LAYERS:
@@ -1468,18 +1453,13 @@ for layer_name in LINE_LAYERS:
     cfg = LINE_LAYERS[layer_name]
     n_feat, n_seg = layer_stats.get(layer_name, (0, 0))
 
-    cb = gui.Checkbox(f"{layer_name} ({n_feat})")
-    cb.checked = True
     _layer_visible[layer_name] = True
-    cb.set_on_checked(_make_pipe_toggle(layer_name))
+    cb = _ler_section.add_layer_row(cfg["color"],
+                                    f"{layer_display_name(layer_name)} ({n_feat})",
+                                    True, _make_pipe_toggle(layer_name))
     _pipe_checkboxes.append((layer_name, cb))
 
-    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
-
 # "Toggle all components" master checkbox
-_all_comps_cb = gui.Checkbox("All components")
-_all_comps_cb.checked = True
-
 def _on_toggle_all_comps(checked):
     for ln, cb in _comp_checkboxes:
         cb.checked = checked
@@ -1490,8 +1470,7 @@ def _on_toggle_all_comps(checked):
         scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
     window.post_redraw()
 
-_all_comps_cb.set_on_checked(_on_toggle_all_comps)
-_ler_legend_container.add_child(_all_comps_cb)
+_all_comps_cb = _ler_section.add_all_components(True, _on_toggle_all_comps)
 
 # Component layers
 for layer_name, cfg in COMPONENT_LAYERS.items():
@@ -1499,18 +1478,16 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         continue
     n_comp = comp_stats.get(layer_name, 0)
 
-    cb = gui.Checkbox(f"{layer_name} ({n_comp})")
-    cb.checked = True
     _layer_visible[layer_name] = True
-    cb.set_on_checked(_make_comp_toggle(layer_name))
+    cb = _ler_section.add_layer_row(cfg["color"],
+                                    f"{layer_display_name(layer_name)} ({n_comp})",
+                                    True, _make_comp_toggle(layer_name))
     _comp_checkboxes.append((layer_name, cb))
-
-    _ler_legend_container.add_child(make_legend_row(cfg["color"], cb, em))
 
 
 def _on_ler_toggle(checked):
     _ler_active[0] = checked
-    _ler_legend_container.visible = checked
+    # Show/hide all LER geometry (legend collapse is handled by the section)
     for ln in layer_meshes:
         alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         mat = make_mesh_material(alpha)
@@ -1521,13 +1498,10 @@ def _on_ler_toggle(checked):
         mat = make_mesh_material(alpha)
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
         scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
-    window.set_needs_layout()
-    window.post_redraw()
 
 
-ler_toggle_cb.set_on_checked(_on_ler_toggle)
-panel.add_child(ler_toggle_cb)
-panel.add_child(_ler_legend_container)
+_ler_section.set_on_master(window, _on_ler_toggle)
+_ler_section.add_to(panel)
 
 panel.add_stretch()
 
@@ -1740,11 +1714,11 @@ def _do_pick(depth_image):
         if best_comp_d < best_seg_d and best_comp_d < PICK_RADIUS_COMP:
             centre = pick_comp_centres[best_comp_i].copy()
             attrs = pick_comp_attrs[best_comp_i]
-            label = f"{pick_comp_layer[best_comp_i]} (component)"
+            label = f"{layer_display_name(pick_comp_layer[best_comp_i])} (component)"
         elif best_seg_d < PICK_RADIUS_SEG:
             centre = pick_seg_midpoints[best_seg_i].copy()
             attrs = pick_seg_attrs[best_seg_i]
-            label = f"{pick_seg_layer[best_seg_i]} (pipe segment)"
+            label = f"{layer_display_name(pick_seg_layer[best_seg_i])} (pipe segment)"
 
     # ── Fall back to a point-cloud (site) pick in screen space ───────────────
     if centre is None:
@@ -1826,20 +1800,15 @@ pc_max = all_pts.max(axis=0)
 def _pivot_to(point: np.ndarray):
     """Recentre on a point while staying top-down (this viewer is top-view only)."""
     span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
-    h = max(1.0, span) * 1.2
-    cx, cy, cz = float(point[0]), float(point[1]), float(point[2])
-    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
-    print(f"  Pivot -> [{cx:.2f}, {cy:.2f}] (top-down)")
+    pivot_top_down(scene_widget, point, max(1.0, span) * 1.2)
+    print(f"  Pivot -> [{float(point[0]):.2f}, {float(point[1]):.2f}] (top-down)")
 
 
 def _top_view():
     """Bird's-eye view looking straight down, framed on the whole scene. This
     viewer spans multiple sites, so there is no single trench to frame."""
-    cx, cy = float(cloud_centroid[0]), float(cloud_centroid[1])
-    cz = float(cloud_centroid[2])
-    span = max(float(pc_max[0] - pc_min[0]), float(pc_max[1] - pc_min[1]))
-    h = max(1.0, span) * 1.2
-    scene_widget.look_at([cx, cy, cz], [cx, cy, cz + h], [0.0, 1.0, 0.0])
+    top_view(scene_widget, *trench_or_scene_frame(None, cloud_centroid,
+                                                  pc_min, pc_max))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
