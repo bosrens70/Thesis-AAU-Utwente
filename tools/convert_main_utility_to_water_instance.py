@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Convert "Main Utility" (class 0) points to WaterLine instances.
-================================================================
-For every PLY site in Water_Area_4 and Water_Area_5, extracts all
-class-0 points and saves them as a single WaterLine instance using
-the same directory layout and PLY format as label_module.py.
+Convert semantic-class points to WaterLine instances.
+======================================================
+For every PLY site in Water_Area_4 and Water_Area_5, extracts the points of
+each source class and saves them as a single WaterLine instance using the
+same directory layout and PLY format as label_module.py.
+
+Both "Main Utility" (class 0) and "Inactive Utility" (class 3) are water
+utilities in the OpenTrench3D water areas, so both become water instances;
+the class id is the filename prefix (``0_instance_0_type_7.ply``,
+``3_instance_0_type_7.ply``).
 
 Usage:  python tools/convert_main_utility_to_water_instance.py
 """
@@ -22,6 +27,7 @@ from core.data_loader import instance_base_name
 
 WATER_LINE_TYPE_ID = 7
 AREAS = ["Water_Area_4", "Water_Area_5"]
+SOURCE_CLASSES = [0, 3]   # Main Utility, Inactive Utility
 
 
 def parse_ply_header(ply_path):
@@ -40,12 +46,15 @@ def parse_ply_header(ply_path):
 
 
 def process_site(ply_path):
-    """Extract class-0 points from a site PLY and save as a WaterLine instance."""
+    """Extract each source class from a site PLY and save as WaterLine instances.
+
+    Returns the number of instances written (0 if none).
+    """
     header_rows, props = parse_ply_header(ply_path)
 
     if "class" not in props:
         print(f"  SKIP {ply_path.name}: no 'class' property in PLY header")
-        return False
+        return 0
 
     class_col = props.index("class")
     xyz_cols = [props.index("x"), props.index("y"), props.index("z")]
@@ -57,11 +66,20 @@ def process_site(ply_path):
 
     data = np.loadtxt(str(ply_path), skiprows=header_rows)
     classes = data[:, class_col].astype(int)
-    mask = classes == 0
-    n_class0 = int(mask.sum())
 
-    if n_class0 == 0:
-        print(f"  SKIP {ply_path.name}: 0 class-0 points")
+    n_written = 0
+    for class_id in SOURCE_CLASSES:
+        if write_instance(ply_path, data, classes == class_id, class_id,
+                          xyz_cols, rgb_cols):
+            n_written += 1
+    return n_written
+
+
+def write_instance(ply_path, data, mask, class_id, xyz_cols, rgb_cols):
+    """Write the masked points as ``<class_id>_instance_0_type_7.ply``."""
+    n_class = int(mask.sum())
+    if n_class == 0:
+        print(f"  SKIP {ply_path.name}: 0 class-{class_id} points")
         return False
 
     pts = data[mask][:, xyz_cols]
@@ -70,7 +88,7 @@ def process_site(ply_path):
     inst_dir = ply_path.parent / f"{instance_base_name(ply_path)}_Instances"
     inst_dir.mkdir(parents=True, exist_ok=True)
 
-    out_path = inst_dir / f"0_instance_0_type_{WATER_LINE_TYPE_ID}.ply"
+    out_path = inst_dir / f"{class_id}_instance_0_type_{WATER_LINE_TYPE_ID}.ply"
     n = len(pts)
 
     with open(str(out_path), "w", encoding="utf-8") as f:
@@ -93,7 +111,8 @@ def process_site(ply_path):
             parts.append(str(WATER_LINE_TYPE_ID))
             f.write(" ".join(parts) + "\n")
 
-    print(f"  OK   {ply_path.name}: {n_class0:,} pts -> {inst_dir.name}/")
+    print(f"  OK   {ply_path.name}: class {class_id}, {n_class:,} pts "
+          f"-> {inst_dir.name}/{out_path.name}")
     return True
 
 
@@ -114,13 +133,12 @@ def main():
         print(f"{'='*60}")
 
         for ply_path in ply_files:
-            if process_site(ply_path):
-                total_saved += 1
-            else:
-                total_skipped += 1
+            n_written = process_site(ply_path)
+            total_saved += n_written
+            total_skipped += len(SOURCE_CLASSES) - n_written
 
     print(f"\n{'='*60}")
-    print(f"  Done.  Saved: {total_saved}   Skipped: {total_skipped}")
+    print(f"  Done.  Instances saved: {total_saved}   Skipped: {total_skipped}")
     print(f"{'='*60}")
 
 

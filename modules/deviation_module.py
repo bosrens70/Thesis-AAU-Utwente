@@ -63,7 +63,8 @@ from core.geometry import (
     merge_linesets, drape_z_from_polylines,
 )
 from core.crop import CropRegion
-from core.depth import clean_coords_with_depth as _core_clean_coords
+from core.depth import (clean_coords_with_depth as _core_clean_coords,
+                        MAX_DEPTH_BELOW_GROUND)
 from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     pivot_oblique, top_view, trench_or_scene_frame,
@@ -368,7 +369,7 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         if not _crop_region.contains_local(pt[0], pt[1]):
             continue
 
-        if g.z == -99 or pt[2] <= -98:
+        if g.z == -99 or pt[2] <= -98 or pt[2] < GROUND_Z - MAX_DEPTH_BELOW_GROUND:
             if parent_avg_z is not None:
                 pt[2] = parent_avg_z
             else:

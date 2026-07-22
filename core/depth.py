@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Depth resolution for LER vertices with the -99 sentinel Z.
-==========================================================
+Depth resolution for LER vertices without a usable registered Z.
+================================================================
 Single implementation of the UTM -> local translation plus the ordered
 DepthSource fallback hierarchy (registered Z, vejledendeDybde, feature mean,
-parent-layer mean, ground level). Previously copied, and drifted, across
+parent-layer mean, ground level). A vertex enters the fallback when its Z is
+the -99 sentinel or fails the below-ground plausibility gate. Previously copied, and drifted, across
 base / label / ERR / deviation. Deliberately Open3D-free so it stays
 headless-testable.
 """
@@ -18,12 +19,21 @@ from core.config import DepthSource, PIPE_DEPTH_CONFIG
 # is far above this in the Danish height datum.
 SENTINEL_MAX = -98.0
 
+# Plausibility gate: a registered Z more than this many metres below the local
+# ground level is treated as unregistered and routed through the fallback
+# hierarchy. Catches placeholder elevations that pass the sentinel check: some
+# owners register Z = 0.0 DVR90 where the terrain sits at ~30 m, and a few
+# vertices carry corrupted near-sentinel values (-97.5 .. -71.3).
+MAX_DEPTH_BELOW_GROUND = 15.0
+
 
 def clean_coords_with_depth(coords_raw, vejledende_dybde_mm, *, TX, TY, TZ,
                             ground_z_at, cfg=PIPE_DEPTH_CONFIG,
-                            parent_avg_z=None, clamp_z=None):
+                            parent_avg_z=None, clamp_z=None,
+                            max_below_ground=MAX_DEPTH_BELOW_GROUND):
     """
-    Translate UTM -> local.  For vertices with the -99 sentinel Z, resolve the
+    Translate UTM -> local.  For vertices whose Z is the -99 sentinel or lies
+    implausibly far below the local ground (``max_below_ground``), resolve the
     depth using the ordered DepthSource hierarchy defined in *cfg*.
 
     Parameters
@@ -37,6 +47,8 @@ def clean_coords_with_depth(coords_raw, vejledende_dybde_mm, *, TX, TY, TZ,
     parent_avg_z : local mean Z of the parent pipe layer (components only).
     clamp_z : optional ``(lo, hi)`` — clamp final local Z into this range
         (catches unresolved sentinels and wildly wrong estimates).
+    max_below_ground : registered Z more than this many metres below the local
+        ground is treated as unregistered (placeholder / corrupted values).
 
     Returns
     -------
@@ -53,7 +65,12 @@ def clean_coords_with_depth(coords_raw, vejledende_dybde_mm, *, TX, TY, TZ,
     n = len(coords)
     sources = np.full(n, DepthSource.NONE, dtype=np.int8)
 
-    bad = coords[:, 2] <= SENTINEL_MAX
+    # ground_z_at takes local XY (already translated above); +TZ lifts the
+    # returned local ground back to the absolute datum the raw Z values use.
+    ground_utm = np.array([ground_z_at(x, y)
+                           for x, y in coords[:, :2]], dtype=float) + TZ
+    bad = ((coords[:, 2] <= SENTINEL_MAX)
+           | (coords[:, 2] < ground_utm - max_below_ground))
     sources[~bad] = DepthSource.REGISTERED
 
     if bad.any():

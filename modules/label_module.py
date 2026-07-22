@@ -65,7 +65,8 @@ from core.geometry import (
     linear_to_srgb,
 )
 from core.crop import CropRegion
-from core.depth import clean_coords_with_depth as _core_clean_coords
+from core.depth import (clean_coords_with_depth as _core_clean_coords,
+                        MAX_DEPTH_BELOW_GROUND)
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
@@ -480,7 +481,8 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         if not _pt_in_local_bbox(pt[0], pt[1]):
             continue
 
-        if g.z == -99 or pt[2] <= -98:
+        _gz_local = _ground_z_at(pt[0], pt[1])
+        if g.z == -99 or pt[2] <= -98 or pt[2] < _gz_local - MAX_DEPTH_BELOW_GROUND:
             # Component has no reliable Z — estimate from parent pipe depth
             # or from ground model
             if parent_avg_z is not None:
@@ -488,7 +490,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
                 pt[2] = parent_avg_z
                 _comp_depth_stats["from_pipe_avg"] += 1
             else:
-                pt[2] = _ground_z_at(pt[0], pt[1])
+                pt[2] = _gz_local
                 _comp_depth_stats["from_ground"] += 1
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
