@@ -50,3 +50,4 @@ make_ler_appendix.py
 
 # ── Active site selection (per-machine, see its docstring) ──────
 core/site_local.py
+/tools
