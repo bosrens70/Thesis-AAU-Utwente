@@ -47,7 +47,7 @@ from core.config import (
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
-    TARGET_CLASS, UTILITY_TO_LER_MATCH,
+    TARGET_CLASS, UTILITY_TO_LER_MATCH, UTILITY_TYPE_COLORS,
     DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
     forsyningsart_color,
 )
@@ -942,7 +942,7 @@ panel.add_stretch()
 # 10b.  Left-side Instance Labeling panel
 # ─────────────────────────────────────────────────────────────────────────────
 LEFT_PANEL_WIDTH = int(18 * em)
-left_panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+left_panel = gui.Vert(int(0.15 * em), gui.Margins(int(em), int(em), int(em), int(em)))
 
 if instance_data:
     _inst_progress_lbl = gui.Label(
@@ -950,18 +950,16 @@ if instance_data:
     )
     _inst_progress_lbl.text_color = gui.Color(1.0, 1.0, 0.3, 1.0)
     left_panel.add_child(_inst_progress_lbl)
-    left_panel.add_fixed(int(0.1 * em))
 
     _inst_pts_lbl = gui.Label(f"  {instance_data[0]['n_pts']:,} points")
     _inst_pts_lbl.text_color = gui.Color(0.7, 0.7, 0.7, 1.0)
     left_panel.add_child(_inst_pts_lbl)
-    left_panel.add_fixed(int(0.1 * em))
 
     _inst_assigned_lbl = gui.Label("")
     _inst_assigned_lbl.text_color = gui.Color(0.3, 1.0, 0.3, 1.0)
     _inst_assigned_lbl.visible = False
     left_panel.add_child(_inst_assigned_lbl)
-    left_panel.add_fixed(int(0.3 * em))
+    left_panel.add_fixed(int(0.25 * em))
 
     _suggest_btn = gui.Button("Suggest LER match")
     _suggest_btn.set_on_clicked(lambda: _suggest_ler_match())
@@ -979,7 +977,7 @@ if instance_data:
     _next_suggest_btn.set_on_clicked(lambda: _next_suggestion())
     _suggest_nav_row.add_child(_next_suggest_btn)
     left_panel.add_child(_suggest_nav_row)
-    left_panel.add_fixed(int(0.4 * em))
+    left_panel.add_fixed(int(0.25 * em))
 
     _ler_match_lbl = gui.Label("LER match: none (click a line)")
     _ler_match_lbl.text_color = gui.Color(0.6, 0.6, 0.6, 1.0)
@@ -992,18 +990,68 @@ if instance_data:
     _clear_match_btn = gui.Button("Clear LER match")
     _clear_match_btn.set_on_clicked(lambda: _clear_ler_match())
     left_panel.add_child(_clear_match_btn)
-    left_panel.add_fixed(int(0.4 * em))
+    left_panel.add_fixed(int(0.25 * em))
 
     left_panel.add_child(gui.Label("Assign label (or press 1-0):"))
-    left_panel.add_fixed(int(0.2 * em))
 
-_label_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-_labeled_output_dir = _instance_dir / f"labeled_{_label_stamp}" if instance_data else None
-if _labeled_output_dir and not _labeled_output_dir.exists():
-    _labeled_output_dir.mkdir(parents=True)
+# Labelled output: resume the most recent labelled session when one exists, so
+# labels and LER matches carry across sessions and a matching-only pass can
+# attach to labels saved earlier. A fresh timestamped folder is created only
+# when the site has no labelled session yet.
+_labeled_output_dir = None
+if instance_data:
+    _prev_labeled = sorted(
+        [d for d in _instance_dir.iterdir()
+         if d.is_dir() and d.name.startswith("labeled_") and any(d.glob("*.ply"))],
+        key=lambda p: p.name, reverse=True)
+    if _prev_labeled:
+        _labeled_output_dir = _prev_labeled[0]
+    else:
+        _label_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        _labeled_output_dir = _instance_dir / f"labeled_{_label_stamp}"
+        _labeled_output_dir.mkdir(parents=True)
 
 
 _LABEL_TO_ID = {name: i + 1 for i, name in enumerate(INSTANCE_LABEL_OPTIONS)}
+
+# Reverse of UTILITY_TO_LER_MATCH: matched LER layer -> implied type label, so
+# an accepted match can label an instance that has no label yet.
+_LER_LAYER_TO_LABEL = {
+    layer: INSTANCE_LABEL_OPTIONS[lid - 1]
+    for lid, _cfg in UTILITY_TO_LER_MATCH.items()
+    if 1 <= lid <= len(INSTANCE_LABEL_OPTIONS)
+    for layer in _cfg["layers"]
+}
+
+_INSTANCE_FNAME_RE = re.compile(rf"^{TARGET_CLASS}_instance_(\d+)_type_(\d+)\.ply$")
+
+# Prefill labels and LER matches from the resumed session, and start at the
+# first instance that still has no label.
+if _labeled_output_dir and _labeled_output_dir.exists():
+    for _f in sorted(_labeled_output_dir.glob("*.ply")):
+        _fm = _INSTANCE_FNAME_RE.match(_f.name)
+        if not _fm:
+            continue
+        _pidx, _plid = int(_fm.group(1)), int(_fm.group(2))
+        if _pidx < len(instance_data) and 1 <= _plid <= len(INSTANCE_LABEL_OPTIONS):
+            _instance_labels[_pidx] = INSTANCE_LABEL_OPTIONS[_plid - 1]
+    _matches_path = _labeled_output_dir / "ler_matches.json"
+    if _matches_path.exists():
+        try:
+            with open(str(_matches_path), encoding="utf-8") as _fh:
+                for _fname, _pmatch in json.load(_fh).items():
+                    _fm = _INSTANCE_FNAME_RE.match(_fname)
+                    if _fm and int(_fm.group(1)) < len(instance_data):
+                        _instance_ler_match[int(_fm.group(1))] = _pmatch
+        except (json.JSONDecodeError, OSError) as _e:
+            print(f"  [warn] Could not read {_matches_path.name}: {_e}")
+    if _instance_labels or _instance_ler_match:
+        print(f"  [resume] {_labeled_output_dir.name}/: {len(_instance_labels)} labels, "
+              f"{len(_instance_ler_match)} LER matches loaded")
+        _first_unlabeled = next(
+            (i for i in range(len(instance_data)) if i not in _instance_labels), None)
+        if _first_unlabeled is not None:
+            _current_inst_idx[0] = _first_unlabeled
 
 
 def _write_ler_matches_json():
@@ -1073,6 +1121,64 @@ def _save_instance_ply(idx, label_name):
     _write_ler_matches_json()
 
 
+def _check_all_labeled():
+    """Show the completion message once every instance carries a label. Shared by
+    the label, autolabel, and startup paths so the message is consistent."""
+    if instance_data and len(_instance_labels) == len(instance_data):
+        _inst_progress_lbl.text = "All instances labeled!"
+        _inst_pts_lbl.text = ""
+        print("  [done] All instances have been labeled.")
+        return True
+    return False
+
+
+def _utility_color_for_label(label_name):
+    """DLF utility colour (RGB 0-1) for a label, via its utility-type id."""
+    return UTILITY_TYPE_COLORS.get(_LABEL_TO_ID.get(label_name, 0),
+                                   UTILITY_TYPE_COLORS[0])
+
+
+def _apply_instance_color(idx):
+    """Render a labelled instance in its utility-type colour, so an instance that
+    has been linked to a utility is visually distinct from the raw RGB of the
+    unlabelled ones. Restores the original RGB when the instance has no label.
+    Re-adds the point geometry (Open3D cannot repaint vertices in place) and
+    keeps its current visibility."""
+    gn = _inst_pts_gn(idx)
+    if not scene_widget.scene.has_geometry(gn):
+        return
+    label_name = _instance_labels.get(idx)
+    if label_name is not None:
+        pcd = o3d.geometry.PointCloud(instance_data[idx]["pcd"])  # copy, keep original
+        pcd.paint_uniform_color(_utility_color_for_label(label_name))
+    else:
+        pcd = instance_data[idx]["pcd"]  # original RGB
+    was_visible = (idx == _current_inst_idx[0])
+    scene_widget.scene.remove_geometry(gn)
+    scene_widget.scene.add_geometry(gn, pcd, point_material_flat(3.0))
+    scene_widget.scene.show_geometry(gn, was_visible)
+
+
+def _maybe_autolabel_from_layer(idx, layer_name):
+    """When an instance has no type label yet, infer one from the matched LER
+    layer (reverse of UTILITY_TO_LER_MATCH) and save it, so a match recorded on
+    its own still persists a labelled PLY. No-op if the instance is already
+    labelled or the layer has no type mapping (e.g. a Ledningstrace variant)."""
+    if idx in _instance_labels:
+        return
+    label_name = _LER_LAYER_TO_LABEL.get(layer_name)
+    if label_name is None:
+        return
+    _instance_labels[idx] = label_name
+    print(f"  [label] Instance {idx} ({instance_data[idx]['name']}) -> {label_name}"
+          f"  (inferred from LER layer {layer_name})")
+    _inst_assigned_lbl.text = f"  Label: {label_name}"
+    _inst_assigned_lbl.visible = True
+    _save_instance_ply(idx, label_name)
+    _apply_instance_color(idx)
+    _check_all_labeled()
+
+
 def _show_instance(idx):
     if not instance_data:
         return
@@ -1117,6 +1223,7 @@ def _assign_label(label_name):
     _inst_assigned_lbl.text = f"  Label: {label_name}"
     _inst_assigned_lbl.visible = True
     _save_instance_ply(idx, label_name)
+    _apply_instance_color(idx)
     # Advance to next unlabeled instance, or next instance if all labeled
     next_idx = None
     for i in range(idx + 1, len(instance_data)):
@@ -1131,10 +1238,8 @@ def _assign_label(label_name):
     if next_idx is not None:
         _current_inst_idx[0] = next_idx
         _show_instance(next_idx)
-    elif len(_instance_labels) == len(instance_data):
-        _inst_progress_lbl.text = "All instances labeled!"
-        _inst_pts_lbl.text = ""
-        print("  [done] All instances have been labeled.")
+    else:
+        _check_all_labeled()
     window.set_needs_layout()
     window.post_redraw()
 
@@ -1149,9 +1254,8 @@ if instance_data:
         _lbl_btn = gui.Button(f"{_li + 1}. {_label_name}")
         _lbl_btn.set_on_clicked(_make_label_cb(_label_name))
         left_panel.add_child(_lbl_btn)
-        left_panel.add_fixed(int(0.1 * em))
 
-    left_panel.add_fixed(int(0.4 * em))
+    left_panel.add_fixed(int(0.25 * em))
 
     _nav_row = gui.Horiz(int(0.3 * em))
 
@@ -1180,7 +1284,7 @@ if instance_data:
     _nav_row.add_child(_next_btn)
 
     left_panel.add_child(_nav_row)
-    left_panel.add_fixed(int(0.3 * em))
+    left_panel.add_fixed(int(0.2 * em))
 
     _save_info = gui.Label(f"Saves to: {_labeled_output_dir.name}/")
     _save_info.text_color = gui.Color(0.5, 0.5, 0.5, 1.0)
@@ -1347,6 +1451,7 @@ def _accept_suggestion():
     _instance_ler_match[idx] = {"layer": c["layer"], "gml_id": c["gml_id"]}
     print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
           f"-> {c['layer']}  gml_id={c['gml_id']}  (accepted suggestion, score={c['score']:.2f})")
+    _maybe_autolabel_from_layer(idx, c["layer"])
     _refresh_ler_match_label(idx)
     _place_ler_match_highlight(*c["rep_segment"])
     _clear_suggestion_highlight()
@@ -1395,6 +1500,7 @@ def _do_pick_ler(depth_image):
           f"-> {layer_name}  gml_id={gml_id}")
 
     def _update():
+        _maybe_autolabel_from_layer(idx, layer_name)
         _place_ler_match_highlight(pick_seg_p1[best_i], pick_seg_p2[best_i])
         _clear_suggestion_highlight()
         _refresh_ler_match_label(idx)
@@ -1551,6 +1657,15 @@ n_total_comps = sum(comp_stats.values())
 print(f"\nRendering {len(pts):,} points  +  {n_total_segs:,} pipe segments  "
       f"+  {n_total_comps} component spheres")
 print("Launching viewer ...\n")
+
+# Reflect any resumed session in the opening view: colour instances that were
+# already labelled, display the instance the resume logic selected (first
+# unlabelled), and show the completion message when everything is labelled.
+if instance_data:
+    for _lidx in _instance_labels:
+        _apply_instance_color(_lidx)
+    _show_instance(_current_inst_idx[0])
+    _check_all_labeled()
 
 app.run()
 print("Viewer closed.")
