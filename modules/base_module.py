@@ -51,7 +51,13 @@ from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     pivot_oblique, top_view, trench_or_scene_frame,
 )
-from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
+from core.ledningstrace import (
+    get_ledningstrace_display_info, get_storage_key, get_bredde_width,
+    ribbon_alpha,
+)
+from core.trace_render import (
+    build_trace_centerlines, add_trace_centerlines, set_layer_material,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # INITIALISE — load area offset, point cloud, and GML via core/
@@ -309,6 +315,13 @@ for _ln, _cyls in _pipe_layer_cyls.items():
         _m += _c
     _m.compute_vertex_normals()
     _pipe_layer_meshes[_ln] = _m
+
+# Trace centrelines: a trace's corridor ribbon is drawn transparent (see
+# core/trace_render.py), so its registered centreline is drawn separately as a
+# thin tube, like any other utility. Built from the picking arrays above.
+_trace_centerlines = build_trace_centerlines(
+    pick_seg_p1, pick_seg_p2, pick_seg_layer,
+    lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]))
 
 # Pipe centroid
 pipe_centroid = np.array([0.0, 0.0, 0.0])
@@ -605,10 +618,16 @@ setup_scene_lighting(scene_widget.scene, post_processing=True)
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
 
-# Add per-layer pipe meshes (filled)
+# Add per-layer pipe meshes (filled); a trace's ribbon goes on more transparent
 for _ln, _mesh in _pipe_layer_meshes.items():
     alpha = pipe_opacity[0] if _layer_visible.get(_ln, True) else 0.0
-    _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh, make_mesh_material(alpha))
+    _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh,
+              make_mesh_material(ribbon_alpha(_ln, alpha)))
+
+# Add trace centrelines at the unscaled opacity, so they read like the pipes
+add_trace_centerlines(
+    scene_widget.scene, _trace_centerlines, pipe_opacity[0], make_mesh_material,
+    visible_of=lambda k: _layer_visible.get(k, True))
 
 # Add per-layer component meshes (hidden by default)
 for _ln, _mesh in _comp_layer_meshes.items():
@@ -698,7 +717,8 @@ def _on_depth_toggle(checked):
         mesh = _pipe_layer_meshes_depth[ln] if checked and ln in _pipe_layer_meshes_depth else _pipe_layer_meshes[ln]
         alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
         scene_widget.scene.remove_geometry(_pipe_gn(ln))
-        _add_mesh(scene_widget.scene, _pipe_gn(ln), mesh, make_mesh_material(alpha))
+        _add_mesh(scene_widget.scene, _pipe_gn(ln), mesh,
+                  make_mesh_material(ribbon_alpha(ln, alpha)))
     for ln in _comp_layer_meshes:
         mesh = _comp_layer_meshes_depth[ln] if checked and ln in _comp_layer_meshes_depth else _comp_layer_meshes[ln]
         alpha = pipe_opacity[0] if _layer_visible.get(ln, True) else 0.0
@@ -773,7 +793,8 @@ def _apply_opacity(val: float):
 
     for ln in _pipe_layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
-        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+        set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                           make_mesh_material)
 
     for ln in _comp_layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
@@ -793,7 +814,8 @@ def _make_pipe_toggle(ln):
         _layer_visible[ln] = checked
         if ln in _pipe_layer_meshes:
             alpha = pipe_opacity[0] if checked else 0.0
-            scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+            set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                               make_mesh_material)
         window.post_redraw()
     return _cb
 
@@ -815,7 +837,8 @@ def _on_toggle_all_pipes(checked):
         _layer_visible[ln] = checked
         if ln in _pipe_layer_meshes:
             alpha = pipe_opacity[0] if checked else 0.0
-            scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+            set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                               make_mesh_material)
     window.post_redraw()
 
 _all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
@@ -877,7 +900,8 @@ def _on_ler_toggle(checked):
     # Show/hide all utility geometry (legend collapse is handled by the section)
     for ln in _pipe_layer_meshes:
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
-        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+        set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                           make_mesh_material)
     for ln in _comp_layer_meshes:
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))

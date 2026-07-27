@@ -70,7 +70,10 @@ from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     pivot_oblique, top_view, trench_or_scene_frame,
 )
-from core.ledningstrace import get_bredde_width
+from core.ledningstrace import get_bredde_width, is_trace_key, ribbon_alpha
+from core.trace_render import (
+    build_trace_centerlines, add_trace_centerlines, trace_centerline_gn,
+)
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
     setup_scene_lighting,
@@ -330,6 +333,15 @@ seg_gml_id = np.array(all_seg_gml_id, dtype=object) if all_seg_gml_id else np.em
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
+
+# Trace centrelines: the corridor ribbon is drawn transparent (see
+# core/trace_render.py), so the registered centreline is drawn as a thin tube
+# through the same mesh material as the pipes. Shown only in the solid colour
+# modes; the LER deviation modes already render a trace as a deviation-coloured
+# centreline cloud, which this tube would cover.
+_trace_centerlines = build_trace_centerlines(
+    seg_p1, seg_p2, all_seg_layer,
+    lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]))
 
 _t_ler1 = time.perf_counter()
 print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1f}s"
@@ -1379,8 +1391,11 @@ for ln, mesh in ler_meshes.items():
     gn = f"ler_{ln}"
     if not mesh.has_vertex_normals():
         mesh.compute_vertex_normals()
-    scene_widget.scene.add_geometry(gn, mesh, make_mesh_mat(0.6))
+    scene_widget.scene.add_geometry(gn, mesh, make_mesh_mat(ribbon_alpha(ln, 0.6)))
     _ler_visible[ln] = True
+
+# Trace centrelines, at the unscaled opacity so they read like the pipes.
+add_trace_centerlines(scene_widget.scene, _trace_centerlines, 0.6, make_mesh_mat)
 
 # Add LER component meshes
 _comp_visible = {}
@@ -1509,6 +1524,23 @@ scene_widget.setup_camera(60, bounds, cloud_centroid.tolist())
 # ─────────────────────────────────────────────────────────────────────────────
 # 7.  Colour-mode switch
 # ─────────────────────────────────────────────────────────────────────────────
+def _trace_centerlines_visible():
+    """A trace's solid centreline tube belongs to the solid colour modes only:
+    in the LER deviation modes the trace is itself drawn as a deviation-coloured
+    centreline cloud, which the tube would cover."""
+    return _color_mode[0] not in _LER_DEV_MODES
+
+
+def _sync_trace_centerlines():
+    """Match every trace centreline to the master, its layer, and the mode."""
+    _on = _trace_centerlines_visible()
+    for ln in _trace_centerlines:
+        gn = trace_centerline_gn(ln)
+        if scene_widget.scene.has_geometry(gn):
+            scene_widget.scene.show_geometry(
+                gn, _on and _ler_master_on[0] and _ler_visible.get(ln, True))
+
+
 def _apply_ler_color_mode(mode):
     """Swap each LER layer between its solid mesh and a discretized deviation
     point cloud. The cloud carries the metric (XYZ or Z) and colouring
@@ -1525,8 +1557,10 @@ def _apply_ler_color_mode(mode):
             scene_widget.scene.add_geometry(gn, disp,
                                             make_ler_pt_mat(6.0, _ler_opacity[0]))
         else:
-            scene_widget.scene.add_geometry(gn, ler_meshes[ln], make_mesh_mat(_ler_opacity[0]))
+            scene_widget.scene.add_geometry(
+                gn, ler_meshes[ln], make_mesh_mat(ribbon_alpha(ln, _ler_opacity[0])))
         scene_widget.scene.show_geometry(gn, _ler_master_on[0] and _ler_visible.get(ln, True))
+    _sync_trace_centerlines()
 
 
 def _apply_color_mode(mode):
@@ -1722,6 +1756,7 @@ def _apply_utility_filter(sel):
             vis = ln in matching_ler if matching_ler else False
         _ler_visible[ln] = vis
         scene_widget.scene.show_geometry(f"ler_{ln}", vis and _ler_master_on[0])
+    _sync_trace_centerlines()
 
     # Accuracy buffers follow the same per-utility matching as the LER layers.
     matching_acc = _get_matching_accbuf_keys(sel_ut) if sel_ut is not None else None
@@ -1763,8 +1798,14 @@ def _on_ler_opacity(val):
     in_ler_dev = _color_mode[0] in _LER_DEV_MODES
     for ln in ler_meshes:
         if _ler_visible.get(ln, True):
-            mat = make_ler_pt_mat(6.0, val) if in_ler_dev else make_mesh_mat(val)
+            mat = (make_ler_pt_mat(6.0, val) if in_ler_dev
+                   else make_mesh_mat(ribbon_alpha(ln, val)))
             scene_widget.scene.modify_geometry_material(f"ler_{ln}", mat)
+    # Trace centrelines follow the slider at the unscaled opacity
+    for ln in _trace_centerlines:
+        gn = trace_centerline_gn(ln)
+        if scene_widget.scene.has_geometry(gn):
+            scene_widget.scene.modify_geometry_material(gn, make_mesh_mat(val))
     for ln in comp_meshes:
         if _comp_visible.get(ln, False):
             scene_widget.scene.modify_geometry_material(f"comp_{ln}", make_mesh_mat(val))
@@ -1783,6 +1824,7 @@ def _on_ler_master(checked):
     for c_ln in comp_meshes:
         scene_widget.scene.show_geometry(f"comp_{c_ln}",
                                          checked and _comp_visible.get(c_ln, False))
+    _sync_trace_centerlines()
 
 
 _ler_section.set_on_master(window, _on_ler_master)
@@ -1842,6 +1884,7 @@ def _on_toggle_all_ler(checked):
         _cb.checked = checked
         _ler_visible[_ln] = checked
         scene_widget.scene.show_geometry(f"ler_{_ln}", checked and _ler_master_on[0])
+    _sync_trace_centerlines()
     window.post_redraw()
 
 
@@ -1867,6 +1910,7 @@ for ln in LINE_LAYERS:
         def _cb(checked):
             _ler_visible[layer] = checked
             scene_widget.scene.show_geometry(f"ler_{layer}", checked and _ler_master_on[0])
+            _sync_trace_centerlines()
             window.post_redraw()
         return _cb
 

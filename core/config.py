@@ -138,6 +138,19 @@ COMPONENT_LAYERS = {
 
 COMPONENT_SPHERE_RADIUS = 0.05
 
+# Ledningstrace rendering. A trace is a corridor: a registered centreline plus a
+# width ("bredde"). Drawn at full opacity the corridor ribbon hides the utilities
+# beneath it, so the ribbon is rendered at this fraction of the current LER
+# opacity while the centreline is drawn like any other utility (see
+# core/trace_render.py).
+LEDNINGSTRACE_ALPHA_SCALE = 0.7
+
+# Display radius of the trace centreline tube, in metres. Deliberately a fixed
+# display value (the same fallback pipes use), never derived from "bredde":
+# bredde is a corridor width, not a utility cross-section, so the drawn tube
+# makes no claim about the physical size of anything in the corridor.
+TRACE_CENTERLINE_RADIUS = 0.01
+
 # Width of the right-hand control panel in every GUI module, in multiples of the
 # theme font size (em). Kept here so the panels line up across modules; each
 # module derives its pixel width as int(PANEL_WIDTH_EM * em) rather than

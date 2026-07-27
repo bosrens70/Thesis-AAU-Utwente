@@ -132,14 +132,17 @@ def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
     callable
         Callback suitable for checkbox.set_on_checked().
     """
+    from core.trace_render import set_layer_material
+
     def _on_toggle_all_pipes(checked):
         for ln, cb in pipe_checkboxes:
             cb.checked = checked
             layer_visible[ln] = checked
             if ln in pipe_layer_meshes:
                 alpha = pipe_opacity[0] if checked else 0.0
-                scene_widget.scene.modify_geometry_material(pipe_gn(ln),
-                                                             make_mesh_material(alpha))
+                # Trace ribbon/centreline split handled centrally
+                set_layer_material(scene_widget.scene, pipe_gn(ln), ln, alpha,
+                                   make_mesh_material)
         window.post_redraw()
     return _on_toggle_all_pipes
 

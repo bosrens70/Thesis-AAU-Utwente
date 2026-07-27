@@ -6,7 +6,7 @@ Provides shared logic for detecting, tracking, and rendering Ledningstrace
 features by forsyningsart (utility type) across all viewers.
 """
 
-from core.config import forsyningsart_color
+from core.config import forsyningsart_color, LEDNINGSTRACE_ALPHA_SCALE
 
 
 def get_ledningstrace_display_info(layer_name, row, default_color):
@@ -70,3 +70,25 @@ def get_bredde_width(row):
 def is_ledningstrace(layer_name):
     """Check if a layer is Ledningstrace."""
     return layer_name == "Ledningstrace"
+
+
+def is_trace_key(storage_key):
+    """Check if a *storage key* denotes a Ledningstrace.
+
+    Unlike ``is_ledningstrace``, this also matches the per-forsyningsart
+    variants the viewers store meshes under ("Ledningstrace (vand)"), which is
+    the form the rendering code works with.
+    """
+    return str(storage_key).startswith("Ledningstrace")
+
+
+def ribbon_alpha(storage_key, base_alpha):
+    """Opacity for a layer's filled geometry.
+
+    A trace's corridor ribbon is drawn more transparent than the other
+    utilities so it stops hiding what runs beneath it; every other layer keeps
+    the opacity it was given. A hidden layer (``base_alpha`` 0.0) stays hidden.
+    """
+    if is_trace_key(storage_key):
+        return float(base_alpha) * LEDNINGSTRACE_ALPHA_SCALE
+    return float(base_alpha)

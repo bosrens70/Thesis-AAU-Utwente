@@ -70,7 +70,13 @@ from core.geometry import (
 from core.crop import CropRegion
 from core.depth import (clean_coords_with_depth as _core_clean_coords,
                         MAX_DEPTH_BELOW_GROUND)
-from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
+from core.ledningstrace import (
+    get_ledningstrace_display_info, get_storage_key, get_bredde_width,
+    is_trace_key, ribbon_alpha,
+)
+from core.trace_render import (
+    build_trace_centerlines, add_trace_centerlines, set_layer_material,
+)
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
     flat_material, setup_scene_lighting,
@@ -397,8 +403,12 @@ for _ln, _cyls in _pipe_layer_cyls.items():
 
 # Per-layer XRay centerline LineSets — one line per clipped segment, rendered
 # with depth_func="always" so thin pipes are visible through thick ones.
+# Traces are excluded: they always carry their own centreline tube (below), so
+# an XRay line for them would just double it up.
 _pipe_layer_centerlines = {}
 for _ln, (p1s, p2s) in _pipe_layer_seg_pts.items():
+    if is_trace_key(_ln):
+        continue
     _cl_pts   = []
     _cl_lines = []
     for _ci, (_cp1, _cp2) in enumerate(zip(p1s, p2s)):
@@ -412,6 +422,13 @@ for _ln, (p1s, p2s) in _pipe_layer_seg_pts.items():
     _color = _storage_key_colors.get(_ln, [1.0, 1.0, 1.0])
     _cl_ls.paint_uniform_color(_color)
     _pipe_layer_centerlines[_ln] = _cl_ls
+
+# Trace centrelines: the corridor ribbon is drawn transparent (see
+# core/trace_render.py), so the registered centreline is drawn as a thin tube
+# through the same lit material as the pipes.
+_trace_centerlines = build_trace_centerlines(
+    pick_seg_p1, pick_seg_p2, pick_seg_layer,
+    lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]))
 
 # Combined wireframe (all layers) for the wireframe overlay toggle.
 # Build from per-layer meshes using the non-mutating `+` operator so that
@@ -730,10 +747,17 @@ setup_scene_lighting(scene_widget.scene, post_processing=True)
 # Add point cloud
 scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
 
-# Add per-layer pipe meshes (filled); wireframe is a separate combined overlay
+# Add per-layer pipe meshes (filled); wireframe is a separate combined overlay.
+# A trace's corridor ribbon goes on more transparent than the rest.
 for _ln, _mesh in _pipe_layer_meshes.items():
     _alpha0 = 1.0 if _layer_visible.get(_ln, True) else 0.0
-    _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh, make_mesh_material(_alpha0))
+    _add_mesh(scene_widget.scene, _pipe_gn(_ln), _mesh,
+              make_mesh_material(ribbon_alpha(_ln, _alpha0)))
+
+# Add trace centrelines at the unscaled opacity, so they read like the pipes
+add_trace_centerlines(
+    scene_widget.scene, _trace_centerlines, pipe_opacity[0], make_mesh_material,
+    visible_of=lambda k: _layer_visible.get(k, True))
 
 # Add combined wireframe overlay (hidden by default)
 if combined_pipe_wire is not None:
@@ -821,7 +845,8 @@ def _on_ler_toggle(checked):
         if not _layer_visible.get(ln, True):
             continue
         alpha = pipe_opacity[0] if checked else 0.0
-        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+        set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                           make_mesh_material)
     for ln in _comp_layer_meshes:
         if not _layer_visible.get(ln, True):
             continue
@@ -840,7 +865,8 @@ def _make_pipe_toggle(ln):
         _ler = ler_utilities_visible[0]
         if ln in _pipe_layer_meshes:
             alpha = pipe_opacity[0] if (_ler and checked and not pipe_wireframe_active[0]) else 0.0
-            scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+            set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                               make_mesh_material)
         if ln in _pipe_layer_centerlines:
             scene_widget.scene.show_geometry(
                 _centerline_gn(ln), _ler and checked and centerline_xray_active[0]
@@ -926,7 +952,8 @@ def _apply_opacity(val: float):
 
     for ln in _pipe_layer_meshes:
         alpha = val if (_ler and _layer_visible.get(ln, True) and not pipe_wireframe_active[0]) else 0.0
-        scene_widget.scene.modify_geometry_material(_pipe_gn(ln), make_mesh_material(alpha))
+        set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
+                           make_mesh_material)
 
     for ln in _comp_layer_meshes:
         alpha = val if (_ler and _layer_visible.get(ln, True)) else 0.0

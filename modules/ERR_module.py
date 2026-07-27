@@ -55,7 +55,10 @@ from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
     setup_scene_lighting,
 )
-from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
+from core.ledningstrace import (
+    get_ledningstrace_display_info, get_storage_key, get_bredde_width,
+    ribbon_alpha,
+)
 
 # Buffer (metres) around the Graveforesp polygon
 BUFFER = 2.0
@@ -1182,7 +1185,8 @@ layer_opacity = {}  # layer_name -> [opacity_float]
 for layer_name, mesh in layer_meshes.items():
     layer_opacity[layer_name] = [1.0]
     scene_widget.scene.add_geometry(
-        _line_geom_name(layer_name), mesh, make_mesh_material(1.0)
+        _line_geom_name(layer_name), mesh,
+        make_mesh_material(ribbon_alpha(layer_name, 1.0))
     )
 
 # Add utility component layers
@@ -1270,7 +1274,7 @@ def _on_depth_toggle(checked):
         alpha = pipe_opacity_val[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln),
-                                        make_mesh_material(alpha))
+                                        make_mesh_material(ribbon_alpha(ln, alpha)))
     for ln in comp_meshes:
         alpha = pipe_opacity_val[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.remove_geometry(_comp_geom_name(ln))
@@ -1396,7 +1400,7 @@ def _apply_opacity(val: float):
         layer_opacity[ln][0] = val
     for ln in layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
-        mat = make_mesh_material(alpha)
+        mat = make_mesh_material(ribbon_alpha(ln, alpha))
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     for ln in comp_meshes:
@@ -1417,7 +1421,7 @@ def _make_pipe_toggle(ln):
     def _cb(checked):
         _layer_visible[ln] = checked
         alpha = pipe_opacity_val[0] if checked else 0.0
-        mat = make_mesh_material(alpha)
+        mat = make_mesh_material(ribbon_alpha(ln, alpha))
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
         window.post_redraw()
@@ -1441,7 +1445,7 @@ def _on_toggle_all_pipes(checked):
         cb.checked = checked
         _layer_visible[ln] = checked
         alpha = pipe_opacity_val[0] if checked else 0.0
-        mat = make_mesh_material(alpha)
+        mat = make_mesh_material(ribbon_alpha(ln, alpha))
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     window.post_redraw()
@@ -1492,7 +1496,7 @@ def _on_ler_toggle(checked):
     # Show/hide all LER geometry (legend collapse is handled by the section)
     for ln in layer_meshes:
         alpha = pipe_opacity_val[0] if (checked and _layer_visible.get(ln, True)) else 0.0
-        mat = make_mesh_material(alpha)
+        mat = make_mesh_material(ribbon_alpha(ln, alpha))
         scene_widget.scene.remove_geometry(_line_geom_name(ln))
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     for ln in comp_meshes:
