@@ -34,7 +34,7 @@ from core.config import (
     VOXEL_SIZE, MIN_CLUSTER_SIZE, MIN_SAMPLES, POINT_SIZE,
     MIN_INSTANCE_POINTS,
 )
-from core.data_loader import instance_base_name
+from core.site_status import instance_dir_for
 from core.rendering import point_material_shaded, setup_scene_lighting
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,15 +438,16 @@ class InstanceViewer:
         ms  = self._ms_edit.int_value
         mip = self._mip_edit.int_value
 
-        stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-        perm_dir = ply_path.parent / f"{instance_base_name(ply_path)}_Instances"
-        out_dir  = perm_dir / stamp
-        out_dir.mkdir(parents=True, exist_ok=True)
-
         instance_ids = sorted(uid for uid in np.unique(self._cur_labels) if uid >= 0)
         if not instance_ids:
             print("\nNo instances to save.")
             return
+
+        # Created only once there is something to write, so a save with nothing
+        # to save leaves no empty run folder behind.
+        stamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_dir = instance_dir_for(ply_path) / stamp
+        out_dir.mkdir(parents=True, exist_ok=True)
 
         cls1 = all_classes[mask1]
         rgb1 = all_rgb[mask1]

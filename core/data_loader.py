@@ -24,6 +24,13 @@ from core.config import (
     COMPONENT_SPHERE_RADIUS,
     ACCURACY_CLASS_FIELD, accuracy_class_halfwidth,
 )
+# Directory-layout conventions live in core/site_status.py so the headless
+# status tool and the viewers resolve the same folders.  Re-exported here
+# because callers have always imported instance_base_name from this module.
+from core.site_status import (
+    instance_base_name, instance_dir_for, site_sidecar,
+    resolve_segment_dir, resolve_labeled_dir,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -313,18 +320,6 @@ def load_gml_layers(gml_path, line_layers=None, component_layers=None):
 # 4. INSTANCE DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
-def instance_base_name(ply_path):
-    """
-    Derive the base name used for a PLY's instance directory.
-
-    Strips a redundant leading ``Area_N_`` prefix from the PLY stem, since the
-    instance directory already lives inside the ``Water_Area_N`` folder (e.g.
-    ``Area_5_Site_11`` -> ``Site_11``). PLY stems without that prefix are
-    returned unchanged.
-    """
-    return re.sub(r"^Area_\d+_", "", Path(ply_path).stem)
-
-
 def discover_instances(ply_path):
     """
     Auto-discover the permanent instance directory for a PLY file.
@@ -349,45 +344,20 @@ def discover_instances(ply_path):
     parent = ply_path.parent
 
     # New convention: permanent <base>_Instances/ directory
-    perm_dir = parent / f"{base}_Instances"
+    perm_dir = instance_dir_for(ply_path)
     if perm_dir.is_dir():
-        # Find the most recent timestamp subfolder with raw instance PLYs
-        ts_dirs = sorted(
-            [d for d in perm_dir.iterdir()
-             if d.is_dir() and d.name[0].isdigit()],
-            key=lambda p: p.name,
-            reverse=True,
-        )
-        inst_files = []
-        src_label = "none"
-        for ts_dir in ts_dirs:
-            files = sorted(ts_dir.glob("*.ply"))
-            if files:
-                inst_files = files
-                src_label = ts_dir.name
-                break
+        # Newest segment run holding instances; empty run folders are skipped.
+        segment, _empty = resolve_segment_dir(perm_dir)
+        inst_files = segment.ply_files if segment else []
+        src_label = segment.path.name if segment else "none"
 
-        # Fall back to most recent labeled_* subfolder
+        # Fall back to the labelled session that core/site_status.py deems
+        # authoritative (newest non-empty, legacy labeled/ last).
         if not inst_files:
-            labeled_dirs = sorted(
-                [d for d in perm_dir.iterdir()
-                 if d.is_dir() and d.name.startswith("labeled_")],
-                key=lambda p: p.name,
-                reverse=True,
-            )
-            for ld in labeled_dirs:
-                files = sorted(ld.glob("*.ply"))
-                if files:
-                    inst_files = files
-                    src_label = ld.name
-                    break
-
-        # Legacy fall back to labeled/ (no timestamp)
-        if not inst_files:
-            labeled_dir = perm_dir / "labeled"
-            if labeled_dir.is_dir():
-                inst_files = sorted(labeled_dir.glob("*.ply"))
-                src_label = "labeled/"
+            labeled, _empty_lbl, _superseded = resolve_labeled_dir(perm_dir)
+            if labeled:
+                inst_files = labeled.ply_files
+                src_label = labeled.path.name
 
         print(f"\n  Instance directory: {perm_dir.name}/")
         print(f"  {len(inst_files)} PLY files ({src_label})")
@@ -764,10 +734,7 @@ def pick_trench_vertices(pc: PointCloudData) -> np.ndarray:
 # the user only picks once per site. Delete the JSON or pass ``repick=True`` to
 # pick again. Shared by every viewer that needs these picks.
 
-def _site_sidecar(ply_path, suffix):
-    """Path of the cache file ``<stem>_<suffix>.json`` next to the PLY."""
-    p = Path(ply_path)
-    return p.parent / f"{p.stem}_{suffix}.json"
+_site_sidecar = site_sidecar   # naming lives in core/site_status.py
 
 
 def load_or_pick_ground_level(pc: "PointCloudData", ply_path, repick=False) -> float:

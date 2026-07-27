@@ -53,6 +53,7 @@ from core.data_loader import (
     instance_base_name,
     feature_accuracy_tolerance, accuracy_class_coverage,
 )
+from core.site_status import instance_dir_for, resolve_labeled_dir
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
     batch_point_to_plane_segment_components,
@@ -596,31 +597,21 @@ _ply_stem = _ply_path.stem
 _inst_base = instance_base_name(_ply_path)
 
 # New convention: permanent <base>_Instances/ directory
-_perm_dir = _ply_path.parent / f"{_inst_base}_Instances"
+_perm_dir = instance_dir_for(_ply_path)
 _inst_dir = None
 _inst_files = []
 _src_label = "none"
 
 if _perm_dir.is_dir():
     _inst_dir = _perm_dir
-    # Find the most recent labeled_* subfolder
-    _labeled_dirs = sorted(
-        [d for d in _perm_dir.iterdir()
-         if d.is_dir() and d.name.startswith("labeled_")],
-        key=lambda p: p.name, reverse=True,
-    )
-    for _ld in _labeled_dirs:
-        _files = sorted(_ld.glob("*.ply"))
-        if _files:
-            _inst_files = _files
-            _src_label = _ld.name
-            break
-    # Legacy fallback: labeled/ (no timestamp)
-    if not _inst_files:
-        _legacy_labeled = _perm_dir / "labeled"
-        if _legacy_labeled.is_dir():
-            _inst_files = sorted(_legacy_labeled.glob("*.ply"))
-            _src_label = "labeled/"
+    # Which labelled session counts is decided by core/site_status.py, so this
+    # reads the same folder the label viewer writes and the status tool reports.
+    _labeled, _empty_labeled, _superseded_labeled = resolve_labeled_dir(_perm_dir)
+    if _labeled:
+        _inst_files = list(_labeled.ply_files)
+        _src_label = _labeled.path.name
+        for _sd in _superseded_labeled:
+            print(f"  [note] ignoring superseded label session {_sd.path.name}/")
     # Always include top-level PLY files (e.g. water instance 0_instance_0_type_7.ply)
     _top_level_plys = sorted(_perm_dir.glob("*.ply"))
     if _top_level_plys:

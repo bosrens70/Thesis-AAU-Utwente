@@ -54,6 +54,9 @@ from core.config import (
 from core.data_loader import (
     init_site, discover_instances, load_or_pick_ground_level, load_trench,
 )
+from core.site_status import (
+    LABELED_PREFIX, LABELED_FNAME_RE, resolve_labeled_dir, format_label_summary,
+)
 from core.gui_helpers import (
     make_legend_row, make_master_pipe_toggle, make_master_comp_toggle,
     LerLegendSection,
@@ -996,20 +999,24 @@ if instance_data:
 
 # Labelled output: resume the most recent labelled session when one exists, so
 # labels and LER matches carry across sessions and a matching-only pass can
-# attach to labels saved earlier. A fresh timestamped folder is created only
-# when the site has no labelled session yet.
+# attach to labels saved earlier. Which session that is, is decided by
+# core/site_status.py so the status tool agrees. A fresh timestamped folder is
+# named only when the site has no labelled session yet, and is not created on
+# disk until the first save (see _ensure_output_dir).
 _labeled_output_dir = None
 if instance_data:
-    _prev_labeled = sorted(
-        [d for d in _instance_dir.iterdir()
-         if d.is_dir() and d.name.startswith("labeled_") and any(d.glob("*.ply"))],
-        key=lambda p: p.name, reverse=True)
+    _prev_labeled, _empty_labeled, _superseded_labeled = resolve_labeled_dir(_instance_dir)
     if _prev_labeled:
-        _labeled_output_dir = _prev_labeled[0]
+        _labeled_output_dir = _prev_labeled.path
     else:
         _label_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _labeled_output_dir = _instance_dir / f"labeled_{_label_stamp}"
-        _labeled_output_dir.mkdir(parents=True)
+        _labeled_output_dir = _instance_dir / f"{LABELED_PREFIX}{_label_stamp}"
+    for _sd in _superseded_labeled:
+        print(f"  [note] superseded label session kept: {_sd.path.name}/ "
+              f"({_sd.n_ply} PLYs)")
+    if _empty_labeled:
+        print(f"  [note] {len(_empty_labeled)} empty labeled_* folder(s) ignored; "
+              f"remove them with: python tools/pipeline_status.py --prune-empty")
 
 
 _LABEL_TO_ID = {name: i + 1 for i, name in enumerate(INSTANCE_LABEL_OPTIONS)}
@@ -1023,13 +1030,11 @@ _LER_LAYER_TO_LABEL = {
     for layer in _cfg["layers"]
 }
 
-_INSTANCE_FNAME_RE = re.compile(rf"^{TARGET_CLASS}_instance_(\d+)_type_(\d+)\.ply$")
-
 # Prefill labels and LER matches from the resumed session, and start at the
 # first instance that still has no label.
 if _labeled_output_dir and _labeled_output_dir.exists():
     for _f in sorted(_labeled_output_dir.glob("*.ply")):
-        _fm = _INSTANCE_FNAME_RE.match(_f.name)
+        _fm = LABELED_FNAME_RE.match(_f.name)
         if not _fm:
             continue
         _pidx, _plid = int(_fm.group(1)), int(_fm.group(2))
@@ -1040,7 +1045,7 @@ if _labeled_output_dir and _labeled_output_dir.exists():
         try:
             with open(str(_matches_path), encoding="utf-8") as _fh:
                 for _fname, _pmatch in json.load(_fh).items():
-                    _fm = _INSTANCE_FNAME_RE.match(_fname)
+                    _fm = LABELED_FNAME_RE.match(_fname)
                     if _fm and int(_fm.group(1)) < len(instance_data):
                         _instance_ler_match[int(_fm.group(1))] = _pmatch
         except (json.JSONDecodeError, OSError) as _e:
@@ -1054,12 +1059,46 @@ if _labeled_output_dir and _labeled_output_dir.exists():
             _current_inst_idx[0] = _first_unlabeled
 
 
+def _ensure_output_dir():
+    """Create the labelled output folder on the first write.
+
+    Deferred on purpose: the folder used to be created at startup, so opening
+    the viewer (or just closing the ground-level picker) and quitting without
+    labelling anything left an empty labeled_* folder behind. Several sites
+    accumulated a stack of those.
+    """
+    if _labeled_output_dir and not _labeled_output_dir.is_dir():
+        _labeled_output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  [new] label session {_labeled_output_dir.name}/")
+    return _labeled_output_dir
+
+
+def _label_status_text():
+    """Live '4/4 labelled, 3 matched' counter, formatted by core/site_status.py
+    so it reads the same as the pipeline_status table."""
+    n_total = len(instance_data)
+    n_labeled = len([i for i in _instance_labels if i < n_total])
+    n_matched = sum(1 for i, m in _instance_ler_match.items()
+                    if i < n_total and m.get("gml_id"))
+    n_no_ler = sum(1 for i, m in _instance_ler_match.items()
+                   if i < n_total and m.get("no_ler"))
+    return format_label_summary(n_labeled, n_total, n_matched, n_no_ler)
+
+
+def _refresh_window_title():
+    """Keep the progress for this site visible in the title bar, so the state
+    is readable without scrolling the panel or the console."""
+    window.title = (f"{_ply_path.stem}  |  {_label_status_text()}  |  "
+                    f"press H for help")
+
+
 def _write_ler_matches_json():
     """Persist idx -> {layer, gml_id} for every labelled instance that has an
     exclusive LER link, keyed by the saved PLY filename. Rewritten in full each
     time so relabelling (which changes the filename) never leaves a stale key."""
     if not _labeled_output_dir:
         return
+    _refresh_window_title()
     out = {}
     for idx, match in _instance_ler_match.items():
         if idx not in _instance_labels:
@@ -1069,7 +1108,7 @@ def _write_ler_matches_json():
         out[fname] = match
     if not out:
         return
-    out_path = _labeled_output_dir / "ler_matches.json"
+    out_path = _ensure_output_dir() / "ler_matches.json"
     with open(str(out_path), "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
 
@@ -1088,7 +1127,7 @@ def _save_instance_ply(idx, label_name):
     label_id = _LABEL_TO_ID.get(label_name, 0)
 
     fname = f"{TARGET_CLASS}_instance_{idx}_type_{label_id}.ply"
-    out_path = _labeled_output_dir / fname
+    out_path = _ensure_output_dir() / fname
 
     with open(str(out_path), "w", encoding="utf-8") as f:
         f.write("ply\n")
@@ -1119,6 +1158,7 @@ def _save_instance_ply(idx, label_name):
 
     print(f"  [saved] {out_path}  (utility_type={label_id}: {label_name})")
     _write_ler_matches_json()
+    _refresh_window_title()
 
 
 def _check_all_labeled():
@@ -1666,6 +1706,7 @@ if instance_data:
         _apply_instance_color(_lidx)
     _show_instance(_current_inst_idx[0])
     _check_all_labeled()
+_refresh_window_title()
 
 app.run()
 print("Viewer closed.")
