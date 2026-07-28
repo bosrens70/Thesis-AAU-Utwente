@@ -35,7 +35,8 @@ from core.config import (
     MIN_INSTANCE_POINTS,
 )
 from core.site_status import instance_dir_for
-from core.rendering import point_material_shaded, setup_scene_lighting
+from core.rendering import (point_material_shaded, point_material_flat,
+                            setup_scene_lighting)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. LOAD PLY (lightweight — no GML, no area offset needed)
@@ -234,8 +235,12 @@ class InstanceViewer:
         setup_scene_lighting(self.scene.scene)
 
         self._mat = point_material_shaded(POINT_SIZE)
+        # The backdrop keeps its raw scanner RGB, which is measured colour, so
+        # it is drawn unlit and flat the way CloudCompare shows it rather than
+        # being lit like the cluster colours.
+        self._mat_bg = point_material_flat(POINT_SIZE)
 
-        self.scene.scene.add_geometry("bg",        pcd_bg,        self._mat)
+        self.scene.scene.add_geometry("bg",        pcd_bg,        self._mat_bg)
         self.scene.scene.add_geometry("instances", pcd_instances, self._mat)
         bounds = pcd_instances.get_axis_aligned_bounding_box()
         self.scene.setup_camera(60.0, bounds, bounds.get_center())
