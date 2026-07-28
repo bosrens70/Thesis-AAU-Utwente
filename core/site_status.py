@@ -61,6 +61,28 @@ LABELED_FNAME_RE = re.compile(rf"^{TARGET_CLASS}_instance_(\d+)_type_(\d+)\.ply$
 # tools/convert_main_utility_to_water_instance.py drops in the directory root.
 ANY_LABELED_FNAME_RE = re.compile(r"^(\d+)_instance_(\d+)_type_(\d+)\.ply$")
 
+
+def root_class_instances(instance_dir):
+    """Instance PLYs sitting loose in the root of ``<base>_Instances/``.
+
+    These come from tools/convert_main_utility_to_water_instance.py, which turns
+    the semantic classes that are not clustered by segment_module (class 0 "Main
+    Utility" and class 3 "Inactive Utility") into ready-made instances. Their
+    class prefix is therefore never TARGET_CLASS, which is what separates them
+    from anything a segment or label session writes.
+
+    Several files per class are allowed (``0_instance_0_...``,
+    ``0_instance_1_...``): the cluster id in the name is what identifies them, so
+    a class blob split by hand into separate pipes yields separate instances,
+    each able to carry its own LER match.
+    """
+    if not instance_dir or not Path(instance_dir).is_dir():
+        return []
+    return [
+        f for f in sorted(Path(instance_dir).glob("*.ply"))
+        if (m := ANY_LABELED_FNAME_RE.match(f.name)) and int(m.group(1)) != TARGET_CLASS
+    ]
+
 _STAMP_RE = re.compile(r"^\d{8}_\d{6}$")
 
 
@@ -423,10 +445,7 @@ def site_status(ply_path):
         return st
     st.instance_dir = inst_dir
 
-    st.water_instances = [
-        f for f in sorted(inst_dir.glob("*.ply"))
-        if (m := ANY_LABELED_FNAME_RE.match(f.name)) and int(m.group(1)) != TARGET_CLASS
-    ]
+    st.water_instances = root_class_instances(inst_dir)
 
     st.segment, st.empty_segment_dirs = resolve_segment_dir(inst_dir)
     st.labeled, st.empty_labeled_dirs, st.superseded_labeled_dirs = \
@@ -434,22 +453,39 @@ def site_status(ply_path):
 
     # Instance count comes from the segment run. A site whose raw run was
     # deleted but whose labels survive still has a countable instance set.
+    n_segmented = 0
     if st.segment:
-        st.n_instances = len(ordered_instance_files(st.segment.ply_files))
+        n_segmented = len(ordered_instance_files(st.segment.ply_files))
     elif st.labeled:
-        st.n_instances = len(ordered_instance_files(st.labeled.ply_files))
+        n_segmented = len(ordered_instance_files(st.labeled.ply_files))
+    # The root class instances are labellable and matchable too, so they count
+    # here as label_module counts them; otherwise this table would report fewer
+    # instances than the viewer's own "n/n labelled" counter.
+    st.n_instances = n_segmented + len(st.water_instances)
 
     if st.labeled:
         st.labeled_indices = read_labeled_indices(st.labeled.path)
-        matches = read_ler_matches(st.labeled.path)
         st.has_matches_file = (st.labeled.path / MATCHES_FILENAME).is_file()
-        for entry in matches.values():
+
+    # A root class instance carries its type in its own filename and is never
+    # unlabelled. label_module appends them after the segmented instances, in
+    # this same order, so these indices are the ones it uses.
+    for _k, _f in enumerate(st.water_instances):
+        _m = ANY_LABELED_FNAME_RE.match(_f.name)
+        st.labeled_indices[n_segmented + _k] = int(_m.group(3))
+
+    # Matches live next to the PLYs they describe, so the root class instances
+    # keep their own file alongside the labelled session's.
+    for _dir in ([st.labeled.path] if st.labeled else []) + [inst_dir]:
+        for entry in read_ler_matches(_dir).values():
             if not isinstance(entry, dict):
                 continue
             if entry.get("no_ler"):
                 st.n_no_ler += 1
             elif entry.get("gml_id"):
                 st.n_matched += 1
+    if st.water_instances and (inst_dir / MATCHES_FILENAME).is_file():
+        st.has_matches_file = True
 
     st.issues = _collect_issues(st)
     return st

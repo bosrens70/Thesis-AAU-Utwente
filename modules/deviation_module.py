@@ -5,7 +5,8 @@ Geometric Deviation Viewer — Instances vs LER Utility Registry
 Refactored to use core/ for shared configuration and data loading.
 
 If label_module.py recorded an exclusive LER match for an instance
-(ler_matches.json next to its labelled PLYs, keyed by gml_id), that instance
+(ler_matches.json next to its labelled PLYs, naming a whole utility line by the
+gml_ids of every feature on it), that instance
 is measured against only its linked LER feature, in both directions: the
 instance's own deviation stats/colouring, and that feature's discretized
 LER-surface deviation clouds. Instances without a recorded match keep the
@@ -624,8 +625,14 @@ if _perm_dir.is_dir():
         _src_label = _labeled.path.name
         for _sd in _superseded_labeled:
             print(f"  [note] ignoring superseded label session {_sd.path.name}/")
-    # Always include top-level PLY files (e.g. water instance 0_instance_0_type_7.ply)
-    _top_level_plys = sorted(_perm_dir.glob("*.ply"))
+    # Always include top-level PLY files (e.g. water instance 0_instance_0_type_7.ply).
+    # A root file shadowed by a same-named file in the label session is dropped:
+    # label_module writes the per-class instances back to the root rather than
+    # copying them, but an older session may still hold a copy, and loading both
+    # would count the same points twice.
+    _labeled_names = {p.name for p in _inst_files}
+    _top_level_plys = [p for p in sorted(_perm_dir.glob("*.ply"))
+                       if p.name not in _labeled_names]
     if _top_level_plys:
         _inst_files = _top_level_plys + _inst_files
     # Fallback: top-level only when no labeled instances exist
@@ -695,8 +702,15 @@ for inst_path in _inst_files:
     ut_label = UTILITY_TYPE_LABELS.get(utility_type, f"Unknown({utility_type})")
 
     ler_match = _ler_matches.get(inst_path.name)
-    match_gml_id = ler_match.get("gml_id") if ler_match else None
     confirmed_no_ler = bool(ler_match and ler_match.get("no_ler"))
+    # An exclusive link names a whole utility line: the registry routinely
+    # splits one physical run into several features, and label_module records
+    # every gml_id on it. "gml_ids" is the current form; a record written before
+    # utility lines existed carries only the single "gml_id".
+    match_gml_ids = []
+    if ler_match and not confirmed_no_ler:
+        match_gml_ids = [g for g in (ler_match.get("gml_ids")
+                                     or [ler_match.get("gml_id")]) if g]
 
     # Compute distances: all matching segments (active + inactive combined for
     # heatmap).
@@ -705,8 +719,8 @@ for inst_path in _inst_files:
     #     it (has_ler stays False) rather than falling back to the nearest
     #     same-type feature, which could be an unrelated, already-registered
     #     utility that merely happens to sit nearby.
-    #   - match_gml_id: an exclusive match restricts this to the one linked
-    #     feature (identified by gml_id, covering all of its clipped
+    #   - match_gml_ids: an exclusive match restricts this to the linked utility
+    #     line (every feature on it, covering all of their clipped
     #     sub-segments) instead of every segment whose layer matches the
     #     instance's utility type.
     #   - otherwise: the original nearest-of-type behaviour.
@@ -714,8 +728,8 @@ for inst_path in _inst_files:
         seg_mask_all = np.zeros(len(seg_p1), dtype=bool)
         seg_mask_act = seg_mask_all
         seg_mask_inact = seg_mask_all
-    elif match_gml_id:
-        seg_mask_all = (seg_gml_id == match_gml_id)
+    elif match_gml_ids:
+        seg_mask_all = np.isin(seg_gml_id, match_gml_ids)
         seg_mask_act = seg_mask_all & seg_active
         seg_mask_inact = seg_mask_all & ~seg_active
     else:
@@ -841,8 +855,10 @@ for inst_path in _inst_files:
     _ti1 = time.perf_counter()
     if confirmed_no_ler:
         match_tag = "  [confirmed: not in LER]"
-    elif match_gml_id:
-        match_tag = f"  [exclusive match: {ler_match['layer']}]"
+    elif match_gml_ids:
+        _extent = (f", line of {len(match_gml_ids)} features"
+                   if len(match_gml_ids) > 1 else "")
+        match_tag = f"  [exclusive match: {ler_match['layer']}{_extent}]"
     else:
         match_tag = ""
     if has_ler:
@@ -1015,17 +1031,23 @@ LER_LENGTH_STEP = 0.02    # m — sample spacing along each segment
 LER_SURFACE_STEP = 0.02   # m — surface sample spacing (ribbon width / tube ring)
 
 # Instances with an exclusive LER match (see label_module.py) contribute only
-# to their linked feature's own reference set, keyed by gml_id, so that
-# feature's discretized deviation is measured against just that one instance.
+# to their linked line's own reference set, keyed by gml_id, so those features'
+# discretized deviation is measured against just that one instance. Every
+# feature on the linked line gets the same reference points, so a run split
+# across several features is measured consistently along its whole length.
 _matched_feature_pts = {}
 for _instances in class_instances.values():
     for _inst in _instances:
         _mi = _inst.get("ler_match")
-        if not _mi or not _mi.get("gml_id"):
+        if not _mi or _mi.get("no_ler"):
+            continue
+        _gids = [g for g in (_mi.get("gml_ids") or [_mi.get("gml_id")]) if g]
+        if not _gids:
             continue
         _pts_full = np.asarray(_inst["pcd_dev"].points)
         if len(_pts_full):
-            _matched_feature_pts.setdefault(_mi["gml_id"], []).append(_pts_full)
+            for _gid in _gids:
+                _matched_feature_pts.setdefault(_gid, []).append(_pts_full)
 _matched_feature_pts = {gid: np.concatenate(v) for gid, v in _matched_feature_pts.items()}
 
 # Instance points each layer is compared against: the union over all utility

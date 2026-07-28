@@ -172,6 +172,45 @@ def build_feature_index(seg_p1, seg_p2, seg_layer, seg_gml_id, seg_attrs):
     return index
 
 
+def merge_index_by_line(feature_index, line_of):
+    """Collapse a per-feature index into a per-utility-line one.
+
+    ``line_of`` maps gml_id -> line_id (see core/ler_lines.py). Records of the
+    features on one line are concatenated and their centroid and principal
+    direction recomputed over the whole run, so a candidate is scored on the
+    utility's real extent rather than on whichever fragment it was registered
+    in. Keys of the returned index are line_ids, and each record additionally
+    carries ``gml_ids``, the features it covers.
+
+    Diameter and colour are taken from the first member that has one: they
+    describe the physical utility, so any member that records them speaks for
+    the line.
+    """
+    groups = {}
+    for gid, rec in feature_index.items():
+        groups.setdefault(line_of.get(gid, gid), []).append((gid, rec))
+
+    merged = {}
+    for line_id, members in groups.items():
+        members.sort(key=lambda gr: gr[0])
+        p1s = np.vstack([r["p1"] for _g, r in members])
+        p2s = np.vstack([r["p2"] for _g, r in members])
+        pts = np.vstack([p1s, p2s])
+        merged[line_id] = {
+            "layer": members[0][1]["layer"],
+            "gml_ids": [g for g, _r in members],
+            "p1": p1s,
+            "p2": p2s,
+            "centroid": pts.mean(axis=0),
+            "direction": _principal_direction(pts),
+            "diameter_m": next((r["diameter_m"] for _g, r in members
+                                if r["diameter_m"] is not None), None),
+            "color_rgb": next((r["color_rgb"] for _g, r in members
+                               if r["color_rgb"] is not None), None),
+        }
+    return merged
+
+
 def score_candidates(inst_pts, inst_colors, feature_index, allowed_layers=None,
                      max_dist=8.0, top_k=5, weights=None, max_query_pts=300,
                      rng_seed=0):
@@ -218,7 +257,13 @@ def score_candidates(inst_pts, inst_colors, feature_index, allowed_layers=None,
     for gid, feat in feature_index.items():
         if allowed_layers is not None and feat["layer"] not in allowed_layers:
             continue
-        if np.linalg.norm(feat["centroid"] - inst_centroid) > max_dist:
+        # Proximity pre-filter. A long feature, or a whole utility line merged
+        # from several, can have its centroid far away while still running
+        # straight through the instance, so being near any of its segments
+        # counts as well as being near its centroid.
+        mids = (feat["p1"] + feat["p2"]) / 2.0
+        if (np.linalg.norm(feat["centroid"] - inst_centroid) > max_dist
+                and np.min(np.linalg.norm(mids - inst_centroid, axis=1)) > max_dist):
             continue
 
         dists = _point_to_segments_min_dist(query_pts, feat["p1"], feat["p2"])
@@ -244,10 +289,12 @@ def score_candidates(inst_pts, inst_colors, feature_index, allowed_layers=None,
         wsum = sum(used_weights.values())
         score = sum(parts[k] * used_weights[k] for k in parts) / wsum if wsum > 0 else 0.0
 
-        rep_i = int(np.argmin(np.linalg.norm(
-            (feat["p1"] + feat["p2"]) / 2.0 - inst_centroid, axis=1)))
+        rep_i = int(np.argmin(np.linalg.norm(mids - inst_centroid, axis=1)))
         results.append({
             "gml_id": gid,
+            # Every feature this candidate covers. One entry for a plain
+            # feature index, the whole run for a line-merged one.
+            "gml_ids": list(feat.get("gml_ids", [gid])),
             "layer": feat["layer"],
             "score": score,
             "breakdown": parts,

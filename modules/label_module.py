@@ -5,16 +5,32 @@ Single Point Cloud Viewer with Instance Labels + Surrounding Utilities
 Refactored to use core/ for shared configuration and data loading.
 
 Besides assigning a utility-type label to an instance, an instance can also
-be linked to one specific LER line feature: left-click a utility line while
-that instance is active to record the match (layer + gml_id), or use
-"Suggest LER match" to have the closest/best-aligned nearby feature proposed
-automatically (ranked by proximity, direction, diameter and colour
-similarity — see core/ler_matching.py) and accept or cycle through it.
+be linked to one specific LER utility line: left-click a utility line while
+that instance is active to record the match, or use "Suggest LER match" to
+have the closest/best-aligned nearby line proposed automatically (ranked by
+proximity, direction, diameter and colour similarity — see
+core/ler_matching.py) and accept or cycle through it.
+
+A link covers the whole line, not the clicked fragment. The registry splits
+one physical utility into several features, so core/ler_lines.py groups the
+features that continue into each other and the match records every gml_id on
+the run. Lines that merely run alongside each other stay separate. Shift-click
+adds or removes a single feature when that grouping needs correcting.
 "Mark as NOT in LER" records that an instance has no registry counterpart at
 all. Matches are saved to ler_matches.json next to the labelled PLYs;
 deviation_module.py reads it and, when a match exists, measures that
 instance against only its linked LER feature instead of every nearby feature
 of the same utility type.
+
+Two kinds of instance are listed. The clustered ones come from segment_module
+(class 1, "Other Utility"). After them come the per-class instances written by
+tools/convert_main_utility_to_water_instance.py for the classes segment_module
+does not cluster: class 0 "Main Utility" and class 3 "Inactive Utility". Those
+arrive already labelled, since their utility type is in their own filename, but
+without a match they too fall back to being measured against every feature of
+their type, so they are listed here to be linked to one specific LER feature.
+They keep their file in the root instance directory and record their matches
+there, rather than being copied into a label session.
 
 Usage: python modules/label_module.py
   Change the site in core/site_local.py.
@@ -53,16 +69,20 @@ from core.config import (
 )
 from core.data_loader import (
     init_site, discover_instances, load_or_pick_ground_level, load_trench,
+    utility_type_from_filename,
 )
 from core.site_status import (
-    LABELED_PREFIX, LABELED_FNAME_RE, resolve_labeled_dir, format_label_summary,
+    LABELED_PREFIX, LABELED_FNAME_RE, ANY_LABELED_FNAME_RE, MATCHES_FILENAME,
+    resolve_labeled_dir, format_label_summary,
 )
 from core.gui_helpers import (
     make_legend_row, make_master_pipe_toggle, make_master_comp_toggle,
     LerLegendSection,
     pivot_top_down, top_view, trench_or_scene_frame,
 )
-from core.ler_matching import build_feature_index, score_candidates
+from core.ler_matching import (build_feature_index, score_candidates,
+                               merge_index_by_line)
+from core.ler_lines import group_features_into_lines, line_members
 from core.geometry import (
     segment_to_cylinder, segment_to_plane, point_to_segment_dists,
     linear_to_srgb,
@@ -78,7 +98,7 @@ from core.trace_render import (
     build_trace_centerlines, add_trace_centerlines, set_layer_material,
 )
 from core.rendering import (
-    point_material_shaded, point_material_flat, mesh_material, line_material,
+    point_material_flat, mesh_material, line_material,
     flat_material, setup_scene_lighting,
 )
 
@@ -149,34 +169,74 @@ INSTANCE_COLORS = [
 
 _instance_dir = Path(INSTANCE_DIR)
 _instance_files = site.instance_files if site.instance_files else []
+_class_instance_files = site.class_instance_files if site.class_instance_files else []
+
+
+def _read_instance(inst_path, src_class, cluster_id):
+    """One instance_data entry, or None when the PLY holds no points.
+
+    ``src_class`` and ``cluster_id`` record where the instance came from and so
+    what it is saved as (see _instance_fname). A clustered instance passes
+    cluster_id=None, because its id is its position in the size sort below and
+    that is only known once every instance has been read.
+    """
+    pcd = o3d.io.read_point_cloud(str(inst_path))
+    n_pts = len(np.asarray(pcd.points))
+    if n_pts == 0:
+        return None
+    return {
+        "name": inst_path.stem,
+        "path": inst_path,
+        "pcd": pcd,
+        "obb": pcd.get_oriented_bounding_box(),
+        "color": INSTANCE_COLORS[0],
+        "n_pts": n_pts,
+        "src_class": src_class,
+        "cluster_id": cluster_id,
+    }
+
 
 instance_data = []
-for _i, _inst_path in enumerate(_instance_files):
-    _inst_pcd = o3d.io.read_point_cloud(str(_inst_path))
-    _inst_pts = np.asarray(_inst_pcd.points)
-    if len(_inst_pts) == 0:
-        continue
-    _obb = _inst_pcd.get_oriented_bounding_box()
-    _col = INSTANCE_COLORS[_i % len(INSTANCE_COLORS)]
-    _obb.color = _col
-    instance_data.append({
-        "name": _inst_path.stem,
-        "path": _inst_path,
-        "pcd": _inst_pcd,
-        "obb": _obb,
-        "color": _col,
-        "n_pts": len(_inst_pts),
-    })
+for _inst_path in _instance_files:
+    _entry = _read_instance(_inst_path, TARGET_CLASS, None)
+    if _entry:
+        instance_data.append(_entry)
 
+# Largest first. A clustered instance's position in this order is the index
+# baked into its saved filename, so the order is a persistence key, not a
+# display preference.
 instance_data.sort(key=lambda d: d["n_pts"], reverse=True)
+for _i, _d in enumerate(instance_data):
+    _d["cluster_id"] = _i
+
+# The loose per-class instances (class 0 "Main Utility", class 3 "Inactive
+# Utility", written by tools/convert_main_utility_to_water_instance.py) are
+# appended after that sort and never mixed into it: inserting anything ahead of
+# a clustered instance would shift its index and silently re-map every label
+# already saved for this site. They keep the class and cluster id from their own
+# filename, so a class blob split by hand into several files becomes several
+# instances, each able to carry its own LER match.
+for _inst_path in _class_instance_files:
+    _m = ANY_LABELED_FNAME_RE.match(_inst_path.name)
+    _entry = _read_instance(_inst_path, int(_m.group(1)), int(_m.group(2)))
+    if _entry:
+        instance_data.append(_entry)
+
 for _i, _d in enumerate(instance_data):
     _d["color"] = INSTANCE_COLORS[_i % len(INSTANCE_COLORS)]
     _d["obb"].color = _d["color"]
 
+# (src_class, cluster_id) -> index, for resolving a saved filename back to the
+# instance it describes. The utility type in the name is deliberately not part
+# of the key: relabelling changes it, and a recorded match must survive that.
+_IDX_BY_SRC = {(_d["src_class"], _d["cluster_id"]): _i
+               for _i, _d in enumerate(instance_data)}
+
 if instance_data:
     print(f"\n  Loaded {len(instance_data)} instances from {_instance_dir.name}/ (sorted largest first)")
     for _i, _d in enumerate(instance_data):
-        print(f"    [{_i}] {_d['name']}: {_d['n_pts']:,} points")
+        _tag = "" if _d["src_class"] == TARGET_CLASS else f"  [class {_d['src_class']}]"
+        print(f"    [{_i}] {_d['name']}: {_d['n_pts']:,} points{_tag}")
 else:
     print(f"\n  [warn] No instance PLY files found in {INSTANCE_DIR}")
 
@@ -252,6 +312,14 @@ pick_seg_attrs     = []   # list of [(label, value), ...]
 pick_seg_layer     = []   # layer name per segment
 pick_seg_gml_id    = []   # GML gml_id per segment (identifies the whole feature)
 
+# One entry per loaded feature part, (storage_key, gml_id, raw coords, attrs),
+# fed to core/ler_lines.py once every layer is in. The registry splits one
+# physical utility into several features, so this is what lets a match cover the
+# whole run. Deliberately the raw GML coordinates, not the bbox-clipped
+# segments: a clipping artefact at the crop boundary must not be able to
+# fabricate a junction.
+_line_features = []
+
 # Store per-utility-type average depth for component fallback
 _layer_avg_depth_local = {}
 
@@ -299,6 +367,7 @@ for layer_name, cfg in LINE_LAYERS.items():
         is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
         if is_trace and display_fa and display_fa not in _ledningstrace_variants:
             _ledningstrace_variants[display_fa] = color
+        storage_key = get_storage_key(layer_name, display_fa)
 
         bredde_m = get_bredde_width(row)
         if is_trace and bredde_m is None:
@@ -325,6 +394,7 @@ for layer_name, cfg in LINE_LAYERS.items():
             coords_raw = np.array(sub_geom.coords, dtype=float)
             if not _segments_in_bbox(coords_raw):
                 continue
+            _line_features.append((storage_key, gml_id_val, coords_raw, row_attrs))
 
             coords, _seg_srcs = _clean_coords_with_depth(coords_raw, vejl_dybde)
             for _src in _seg_srcs:
@@ -350,7 +420,6 @@ for layer_name, cfg in LINE_LAYERS.items():
                     mesh = segment_to_cylinder(clipped[0] - _dz, clipped[1] - _dz, radius, color)
                 if mesh is not None:
                     all_pipe_meshes.append(mesh)
-                    storage_key = get_storage_key(layer_name, display_fa)
                     _pipe_layer_cyls.setdefault(storage_key, []).append(mesh)
                     # Track color for this storage key
                     if storage_key not in _storage_key_colors:
@@ -385,6 +454,22 @@ pick_seg_midpoints = np.array(pick_seg_midpoints) if pick_seg_midpoints else np.
 # likely instance <-> LER feature match (see "Suggest LER match" below).
 _ler_feature_index = build_feature_index(
     pick_seg_p1, pick_seg_p2, pick_seg_layer, pick_seg_gml_id, pick_seg_attrs)
+
+# Features that form one physical utility, so a match covers the whole run
+# rather than the fragment that happened to be clicked.
+_line_of, _lines = group_features_into_lines(_line_features)
+# The same index, merged per line: "Suggest LER match" proposes whole utility
+# lines, and the score sees the run's full extent and direction.
+_ler_line_index = merge_index_by_line(_ler_feature_index, _line_of)
+_n_multi = sum(1 for ms in _lines.values() if len(ms) > 1)
+if _n_multi:
+    print(f"  {len(_line_of)} features grouped into {len(_lines)} utility lines "
+          f"({_n_multi} spanning more than one feature)")
+
+
+def _line_gml_ids(gml_id):
+    """Every gml_id on the same utility line as this one."""
+    return line_members(_line_of, _lines, gml_id)
 
 print(f"\n  Total: {len(all_pipe_meshes):,} cylinder segments")
 print(f"\n  Depth estimation stats:")
@@ -664,10 +749,10 @@ def make_dotted_bbox_lineset(
 
 
 def make_point_material() -> rendering.MaterialRecord:
-    # Shaded (defaultLit) + estimated normals + SSAO post-processing is the
-    # closest Open3D equivalent to an EDL shader. Points near geometric ridges
-    # end up darker, giving a depth cue for the class-coloured cloud.
-    return point_material_shaded(3.0)
+    # This viewer's scene cloud is always raw scanner RGB, which is measured
+    # colour, so it is drawn unlit and flat the way CloudCompare and other 2D
+    # viewers show it. Lighting it brightened the cloud well past its source.
+    return point_material_flat(3.0)
 
 
 def make_pipe_wire_material() -> rendering.MaterialRecord:
@@ -1057,33 +1142,83 @@ _LER_LAYER_TO_LABEL = {
     for layer in _cfg["layers"]
 }
 
-# Prefill labels and LER matches from the resumed session, and start at the
-# first instance that still has no label.
+
+def _index_for_fname(fname):
+    """Instance index for a saved PLY filename, or None when it names no
+    instance this site still has."""
+    m = ANY_LABELED_FNAME_RE.match(str(fname))
+    if not m:
+        return None
+    return _IDX_BY_SRC.get((int(m.group(1)), int(m.group(2))))
+
+
+def _load_matches_json(match_dir):
+    """Read one ler_matches.json into _instance_ler_match. Returns how many
+    entries were adopted, so the caller can report the resume."""
+    path = Path(match_dir) / MATCHES_FILENAME
+    if not path.is_file():
+        return 0
+    try:
+        with open(str(path), encoding="utf-8") as fh:
+            loaded = json.load(fh)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"  [warn] Could not read {path.name}: {e}")
+        return 0
+    n = 0
+    for fname, match in loaded.items():
+        idx = _index_for_fname(fname)
+        if idx is None:
+            continue
+        # A record written before utility lines existed names a single feature,
+        # which is a fragment of the run it was meant to cover. Expand it to its
+        # line in memory; it is only written back in the new form the next time
+        # something is saved, and "gml_id" is kept, so the change is reversible.
+        if not match.get("no_ler") and not match.get("gml_ids") and match.get("gml_id"):
+            ids = _line_gml_ids(match["gml_id"])
+            match = dict(match, gml_ids=ids,
+                         line_id=_line_of.get(match["gml_id"], match["gml_id"]))
+            if len(ids) > 1:
+                print(f"  [line] {fname}: match expanded from 1 feature to the "
+                      f"{len(ids)}-feature line it belongs to")
+        _instance_ler_match[idx] = match
+        n += 1
+    return n
+
+
+# Prefill labels and LER matches from the resumed session.
 if _labeled_output_dir and _labeled_output_dir.exists():
     for _f in sorted(_labeled_output_dir.glob("*.ply")):
         _fm = LABELED_FNAME_RE.match(_f.name)
         if not _fm:
             continue
-        _pidx, _plid = int(_fm.group(1)), int(_fm.group(2))
-        if _pidx < len(instance_data) and 1 <= _plid <= len(INSTANCE_LABEL_OPTIONS):
+        _pidx, _plid = _index_for_fname(_f.name), int(_fm.group(2))
+        if _pidx is not None and 1 <= _plid <= len(INSTANCE_LABEL_OPTIONS):
             _instance_labels[_pidx] = INSTANCE_LABEL_OPTIONS[_plid - 1]
-    _matches_path = _labeled_output_dir / "ler_matches.json"
-    if _matches_path.exists():
-        try:
-            with open(str(_matches_path), encoding="utf-8") as _fh:
-                for _fname, _pmatch in json.load(_fh).items():
-                    _fm = LABELED_FNAME_RE.match(_fname)
-                    if _fm and int(_fm.group(1)) < len(instance_data):
-                        _instance_ler_match[int(_fm.group(1))] = _pmatch
-        except (json.JSONDecodeError, OSError) as _e:
-            print(f"  [warn] Could not read {_matches_path.name}: {_e}")
+    _n_resumed_matches = _load_matches_json(_labeled_output_dir)
     if _instance_labels or _instance_ler_match:
         print(f"  [resume] {_labeled_output_dir.name}/: {len(_instance_labels)} labels, "
-              f"{len(_instance_ler_match)} LER matches loaded")
-        _first_unlabeled = next(
-            (i for i in range(len(instance_data)) if i not in _instance_labels), None)
-        if _first_unlabeled is not None:
-            _current_inst_idx[0] = _first_unlabeled
+              f"{_n_resumed_matches} LER matches loaded")
+
+# The per-class instances arrive already labelled: their utility type is in
+# their own filename. Their matches live in the root instance directory, next to
+# the PLYs they describe, rather than in a label session they are not part of.
+for _idx, _d in enumerate(instance_data):
+    if _d["src_class"] == TARGET_CLASS:
+        continue
+    _tid = utility_type_from_filename(_d["path"].name)
+    if 1 <= _tid <= len(INSTANCE_LABEL_OPTIONS):
+        _instance_labels[_idx] = INSTANCE_LABEL_OPTIONS[_tid - 1]
+if _class_instance_files:
+    _n_class_matches = _load_matches_json(_instance_dir)
+    if _n_class_matches:
+        print(f"  [resume] {_instance_dir.name}/{MATCHES_FILENAME}: "
+              f"{_n_class_matches} LER match(es) for class instances")
+
+# Start at the first instance that still needs a label.
+_first_unlabeled = next(
+    (i for i in range(len(instance_data)) if i not in _instance_labels), None)
+if _first_unlabeled is not None:
+    _current_inst_idx[0] = _first_unlabeled
 
 
 def _ensure_output_dir():
@@ -1098,6 +1233,32 @@ def _ensure_output_dir():
         _labeled_output_dir.mkdir(parents=True, exist_ok=True)
         print(f"  [new] label session {_labeled_output_dir.name}/")
     return _labeled_output_dir
+
+
+def _is_class_instance(idx):
+    """True for the loose per-class instances, which are not part of a
+    clustered segment run and are saved differently."""
+    return instance_data[idx]["src_class"] != TARGET_CLASS
+
+
+def _instance_fname(idx, label_id):
+    """Filename an instance is saved under, and the key its LER match is
+    recorded against. For a clustered instance the class is TARGET_CLASS and
+    the cluster id is its position in the size sort, which reproduces the
+    original ``1_instance_<idx>_type_<id>.ply`` convention exactly."""
+    d = instance_data[idx]
+    return f"{d['src_class']}_instance_{d['cluster_id']}_type_{label_id}.ply"
+
+
+def _instance_out_dir(idx):
+    """Directory holding an instance's PLY and its ler_matches.json.
+
+    Clustered instances belong to the label session. The per-class ones stay in
+    the root instance directory, where they were created and where
+    deviation_module already reads them, so labelling one never leaves a second
+    copy of the same points for the deviation viewer to count twice.
+    """
+    return _instance_dir if _is_class_instance(idx) else _labeled_output_dir
 
 
 def _label_status_text():
@@ -1121,29 +1282,58 @@ def _refresh_window_title():
 
 def _write_ler_matches_json():
     """Persist idx -> {layer, gml_id} for every labelled instance that has an
-    exclusive LER link, keyed by the saved PLY filename. Rewritten in full each
-    time so relabelling (which changes the filename) never leaves a stale key."""
-    if not _labeled_output_dir:
-        return
+    exclusive LER link, keyed by the saved PLY filename.
+
+    One file per output directory, since a match belongs next to the PLY it
+    describes: the clustered instances write into the label session, the
+    per-class ones into the root instance directory. deviation_module reads
+    every directory its instances come from, so both are picked up. Each file is
+    rewritten in full, so relabelling (which changes the filename) and clearing
+    the last match never leave a stale key behind.
+    """
     _refresh_window_title()
-    out = {}
+    by_dir = {}
     for idx, match in _instance_ler_match.items():
         if idx not in _instance_labels:
             continue
+        out_dir = _instance_out_dir(idx)
+        if not out_dir:
+            continue
         label_id = _LABEL_TO_ID.get(_instance_labels[idx], 0)
-        fname = f"{TARGET_CLASS}_instance_{idx}_type_{label_id}.ply"
-        out[fname] = match
-    if not out:
-        return
-    out_path = _ensure_output_dir() / "ler_matches.json"
-    with open(str(out_path), "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+        by_dir.setdefault(out_dir, {})[_instance_fname(idx, label_id)] = match
+
+    for out_dir in {d for d in map(_instance_out_dir, range(len(instance_data))) if d}:
+        out = by_dir.get(out_dir, {})
+        path = Path(out_dir) / MATCHES_FILENAME
+        if not out and not path.is_file():
+            continue        # nothing to record here, and nothing stale to clear
+        if out and out_dir == _labeled_output_dir:
+            _ensure_output_dir()
+        if not path.parent.is_dir():
+            continue
+        with open(str(path), "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
 
 
 def _save_instance_ply(idx, label_name):
-    if not _labeled_output_dir or idx >= len(instance_data):
+    if idx >= len(instance_data) or not _instance_out_dir(idx):
         return
     inst = instance_data[idx]
+    label_id = _LABEL_TO_ID.get(label_name, 0)
+    fname = _instance_fname(idx, label_id)
+
+    if _is_class_instance(idx):
+        # The root file already holds these points under this type, so there is
+        # nothing to write. Writing a copy into the label session would make
+        # deviation_module load the same cloud twice and count it twice.
+        out_path = Path(_instance_dir) / fname
+        if out_path == inst["path"] and out_path.is_file():
+            _write_ler_matches_json()
+            _refresh_window_title()
+            return
+    else:
+        out_path = _ensure_output_dir() / fname
+
     pcd = inst["pcd"]
     pts = np.asarray(pcd.points)
     has_colors = pcd.has_colors()
@@ -1151,10 +1341,6 @@ def _save_instance_ply(idx, label_name):
     has_normals = pcd.has_normals()
     normals = np.asarray(pcd.normals) if has_normals else None
     n = len(pts)
-    label_id = _LABEL_TO_ID.get(label_name, 0)
-
-    fname = f"{TARGET_CLASS}_instance_{idx}_type_{label_id}.ply"
-    out_path = _ensure_output_dir() / fname
 
     with open(str(out_path), "w", encoding="utf-8") as f:
         f.write("ply\n")
@@ -1182,6 +1368,18 @@ def _save_instance_ply(idx, label_name):
                 parts.extend([f"{normals[i, 0]:.6f}", f"{normals[i, 1]:.6f}", f"{normals[i, 2]:.6f}"])
             parts.append(str(label_id))
             f.write(" ".join(parts) + "\n")
+
+    # A relabelled per-class instance is rewritten under its new type and its
+    # previous file removed, so it keeps exactly one file and the per-point
+    # utility_type inside it (which deviation_module majority-votes) never
+    # disagrees with the type in the name.
+    if _is_class_instance(idx):
+        old_path = inst["path"]
+        if old_path != out_path and old_path.parent == out_path.parent and old_path.is_file():
+            old_path.unlink()
+            print(f"  [replaced] {old_path.name}")
+        inst["path"] = out_path
+        inst["name"] = out_path.stem
 
     print(f"  [saved] {out_path}  (utility_type={label_id}: {label_name})")
     _write_ler_matches_json()
@@ -1264,13 +1462,7 @@ def _show_instance(idx):
     else:
         _inst_assigned_lbl.visible = False
     _refresh_ler_match_label(idx)
-    _m = _instance_ler_match.get(idx)
-    _gid = _m.get("gml_id") if _m else None
-    if _gid and _gid in pick_seg_gml_id:
-        _gi = pick_seg_gml_id.index(_gid)
-        _place_ler_match_highlight(pick_seg_p1[_gi], pick_seg_p2[_gi])
-    else:
-        _clear_ler_match_highlight()
+    _place_ler_match_highlight(_match_gml_ids(_instance_ler_match.get(idx)))
     _suggestion_state["candidates"] = []
     _suggestion_state["idx"] = 0
     _suggest_lbl.text = ""
@@ -1377,19 +1569,58 @@ def _clear_ler_match_highlight():
         pass
 
 
-def _place_ler_match_highlight(p1, p2):
-    _clear_ler_match_highlight()
+def _line_lineset(gml_ids, color):
+    """LineSet over every loaded segment of the given features, or None when
+    none of them is present in this footprint."""
+    wanted = set(gml_ids or [])
+    pts, lines = [], []
+    for _i, _gid in enumerate(pick_seg_gml_id):
+        if _gid not in wanted:
+            continue
+        pts.extend([pick_seg_p1[_i], pick_seg_p2[_i]])
+        lines.append([len(pts) - 2, len(pts) - 1])
+    if not lines:
+        return None
     ls = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(np.array([p1, p2])),
-        lines=o3d.utility.Vector2iVector([[0, 1]]),
+        points=o3d.utility.Vector3dVector(np.array(pts)),
+        lines=o3d.utility.Vector2iVector(lines),
     )
-    ls.paint_uniform_color([1.0, 0.0, 1.0])  # magenta — distinct from any LER layer colour
+    ls.paint_uniform_color(color)
+    return ls
+
+
+def _highlight_material():
     mat = line_material(6.0)
     try:
         mat.depth_func = "always"  # stay visible through occluding pipe meshes
     except AttributeError:
         pass
-    scene_widget.scene.add_geometry(LER_MATCH_HIGHLIGHT_GEOM, ls, mat)
+    return mat
+
+
+def _place_ler_match_highlight(gml_ids):
+    """Outline every segment of the linked utility line.
+
+    A line is usually several GML features, so highlighting only the clicked
+    one made a whole-line link look like a fragment.
+    """
+    _clear_ler_match_highlight()
+    # magenta — distinct from any LER layer colour
+    ls = _line_lineset(gml_ids, [1.0, 0.0, 1.0])
+    if ls is not None:
+        scene_widget.scene.add_geometry(LER_MATCH_HIGHLIGHT_GEOM, ls, _highlight_material())
+
+
+def _match_gml_ids(match):
+    """The features a stored match covers, newest key first so a record written
+    before utility lines existed still resolves."""
+    if not match:
+        return []
+    ids = match.get("gml_ids")
+    if ids:
+        return list(ids)
+    gid = match.get("gml_id")
+    return [gid] if gid else []
 
 
 def _refresh_ler_match_label(idx):
@@ -1398,9 +1629,12 @@ def _refresh_ler_match_label(idx):
         _ler_match_lbl.text = "LER match: confirmed NOT in LER"
         _ler_match_lbl.text_color = gui.Color(1.0, 0.55, 0.15, 1.0)
     elif m:
-        gid = m.get("gml_id", "")
+        ids = _match_gml_ids(m)
+        gid = m.get("line_id") or m.get("gml_id", "")
         gid_short = gid[-28:] if len(gid) > 28 else gid
-        _ler_match_lbl.text = f"LER match: {layer_display_name(m['layer'])}\n({gid_short})"
+        extent = f" (line, {len(ids)} features)" if len(ids) > 1 else ""
+        _ler_match_lbl.text = (f"LER match: {layer_display_name(m['layer'])}{extent}"
+                               f"\n({gid_short})")
         _ler_match_lbl.text_color = gui.Color(0.3, 1.0, 1.0, 1.0)
     else:
         _ler_match_lbl.text = "LER match: none (click a line)"
@@ -1448,19 +1682,14 @@ def _clear_suggestion_highlight():
         pass
 
 
-def _place_suggestion_highlight(p1, p2):
+def _place_suggestion_highlight(gml_ids):
+    """Outline the whole candidate line, so what Accept would record is what is
+    shown."""
     _clear_suggestion_highlight()
-    ls = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(np.array([p1, p2])),
-        lines=o3d.utility.Vector2iVector([[0, 1]]),
-    )
-    ls.paint_uniform_color([1.0, 0.85, 0.0])  # yellow — tentative, vs. magenta for a confirmed match
-    mat = line_material(6.0)
-    try:
-        mat.depth_func = "always"
-    except AttributeError:
-        pass
-    scene_widget.scene.add_geometry(LER_SUGGEST_HIGHLIGHT_GEOM, ls, mat)
+    # yellow — tentative, vs. magenta for a confirmed match
+    ls = _line_lineset(gml_ids, [1.0, 0.85, 0.0])
+    if ls is not None:
+        scene_widget.scene.add_geometry(LER_SUGGEST_HIGHLIGHT_GEOM, ls, _highlight_material())
 
 
 def _show_current_suggestion():
@@ -1473,10 +1702,11 @@ def _show_current_suggestion():
         return
     c = cands[i]
     parts_str = ", ".join(f"{k}={v:.2f}" for k, v in c["breakdown"].items())
-    _suggest_lbl.text = (f"Suggestion {i + 1}/{len(cands)}: {layer_display_name(c['layer'])}\n"
-                        f"score={c['score']:.2f}  ({parts_str})")
+    extent = f", {len(c['gml_ids'])} features" if len(c["gml_ids"]) > 1 else ""
+    _suggest_lbl.text = (f"Suggestion {i + 1}/{len(cands)}: {layer_display_name(c['layer'])}"
+                        f"{extent}\nscore={c['score']:.2f}  ({parts_str})")
     _suggest_lbl.text_color = gui.Color(1.0, 0.85, 0.2, 1.0)
-    _place_suggestion_highlight(*c["rep_segment"])
+    _place_suggestion_highlight(c["gml_ids"])
     window.post_redraw()
 
 
@@ -1495,7 +1725,9 @@ def _suggest_ler_match():
         if match_cfg:
             allowed_layers = match_cfg["layers"]
 
-    candidates = score_candidates(pts, colors, _ler_feature_index, allowed_layers=allowed_layers)
+    # Scored per utility line, not per feature, so a suggestion covers the whole
+    # run instead of whichever fragment happens to sit nearest the instance.
+    candidates = score_candidates(pts, colors, _ler_line_index, allowed_layers=allowed_layers)
     _suggestion_state["candidates"] = candidates
     _suggestion_state["idx"] = 0
     _show_current_suggestion()
@@ -1515,18 +1747,23 @@ def _accept_suggestion():
         return
     c = cands[_suggestion_state["idx"]]
     idx = _current_inst_idx[0]
-    _instance_ler_match[idx] = {"layer": c["layer"], "gml_id": c["gml_id"]}
+    # Candidates come from the line-merged index, so gml_id is the line_id and
+    # gml_ids are the features it covers.
+    _instance_ler_match[idx] = {"layer": c["layer"], "gml_id": c["gml_ids"][0],
+                                "gml_ids": list(c["gml_ids"]), "line_id": c["gml_id"]}
     print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
-          f"-> {c['layer']}  gml_id={c['gml_id']}  (accepted suggestion, score={c['score']:.2f})")
+          f"-> {c['layer']}  line={c['gml_id']} ({len(c['gml_ids'])} feature(s))"
+          f"  (accepted suggestion, score={c['score']:.2f})")
     _maybe_autolabel_from_layer(idx, c["layer"])
     _refresh_ler_match_label(idx)
-    _place_ler_match_highlight(*c["rep_segment"])
+    _place_ler_match_highlight(c["gml_ids"])
     _clear_suggestion_highlight()
     _write_ler_matches_json()
     window.post_redraw()
 
 
 _ler_last_click = [None]
+_ler_last_click_shift = [False]   # shift held: adjust the link, do not replace it
 
 
 def _do_pick_ler(depth_image):
@@ -1562,13 +1799,42 @@ def _do_pick_ler(depth_image):
     idx = _current_inst_idx[0]
     layer_name = pick_seg_layer[best_i]
     gml_id = pick_seg_gml_id[best_i]
-    _instance_ler_match[idx] = {"layer": layer_name, "gml_id": gml_id}
-    print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
-          f"-> {layer_name}  gml_id={gml_id}")
+
+    if _ler_last_click_shift[0]:
+        # Shift-click adjusts the current link one feature at a time, for the
+        # cases the automatic grouping gets wrong: a run the registry leaves a
+        # gap in, or a neighbour it joined that should have stayed separate.
+        prev = _instance_ler_match.get(idx)
+        ids = _match_gml_ids(prev) if prev and not prev.get("no_ler") else []
+        if prev and not prev.get("no_ler") and prev.get("layer") != layer_name:
+            print(f"  [ler-match] ignored: {layer_display_name(layer_name)} is not "
+                  f"the linked layer ({layer_display_name(prev['layer'])})")
+            return
+        if gml_id in ids:
+            ids = [g for g in ids if g != gml_id]
+            action = "removed from"
+        else:
+            ids = ids + [gml_id]
+            action = "added to"
+        if ids:
+            _instance_ler_match[idx] = {"layer": layer_name, "gml_id": ids[0],
+                                        "gml_ids": ids,
+                                        "line_id": (prev or {}).get("line_id") or ids[0]}
+        else:
+            _instance_ler_match.pop(idx, None)
+        print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}): "
+              f"{gml_id} {action} the link ({len(ids)} feature(s))")
+    else:
+        ids = _line_gml_ids(gml_id)
+        _instance_ler_match[idx] = {"layer": layer_name, "gml_id": gml_id,
+                                    "gml_ids": ids, "line_id": _line_of.get(gml_id, gml_id)}
+        print(f"  [ler-match] Instance {idx} ({instance_data[idx]['name']}) "
+              f"-> {layer_name}  line={_line_of.get(gml_id, gml_id)} "
+              f"({len(ids)} feature(s), clicked {gml_id})")
 
     def _update():
         _maybe_autolabel_from_layer(idx, layer_name)
-        _place_ler_match_highlight(pick_seg_p1[best_i], pick_seg_p2[best_i])
+        _place_ler_match_highlight(_match_gml_ids(_instance_ler_match.get(idx)))
         _clear_suggestion_highlight()
         _refresh_ler_match_label(idx)
         _write_ler_matches_json()
@@ -1611,6 +1877,10 @@ def _on_mouse_ler(event):
         click_pos = _ler_mouse_down_pos[0]
         _ler_mouse_down_pos[0] = None
         _ler_last_click[0] = click_pos
+        try:
+            _ler_last_click_shift[0] = event.is_modifier_down(gui.KeyModifier.SHIFT)
+        except AttributeError:
+            _ler_last_click_shift[0] = False
         scene_widget.scene.scene.render_to_depth_image(_do_pick_ler)
         # HANDLED so Open3D does not also pan/translate the view on this click
         return gui.Widget.EventCallbackResult.HANDLED
@@ -1684,7 +1954,9 @@ def on_key(event):
         print("\n-- Shortcuts ---------------------------------------------------")
         print("  1-0            assign label to current instance (1-10)")
         print("  Left-click     link a utility line to the current instance")
-        print("                 (exclusive LER match, see left panel)")
+        print("                 (the whole line, every connected feature on it)")
+        print("  Shift-click    add/remove one feature from the current link,")
+        print("                 when the line grouping needs correcting")
         print("                 or use 'Mark as NOT in LER' if it isn't registered")
         print("                 or try 'Suggest LER match' for a proposed link")
         print("  C              pivot to point cloud centroid")

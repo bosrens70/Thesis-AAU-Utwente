@@ -519,6 +519,21 @@ POINT_SIZE         = 2.0
 MIN_INSTANCE_POINTS = 250
 
 # ─────────────────────────────────────────────────────────────────────────────
+# UTILITY LINE GROUPING (see core/ler_lines.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# One physical utility is often registered as a chain of separate features, so
+# an instance is linked to the whole chain rather than to one gml_id. Features
+# that share a geometry node are one chain, so this distance is the only
+# geometric threshold in the grouping; everything else it demands is an
+# attribute agreement (see core/ler_lines.py).
+
+# Metres. How close two geometry nodes must be to count as the same node. The
+# junctions observed in this data are exact (0.000 m) while the nearest
+# non-junction pair, two cables leaving one cabinet, is 0.200 m apart, so the
+# threshold sits well inside that gap.
+LINE_JOIN_TOL = 0.01
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UTILITY-TO-LER MATCHING (for deviation viewer)
 # ─────────────────────────────────────────────────────────────────────────────
 UTILITY_TO_LER_MATCH = {

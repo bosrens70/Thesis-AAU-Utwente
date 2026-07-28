@@ -29,7 +29,7 @@ from core.config import (
 # because callers have always imported instance_base_name from this module.
 from core.site_status import (
     instance_base_name, instance_dir_for, site_sidecar,
-    resolve_segment_dir, resolve_labeled_dir,
+    resolve_segment_dir, resolve_labeled_dir, root_class_instances,
 )
 
 
@@ -81,6 +81,10 @@ class SiteData:
     gml: GMLData = None
     instance_dir: Path = None
     instance_files: list = field(default_factory=list)
+    # Loose root instances of the classes segment_module does not cluster (see
+    # core.site_status.root_class_instances). Kept separate from instance_files
+    # so the caller decides where they land in its own instance ordering.
+    class_instance_files: list = field(default_factory=list)
     load_time: float = 0.0
 
 
@@ -335,9 +339,13 @@ def discover_instances(ply_path):
             labeled_20260526_150000/      <- label-viewer session (timestamped)
               1_instance_0_type_4.ply
 
-    Returns (instance_dir, instance_files) where instance_dir is the
-    permanent ``Site_XX_Instances/`` folder and instance_files are the
-    raw PLY files from the most recent timestamp subfolder.
+    Returns (instance_dir, instance_files, class_instance_files) where
+    instance_dir is the permanent ``Site_XX_Instances/`` folder,
+    instance_files are the raw PLY files from the most recent timestamp
+    subfolder, and class_instance_files are the loose root instances of the
+    classes segment_module does not cluster (see
+    core.site_status.root_class_instances). The two file lists are disjoint and
+    kept apart so the caller controls how they are ordered together.
     """
     ply_path = Path(ply_path)
     base = instance_base_name(ply_path)
@@ -359,9 +367,13 @@ def discover_instances(ply_path):
                 inst_files = labeled.ply_files
                 src_label = labeled.path.name
 
+        class_files = root_class_instances(perm_dir)
         print(f"\n  Instance directory: {perm_dir.name}/")
         print(f"  {len(inst_files)} PLY files ({src_label})")
-        return perm_dir, inst_files
+        if class_files:
+            print(f"  {len(class_files)} root class instance(s): "
+                  f"{', '.join(f.name for f in class_files)}")
+        return perm_dir, inst_files, class_files
 
     # Legacy fallback: timestamped <base>_instances_<stamp>/ directories
     candidates = sorted(
@@ -372,7 +384,7 @@ def discover_instances(ply_path):
     )
     if not candidates:
         print(f"  [warn] No instance directories found for {base}")
-        return None, []
+        return None, [], []
 
     inst_dir = candidates[0]
 
@@ -384,9 +396,10 @@ def discover_instances(ply_path):
         inst_files = sorted(inst_dir.glob("*.ply"))
         subdir_label = "root"
 
+    # Legacy layout predates the root class instances, so there are none.
     print(f"\n  Instance directory: {inst_dir.name}/")
     print(f"  {len(inst_files)} PLY files ({subdir_label})")
-    return inst_dir, inst_files
+    return inst_dir, inst_files, []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,8 +628,9 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
     # ── 4. Instance discovery ────────────────────────────────────────────
     inst_dir = None
     inst_files = []
+    class_files = []
     if load_instances:
-        inst_dir, inst_files = discover_instances(ply_file)
+        inst_dir, inst_files, class_files = discover_instances(ply_file)
 
     t_end = time.perf_counter()
     print(f"\nAll data loaded in {t_end - t_start:.2f}s")
@@ -624,6 +638,7 @@ def init_site(ply_file=None, geojson_path=None, gml_path=None,
     return SiteData(
         area=area, pc=pc, gml=gml,
         instance_dir=inst_dir, instance_files=inst_files,
+        class_instance_files=class_files,
         load_time=t_end - t_start,
     )
 

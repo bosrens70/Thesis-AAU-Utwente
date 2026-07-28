@@ -44,7 +44,8 @@ from core.geometry import (
 from core.crop import CropRegion
 from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.rendering import (
-    point_material_shaded, mesh_material, line_material, flat_material,
+    point_material_shaded, point_material_flat, mesh_material, line_material,
+    flat_material,
     setup_scene_lighting,
 )
 from core.gui_helpers import (
@@ -558,11 +559,19 @@ def make_mesh_material(alpha: float) -> rendering.MaterialRecord:
     return mesh_material(alpha)
 
 
-def make_point_material() -> rendering.MaterialRecord:
-    # Shaded (defaultLit) + estimated normals + SSAO post-processing is the
-    # closest Open3D equivalent to an EDL shader. Points near geometric ridges
-    # end up darker, giving a depth cue for the class-coloured cloud.
-    return point_material_shaded(3.0)
+def make_point_material(class_colored: bool = False) -> rendering.MaterialRecord:
+    """Material for the scene cloud, chosen by what its colours mean.
+
+    Class colours are categorical, so shaded (defaultLit) + estimated normals +
+    SSAO is the closest Open3D equivalent to an EDL shader: points near
+    geometric ridges end up darker, and colour fidelity does not matter for a
+    label palette. Raw scanner RGB is measured colour, so it is drawn unlit and
+    flat the way CloudCompare and other 2D viewers show it; lighting brightened
+    it well past its source.
+    """
+    if class_colored:
+        return point_material_shaded(3.0)
+    return point_material_flat(3.0)
 
 
 def make_frame_material() -> rendering.MaterialRecord:
@@ -616,7 +625,8 @@ scene_widget.scene.set_background([1.0, 1.0, 1.0, 1.0])
 setup_scene_lighting(scene_widget.scene, post_processing=True)
 
 # Add point cloud
-scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
+scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd,
+                                make_point_material(class_labels_active[0]))
 
 # Add per-layer pipe meshes (filled); a trace's ribbon goes on more transparent
 for _ln, _mesh in _pipe_layer_meshes.items():
@@ -662,9 +672,11 @@ def _toggle_class_labels(show_labels: bool):
         pcd.colors = o3d.utility.Vector3dVector(original_colors)
         print("[class toggle] OFF — showing original RGB colours")
 
-    # Update the point cloud in the scene
+    # Update the point cloud in the scene. The material changes with the mode,
+    # not just the colours: class colours are shaded, raw RGB is flat.
     scene_widget.scene.remove_geometry(POINT_CLOUD_GEOM)
-    scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd, make_point_material())
+    scene_widget.scene.add_geometry(POINT_CLOUD_GEOM, pcd,
+                                    make_point_material(show_labels))
     window.post_redraw()
 
 
