@@ -27,6 +27,7 @@ Usage: python modules/deviation_module.py
   Change the site in core/site_local.py.
 """
 
+import copy
 import sys
 from pathlib import Path
 
@@ -54,6 +55,8 @@ from core.config import (
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
     DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
     DEVIATION_GRADIENT_TICKS,
+    ACCURACY_UNREGISTERED_COLOR, ACCURACY_UNREGISTERED_LABEL,
+    accuracy_class_color,
     KLIC_XY_THRESHOLDS, KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS,
     FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
@@ -155,7 +158,9 @@ all_seg_radius = []       # cylinder radius per segment (used to sample the tube
 all_seg_crown_offset = [] # top->axis lowering per segment: the tube radius for every
                           # pipe (registered or fallback diameter), 0 for traces
 all_seg_gml_id = []       # GML gml_id per segment — identifies the whole feature
+all_seg_acc_class = []    # registered noejagtighedsklasse per segment: 1..5, 0 = none
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
+ler_meshes_acc = {}       # layer -> same mesh, painted by registered accuracy class
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
@@ -175,6 +180,34 @@ def _to_local(coords_utm, vejl_dybde_mm=None):
     return coords
 
 
+# Accuracy-class colouring of the utility geometry itself (the "Colour by
+# accuracy class" toggle). A layer is one merged mesh, but the class is
+# registered per feature, so the parts are recoloured after the merge: each part
+# contributes a known number of vertices, in merge order, and gets its feature's
+# class colour. Only the colours are rebuilt, never the geometry.
+_acc_view_reg = 0     # features in view whose accuracy class is registered
+_acc_view_total = 0   # features in view
+
+
+def _acc_colored_mesh(mesh, parts):
+    """Copy of a merged layer mesh painted by registered accuracy class.
+
+    ``parts`` is ``[(n_vertices, class_idx), ...]`` in merge order, with
+    ``class_idx`` 0 where the feature registers no class. Returns ``None`` when
+    the vertex counts do not add up to the merged mesh, so the caller keeps the
+    plain utility colouring rather than painting the wrong features.
+    """
+    if not parts:
+        return None
+    counts = np.array([n for n, _ in parts], dtype=int)
+    if int(counts.sum()) != len(mesh.vertices):
+        return None
+    cols = np.array([accuracy_class_color(c) for _, c in parts], dtype=float)
+    out = copy.deepcopy(mesh)
+    out.vertex_colors = o3d.utility.Vector3dVector(np.repeat(cols, counts, axis=0))
+    return out
+
+
 for layer_name, cfg in list(LINE_LAYERS.items()):
     try:
         gdf = gpd.read_file(GML_PATH, layer=layer_name)
@@ -189,10 +222,12 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
 
     # For Ledningstrace: accumulate per-forsyningsart sub-layers
     _trace_sub_cyls = {}   # display_name -> [meshes]
+    _trace_sub_acc = {}    # display_name -> [(n_vertices, class_idx), ...]
     _trace_sub_stats = {}  # display_name -> [n_feat_act, n_seg_act, n_feat_inact, n_seg_inact]
     n_feat_act, n_seg_act = 0, 0
     n_feat_inact, n_seg_inact = 0, 0
     layer_cyls = []
+    layer_acc = []         # (n_vertices, class_idx) per mesh in layer_cyls
     _layer_z_vals = []
 
     for _, row in gdf.iterrows():
@@ -239,6 +274,11 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
         vejl = row.get("vejledendeDybde", None) if "vejledendeDybde" in row.index else None
         gml_id_val = str(row.get("gml_id", "") or "")
 
+        # Registered horizontal accuracy class of this feature (0 = not
+        # registered), carried per segment so the geometry can be coloured by it.
+        _tol = feature_accuracy_tolerance(row)
+        acc_class = _tol[1] if _tol is not None else 0
+
         hit = False
         for sub in subs:
             coords_raw = np.array(sub.coords, dtype=float)
@@ -269,21 +309,28 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 crown_offset = radius if bredde_m is None else 0.0
                 all_seg_crown_offset.append(crown_offset)
                 all_seg_gml_id.append(gml_id_val)
+                all_seg_acc_class.append(acc_class)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
                     _dz = np.array([0.0, 0.0, crown_offset])
                     mesh = segment_to_cylinder(cp1 - _dz, cp2 - _dz, radius, color)
                 if mesh is not None:
+                    _part = (len(mesh.vertices), acc_class)
                     if is_trace:
                         _trace_sub_cyls.setdefault(display_name, []).append(mesh)
+                        _trace_sub_acc.setdefault(display_name, []).append(_part)
                     else:
                         layer_cyls.append(mesh)
+                        layer_acc.append(_part)
                 if is_active:
                     n_seg_act += 1
                 else:
                     n_seg_inact += 1
         if hit:
+            _acc_view_total += 1
+            if acc_class:
+                _acc_view_reg += 1
             if is_active:
                 n_feat_act += 1
             else:
@@ -306,6 +353,9 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 m += c
             m.compute_vertex_normals()
             ler_meshes[dname] = m
+            _m_acc = _acc_colored_mesh(m, _trace_sub_acc.get(dname, []))
+            if _m_acc is not None:
+                ler_meshes_acc[dname] = _m_acc
 
             fa_val = dname.split("(")[-1].rstrip(")").strip() if "(" in dname else ""
             LINE_LAYERS[dname] = {"color": _forsyningsart_color(fa_val, default_color),
@@ -325,6 +375,9 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 m += c
             m.compute_vertex_normals()
             ler_meshes[layer_name] = m
+            _m_acc = _acc_colored_mesh(m, layer_acc)
+            if _m_acc is not None:
+                ler_meshes_acc[layer_name] = _m_acc
         if n_feat_act + n_feat_inact > 0:
             parts = []
             if n_feat_act > 0:
@@ -343,6 +396,7 @@ seg_half_width = np.array(all_seg_half_width, dtype=float) if all_seg_half_width
 seg_radius = np.array(all_seg_radius, dtype=float) if all_seg_radius else np.empty(0, dtype=float)
 seg_crown_offset = np.array(all_seg_crown_offset, dtype=float) if all_seg_crown_offset else np.empty(0, dtype=float)
 seg_gml_id = np.array(all_seg_gml_id, dtype=object) if all_seg_gml_id else np.empty(0, dtype=object)
+seg_acc_class = np.array(all_seg_acc_class, dtype=int) if all_seg_acc_class else np.empty(0, dtype=int)
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
@@ -355,6 +409,14 @@ n_inactive_segs = n_total_segs - n_active_segs
 _trace_centerlines = build_trace_centerlines(
     seg_p1, seg_p2, all_seg_layer,
     lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]))
+# Second set for the accuracy-class colouring. The centreline is the visible
+# part of a trace (the corridor ribbon is nearly transparent), so it has to
+# carry the class too, per segment: one trace layer holds several features and
+# they need not share a class.
+_trace_centerlines_acc = build_trace_centerlines(
+    seg_p1, seg_p2, all_seg_layer,
+    lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]),
+    color_of_index=lambda i: accuracy_class_color(seg_acc_class[i]))
 
 _t_ler1 = time.perf_counter()
 print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1f}s"
@@ -368,7 +430,9 @@ if n_total_segs == 0:
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n--- Loading LER utility components within bbox ---")
 comp_meshes = {}        # layer_name -> merged TriangleMesh
+comp_meshes_acc = {}    # layer_name -> same mesh, painted by registered accuracy class
 comp_stats = {}         # layer_name -> int count
+_comp_acc_cov_rows = [] # (layer, has_column, n_registered_total, n_total)
 
 for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
     try:
@@ -376,9 +440,12 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
     except Exception:
         continue
 
+    _comp_acc_cov_rows.append((comp_layer,) + accuracy_class_coverage(gdf_c))
+
     color = comp_cfg["color"]
     n_comp = 0
     spheres = []
+    comp_acc = []       # (n_vertices, class_idx) per sphere, in merge order
 
     parent_line = COMP_TO_LINE.get(comp_layer)
     parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
@@ -406,6 +473,12 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         sphere.translate(pt)
         sphere.paint_uniform_color(color)
         spheres.append(sphere)
+        _tol_c = feature_accuracy_tolerance(row)
+        _cls_c = _tol_c[1] if _tol_c is not None else 0
+        comp_acc.append((len(sphere.vertices), _cls_c))
+        _acc_view_total += 1
+        if _cls_c:
+            _acc_view_reg += 1
         n_comp += 1
 
     comp_stats[comp_layer] = n_comp
@@ -415,6 +488,9 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
             m += s
         m.compute_vertex_normals()
         comp_meshes[comp_layer] = m
+        _m_acc = _acc_colored_mesh(m, comp_acc)
+        if _m_acc is not None:
+            comp_meshes_acc[comp_layer] = _m_acc
     if n_comp > 0:
         print(f"  {comp_layer:<35} {n_comp:>4} components")
 
@@ -540,11 +616,13 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
 # Accuracy buffers are built for line layers only; components are excluded.
 
 print("\n  Registered accuracy class (noejagtighedsklasse) coverage:")
-for _ln, _has, _nreg, _ntot in _acc_cov_rows:
+for _ln, _has, _nreg, _ntot in _acc_cov_rows + _comp_acc_cov_rows:
     status = f"{_nreg}/{_ntot} registered" if _has else "no column"
     print(f"    {_ln:<32} {status}")
 _n_acc_view = sum(v[0] for v in accbuf_stats.values())
 print(f"  Buffers built for {_n_acc_view} features within the view")
+print(f"  Class colouring: {_acc_view_reg}/{_acc_view_total} features in view "
+      f"carry a class")
 
 
 def _get_matching_segment_mask(utility_type, active_only=None):
@@ -1347,43 +1425,50 @@ _MODE_NAMES = [
     "Point cloud Z deviation (continuous)",      # 5
     "Original RGB",                              # 6
     "LER utility class",                         # 7
-    "LER XYZ deviation (discrete)",              # 8
-    "LER XYZ deviation (continuous)",            # 9
-    "LER XY deviation (discrete)",               # 10
-    "LER XY deviation (continuous)",             # 11
-    "LER Z deviation (discrete)",                # 12
-    "LER Z deviation (continuous)",              # 13
-    "KLIC XY deviation (discrete)",              # 14
+    "LER registered accuracy class",             # 8
+    "LER XYZ deviation (discrete)",              # 9
+    "LER XYZ deviation (continuous)",            # 10
+    "LER XY deviation (discrete)",               # 11
+    "LER XY deviation (continuous)",             # 12
+    "LER Z deviation (discrete)",                # 13
+    "LER Z deviation (continuous)",              # 14
+    "KLIC XY deviation (discrete)",              # 15
 ]
-# Instance point cloud shown per mode. In the LER deviation modes the heatmap
-# lives on the LER segments, so the instance points fall back to original RGB.
+# Instance point cloud shown per mode. In the LER modes the colouring lives on
+# the registered geometry, so the instance points fall back to original RGB.
 _MODE_INST_PCD = ["pcd_dev", "pcd_dev_cont",
                   "pcd_dev_xy", "pcd_dev_xy_cont",
                   "pcd_dev_z", "pcd_dev_z_cont",
                   "pcd_rgb", "pcd_class",
+                  "pcd_rgb",
                   "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb", "pcd_rgb",
                   "pcd_rgb"]
+# The registered horizontal accuracy class (noejagtighedsklasse) painted onto
+# the registered geometry itself. An LER mode, not a point-cloud one: it says
+# what the register claims about its own geometry, and nothing about the
+# measurement, so it never mixes with a measured deviation colouring.
+ACC_CLASS_MODE = 8
 # LER deviation modes: the LER layers become deviation-coloured point clouds.
 # Each maps to the precomputed cloud carrying the right metric + colouring.
 _LER_MODE_PCD = {
-    8: ler_pcd_dev,           # XYZ deviation, discrete accuracy-class colours
-    9: ler_pcd_dev_cont,      # XYZ deviation, continuous gradient
-    10: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
-    11: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
-    12: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
-    13: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
-    14: ler_pcd_xydev_klic,   # XY deviation, 2-class KLIC/WIBON pass-fail colours
+    9: ler_pcd_dev,           # XYZ deviation, discrete accuracy-class colours
+    10: ler_pcd_dev_cont,     # XYZ deviation, continuous gradient
+    11: ler_pcd_xydev,        # XY deviation, discrete accuracy-class colours
+    12: ler_pcd_xydev_cont,   # XY deviation, continuous gradient
+    13: ler_pcd_zdev,         # Z deviation, discrete accuracy-class colours
+    14: ler_pcd_zdev_cont,    # Z deviation, continuous gradient
+    15: ler_pcd_xydev_klic,   # XY deviation, 2-class KLIC/WIBON pass-fail colours
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
 # Instance-deviation modes: the measured points themselves are deviation
 # coloured, and the crown line carries the same metric.
 _PC_DEV_MODES = (0, 1, 2, 3, 4, 5)
 # Modes that show the discrete accuracy-class heatmap legend (5-class LER scheme)
-_HEATMAP_MODES = (0, 2, 4, 8, 10, 12)
+_HEATMAP_MODES = (0, 2, 4, 9, 11, 13)
 # Modes that show the continuous deviation-gradient legend
-_GRADIENT_MODES = (1, 3, 5, 9, 11, 13)
+_GRADIENT_MODES = (1, 3, 5, 10, 12, 14)
 # Modes that show the 2-class KLIC/WIBON pass-fail legend
-_KLIC_MODES = (14,)
+_KLIC_MODES = (15,)
 
 app = gui.Application.instance
 app.initialize()
@@ -1538,6 +1623,26 @@ if _trench_path_obj is not None:
     _trench_ls.paint_uniform_color([0.0, 1.0, 1.0])
     _trench_mat = line_material(3.0)
     scene_widget.scene.add_geometry(TRENCH_GEOM, _trench_ls, _trench_mat)
+
+# Colouring of the solid LER geometry: the utility colour of its layer, or the
+# registered accuracy class of each feature (ACC_CLASS_MODE). The geometry names
+# never change, so the layer toggles, the utility filter and the opacity slider
+# are unaffected by which of the two is showing.
+def _acc_class_active():
+    return _color_mode[0] == ACC_CLASS_MODE
+
+
+def _solid_ler_mesh(ln):
+    return ler_meshes_acc.get(ln, ler_meshes[ln]) if _acc_class_active() else ler_meshes[ln]
+
+
+def _solid_comp_mesh(ln):
+    return comp_meshes_acc.get(ln, comp_meshes[ln]) if _acc_class_active() else comp_meshes[ln]
+
+
+def _solid_trace_centerlines():
+    return _trace_centerlines_acc if _acc_class_active() else _trace_centerlines
+
 
 # Add LER pipe meshes
 _ler_visible = {}
@@ -1747,9 +1852,29 @@ def _apply_ler_color_mode(mode):
                                             make_ler_pt_mat(6.0, _ler_opacity[0]))
         else:
             scene_widget.scene.add_geometry(
-                gn, ler_meshes[ln], make_mesh_mat(ribbon_alpha(ln, _ler_opacity[0])))
+                gn, _solid_ler_mesh(ln), make_mesh_mat(ribbon_alpha(ln, _ler_opacity[0])))
         scene_widget.scene.show_geometry(gn, _ler_master_on[0] and _ler_visible.get(ln, True))
     _sync_trace_centerlines()
+
+
+def _apply_ler_solid_colors():
+    """Rebuild the LER geometry that only the mesh path draws: the trace
+    centrelines and the component spheres. Both carry the registered accuracy
+    class in ACC_CLASS_MODE and their layer's utility colour in every other
+    mode, so they are re-added whenever the mode changes."""
+    for ln in _trace_centerlines:
+        gn = trace_centerline_gn(ln)
+        if scene_widget.scene.has_geometry(gn):
+            scene_widget.scene.remove_geometry(gn)
+    add_trace_centerlines(scene_widget.scene, _solid_trace_centerlines(),
+                          _ler_opacity[0], make_mesh_mat)
+    for ln in comp_meshes:
+        gn = f"comp_{ln}"
+        scene_widget.scene.remove_geometry(gn)
+        scene_widget.scene.add_geometry(gn, _solid_comp_mesh(ln),
+                                        make_mesh_mat(_ler_opacity[0]))
+        scene_widget.scene.show_geometry(
+            gn, _ler_master_on[0] and _comp_visible.get(ln, False))
 
 
 def _apply_color_mode(mode):
@@ -1762,6 +1887,7 @@ def _apply_color_mode(mode):
             scene_widget.scene.add_geometry(gn, inst[pcd_key], make_pt_mat(4.0))
             scene_widget.scene.show_geometry(gn, _inst_visible.get((ut, i), True))
     _apply_crown_mode(mode)
+    _apply_ler_solid_colors()
     _apply_ler_color_mode(mode)
     _apply_orig_cloud_mode(mode)
     window.post_redraw()
@@ -1807,6 +1933,19 @@ for _tick_m, _col in zip(_grad_ticks_m, _grad_tick_cols):
     _gradient_legend.add_child(make_legend_row(_col, gui.Label(_lbl), em))
 _gradient_legend.visible = False
 
+# Registered accuracy class legend (ACC_CLASS_MODE). Same five colours as the
+# heatmap above, so the header has to say which of the two is on screen: here
+# they are the class LER registers for its own geometry, not a measured
+# deviation. The count is of features within the view, components included.
+_acc_class_legend = gui.Vert(0)
+_acc_class_legend.add_child(gui.Label(
+    f"Registered accuracy class ({_acc_view_reg}/{_acc_view_total}):"))
+for _col, _lbl in zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS):
+    _acc_class_legend.add_child(make_legend_row(_col, gui.Label(_lbl), em))
+_acc_class_legend.add_child(make_legend_row(
+    ACCURACY_UNREGISTERED_COLOR, gui.Label(ACCURACY_UNREGISTERED_LABEL), em))
+_acc_class_legend.visible = False
+
 # KLIC/WIBON pass-fail legend: separate 2-swatch widget so the 5-class
 # heatmap legend is not reused (and shown incorrectly) for this 2-class scheme.
 _klic_legend = gui.Vert(0)
@@ -1821,6 +1960,7 @@ def _on_mode(val, idx):
     _heatmap_legend.visible = (idx in _HEATMAP_MODES)
     _gradient_legend.visible = (idx in _GRADIENT_MODES)
     _klic_legend.visible = (idx in _KLIC_MODES)
+    _acc_class_legend.visible = (idx == ACC_CLASS_MODE)
     window.set_needs_layout()
 
 
@@ -1828,6 +1968,7 @@ combo.set_on_selection_changed(_on_mode)
 panel.add_child(combo)
 panel.add_child(_heatmap_legend)
 panel.add_child(_gradient_legend)
+panel.add_child(_acc_class_legend)
 panel.add_child(_klic_legend)
 panel.add_fixed(int(0.5 * em))
 

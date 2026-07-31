@@ -436,6 +436,21 @@ ACCURACY_CLASS_FIELD = "noejagtighedsklasse"
 # registered upper bound. A display convention only, not a registered value.
 ACCURACY_OPEN_CLASS_WIDTH = 2.00
 
+# Colour for a feature that registers no usable accuracy class, used wherever
+# geometry is painted by class (DEVIATION_COLORS gives the five classes). Kept
+# distinct from every class colour: an unregistered class is missing data, not a
+# coarse one, and how often it happens is itself a result.
+ACCURACY_UNREGISTERED_COLOR = [0.55, 0.55, 0.55]
+ACCURACY_UNREGISTERED_LABEL = "not registered"
+
+
+def accuracy_class_color(class_idx):
+    """Display colour for a registered accuracy class index (1..5), or the
+    unregistered grey for 0 / None / anything outside that range."""
+    if class_idx and 1 <= int(class_idx) <= len(DEVIATION_COLORS):
+        return DEVIATION_COLORS[int(class_idx) - 1]
+    return ACCURACY_UNREGISTERED_COLOR
+
 
 def accuracy_class_halfwidth(value):
     """Map a registered ``noejagtighedsklasse`` value to a 2D buffer half-width.

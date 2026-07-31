@@ -31,7 +31,8 @@ def trace_centerline_gn(storage_key):
 
 
 def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
-                            radius=TRACE_CENTERLINE_RADIUS):
+                            radius=TRACE_CENTERLINE_RADIUS,
+                            color_of_index=None):
     """Build one merged centreline tube mesh per Ledningstrace storage key.
 
     Reads the per-segment arrays the viewers already keep for picking, so no
@@ -41,6 +42,11 @@ def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
     ``seg_layer``            length-N sequence of storage keys.
     ``color_of``             callable ``key -> [r, g, b]``.
     ``radius``               display radius; never derived from "bredde".
+    ``color_of_index``       optional callable ``segment index -> [r, g, b]``,
+                             overriding ``color_of``. For colourings that vary
+                             per feature rather than per layer (e.g. by
+                             registered accuracy class), where one layer's
+                             centreline is no longer one colour.
 
     Returns ``{storage_key: TriangleMesh}``, empty when there are no traces.
     """
@@ -59,7 +65,8 @@ def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
         # The centreline sits on the registered line itself, exactly where the
         # ribbon plane sits, so the two coincide rather than one floating above
         # the other.
-        cyl = segment_to_cylinder(p1[i], p2[i], radius, color_of(key))
+        col = color_of_index(i) if color_of_index is not None else color_of(key)
+        cyl = segment_to_cylinder(p1[i], p2[i], radius, col)
         if cyl is not None:
             by_key.setdefault(key, []).append(cyl)
 
