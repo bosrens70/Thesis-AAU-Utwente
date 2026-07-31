@@ -28,6 +28,16 @@ ball returns the pipe. It is also why the skeleton alone will not do: a skeleton
 runs through the middle of the exposed arc, which sits roughly 0.36 of a radius
 below the crown by an amount that varies with how much of the pipe is exposed.
 
+The rule separates the pipe from an object resting on it, not from material
+stuck to it. Soil left on an incompletely cleaned utility is the first surface
+the ball meets, so the crown comes back high by the thickness of that layer and
+the utility reads too shallow; dirt heaped on one side also widens the footprint
+and pulls the centreline with it. Nothing in the geometry tells the two apart.
+A station whose circle fit fails is a weak hint that the cross-section was not a
+bare pipe surface, but it is recorded, not acted on. The error does not shrink
+with the pipe, so it matters most on the smallest utilities, where the arc
+spread it replaces was already only a few millimetres.
+
 A circle is still fitted to each cross-section, but only to measure the radius,
 an independent reading of udvendigDiameter. It does not position the crown.
 
