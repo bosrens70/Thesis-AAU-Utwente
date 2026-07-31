@@ -6,7 +6,8 @@ Provides shared logic for detecting, tracking, and rendering Ledningstrace
 features by forsyningsart (utility type) across all viewers.
 """
 
-from core.config import forsyningsart_color, LEDNINGSTRACE_ALPHA_SCALE
+from core.config import (forsyningsart_color, LEDNINGSTRACE_ALPHA_SCALE,
+                         LEDNINGSTRACE_LAYER)
 
 
 def get_ledningstrace_display_info(layer_name, row, default_color):
@@ -69,7 +70,7 @@ def get_bredde_width(row):
 
 def is_ledningstrace(layer_name):
     """Check if a layer is Ledningstrace."""
-    return layer_name == "Ledningstrace"
+    return layer_name == LEDNINGSTRACE_LAYER
 
 
 def is_trace_key(storage_key):
@@ -79,7 +80,7 @@ def is_trace_key(storage_key):
     variants the viewers store meshes under ("Ledningstrace (vand)"), which is
     the form the rendering code works with.
     """
-    return str(storage_key).startswith("Ledningstrace")
+    return str(storage_key).startswith(LEDNINGSTRACE_LAYER)
 
 
 def ribbon_alpha(storage_key, base_alpha):

@@ -41,7 +41,7 @@ _project_root = Path(__file__).resolve().parent.parent
 if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
-from core.config import PLY_BASE_DIR, TARGET_CLASS
+from core.config import PLY_BASE_DIR, TARGET_CLASS, ler_layers_for_type
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NAMING CONVENTIONS
@@ -49,6 +49,9 @@ from core.config import PLY_BASE_DIR, TARGET_CLASS
 
 LABELED_PREFIX = "labeled_"
 MATCHES_FILENAME = "ler_matches.json"
+# Picks the label viewer refused because the LER layer contradicted the
+# instance's label, kept beside the matches so a refusal is recoverable.
+CONFLICTS_FILENAME = "ler_match_conflicts.json"
 DEVIATION_DIR_SUFFIX = "_LER_deviation_LAS"
 
 # segment_module writes "<class>_instance_<cluster_id>.ply"; label_module writes
@@ -264,11 +267,9 @@ def read_labeled_indices(labeled_dir):
     return out
 
 
-def read_ler_matches(labeled_dir):
-    """Contents of ``ler_matches.json``, or {} when absent or unreadable."""
-    if not labeled_dir:
-        return {}
-    path = Path(labeled_dir) / MATCHES_FILENAME
+def _read_json_dict(path):
+    """A JSON object from ``path``, or {} when absent or unreadable."""
+    path = Path(path)
     if not path.is_file():
         return {}
     try:
@@ -276,6 +277,36 @@ def read_ler_matches(labeled_dir):
         return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+def read_ler_matches(labeled_dir):
+    """Contents of ``ler_matches.json``, or {} when absent or unreadable."""
+    if not labeled_dir:
+        return {}
+    return _read_json_dict(Path(labeled_dir) / MATCHES_FILENAME)
+
+
+def read_match_conflicts(labeled_dir):
+    """Contents of ``ler_match_conflicts.json``, or {} when absent."""
+    if not labeled_dir:
+        return {}
+    return _read_json_dict(Path(labeled_dir) / CONFLICTS_FILENAME)
+
+
+def match_disagrees_with_label(fname, layer):
+    """True when a recorded match's LER layer contradicts the type in ``fname``.
+
+    The filename carries the utility type the label viewer saved the instance
+    under, so a match can be audited from disk without loading any geometry.
+    Uses the same rule the viewers apply, so a Ledningstrace whose forsyningsart
+    matches the type counts as agreeing. An unrecognised filename, or a type
+    with no LER mapping, cannot disagree.
+    """
+    m = ANY_LABELED_FNAME_RE.match(str(fname))
+    if not m or not layer:
+        return False
+    allowed = ler_layers_for_type(int(m.group(3)), {layer})
+    return allowed is not None and layer not in allowed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -305,6 +336,13 @@ class SiteStatus:
     n_matched: int = 0        # instances linked to a specific LER feature
     n_no_ler: int = 0         # instances confirmed to have no LER counterpart
     has_matches_file: bool = False
+    # Matches whose LER layer contradicts the instance's own label, as
+    # "<filename>: <label type> vs <layer>". Split by how they got there: a
+    # stored match the label viewer now refuses (recorded before the check
+    # existed, or deliberately overridden with Ctrl), and a refused pick logged
+    # in ler_match_conflicts.json with no match written at all.
+    conflicting_matches: list = field(default_factory=list)
+    refused_matches: list = field(default_factory=list)
 
     water_instances: list = field(default_factory=list)
     deviation_dir: Path = None
@@ -413,6 +451,14 @@ def _collect_issues(st):
         unresolved = st.n_instances - st.n_matched - st.n_no_ler
         issues.append(f"{unresolved} labelled instance(s) with no LER match "
                       f"and not marked as absent from LER")
+    if st.conflicting_matches:
+        issues.append(
+            f"{len(st.conflicting_matches)} LER match(es) contradicting their "
+            f"label: {'; '.join(st.conflicting_matches)}")
+    if st.refused_matches:
+        issues.append(
+            f"{len(st.refused_matches)} LER match(es) refused for disagreeing "
+            f"with the label: {'; '.join(st.refused_matches)}")
     if st.empty_labeled_dirs:
         issues.append(f"{len(st.empty_labeled_dirs)} empty labeled_* folder(s)")
     if st.empty_segment_dirs:
@@ -477,13 +523,20 @@ def site_status(ply_path):
     # Matches live next to the PLYs they describe, so the root class instances
     # keep their own file alongside the labelled session's.
     for _dir in ([st.labeled.path] if st.labeled else []) + [inst_dir]:
-        for entry in read_ler_matches(_dir).values():
+        for fname, entry in read_ler_matches(_dir).items():
             if not isinstance(entry, dict):
                 continue
             if entry.get("no_ler"):
                 st.n_no_ler += 1
             elif entry.get("gml_id"):
                 st.n_matched += 1
+                layer = entry.get("layer", "")
+                if entry.get("conflict") or match_disagrees_with_label(fname, layer):
+                    st.conflicting_matches.append(f"{fname}: {layer}")
+        for fname, entry in read_match_conflicts(_dir).items():
+            if isinstance(entry, dict) and not entry.get("overridden"):
+                st.refused_matches.append(
+                    f"{fname}: {entry.get('label', '?')} vs {entry.get('layer', '?')}")
     if st.water_instances and (inst_dir / MATCHES_FILENAME).is_file():
         st.has_matches_file = True
 

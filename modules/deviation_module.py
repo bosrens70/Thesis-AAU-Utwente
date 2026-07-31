@@ -13,6 +13,16 @@ LER-surface deviation clouds. Instances without a recorded match keep the
 original behaviour of measuring against every nearby LER feature whose layer
 matches the instance's utility type.
 
+Two deviation metrics are reported side by side:
+
+* **Crown line** (headline) — the measured top centreline recovered from the
+  instance cloud by core/crown.py, compared line-to-line against the registered
+  line. Both sides are then the same datum LER actually registers (horizontal
+  centreline, vertical top), so the comparison carries no radius bias.
+* **Point cloud** — every measured point against the registered line, the
+  original metric. It is defined for every instance, including the ones whose
+  shape yields no crown line, but it compares a surface against a line.
+
 Usage: python modules/deviation_module.py
   Change the site in core/site_local.py.
 """
@@ -47,6 +57,7 @@ from core.config import (
     KLIC_XY_THRESHOLDS, KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS,
     FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
+    ler_layers_for_type,
 )
 from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
@@ -65,6 +76,7 @@ from core.geometry import (
     merge_linesets, drape_z_from_polylines,
 )
 from core.crop import CropRegion
+from core.crown import crown_line
 from core.depth import (clean_coords_with_depth as _core_clean_coords,
                         MAX_DEPTH_BELOW_GROUND)
 from core.gui_helpers import (
@@ -540,20 +552,14 @@ def _get_matching_segment_mask(utility_type, active_only=None):
 
     active_only: None = both, True = only active, False = only inactive.
     """
-    match = UTILITY_TO_LER_MATCH.get(utility_type)
-    if match is None:
+    allowed = ler_layers_for_type(utility_type, set(all_seg_layer))
+    if allowed is None:
+        # No mapping for this type (an unlabelled instance): nothing to restrict.
         mask = np.ones(len(seg_p1), dtype=bool)
     else:
-        layers = match["layers"]
-        mask = np.zeros(len(seg_p1), dtype=bool)
-        for i, layer_name in enumerate(all_seg_layer):
-            if layer_name in layers:
-                mask[i] = True
-            elif layer_name.startswith("Ledningstrace"):
-                fa = layer_name.split("(")[-1].rstrip(")").strip() if "(" in layer_name else ""
-                mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
-                if mapped_line and mapped_line in layers:
-                    mask[i] = True
+        mask = np.array([ln in allowed for ln in all_seg_layer], dtype=bool)
+        if not len(mask):
+            mask = np.zeros(len(seg_p1), dtype=bool)
 
     if active_only is True:
         mask &= seg_active
@@ -564,20 +570,7 @@ def _get_matching_segment_mask(utility_type, active_only=None):
 
 def _get_matching_ler_names(utility_type):
     """Return set of LER layer display names that match the given utility type."""
-    match = UTILITY_TO_LER_MATCH.get(utility_type)
-    if match is None:
-        return set()
-    layers = match["layers"]
-    names = set()
-    for layer_name in ler_meshes:
-        if layer_name in layers:
-            names.add(layer_name)
-        elif layer_name.startswith("Ledningstrace"):
-            fa = layer_name.split("(")[-1].rstrip(")").strip() if "(" in layer_name else ""
-            mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
-            if mapped_line and mapped_line in layers:
-                names.add(layer_name)
-    return names
+    return ler_layers_for_type(utility_type, ler_meshes) or set()
 
 
 def _get_matching_accbuf_keys(utility_type):
@@ -586,21 +579,9 @@ def _get_matching_accbuf_keys(utility_type):
     Covers line layers, their components (via COMP_TO_LINE) and Ledningstrace
     sub-layers whose forsyningsart maps to a matching line, so the utility filter
     shows only the selected utility's registered-accuracy buffers."""
-    match = UTILITY_TO_LER_MATCH.get(utility_type)
-    if match is None:
-        return set()
-    line_layers = match["layers"]
-    comp_layers = {c for c, pl in COMP_TO_LINE.items() if pl in line_layers}
-    keys = set()
-    for ln in set(accbuf_fill) | set(accbuf_outline):
-        if ln in line_layers or ln in comp_layers:
-            keys.add(ln)
-        elif ln.startswith("Ledningstrace"):
-            fa = ln.split("(")[-1].rstrip(")").strip() if "(" in ln else ""
-            mapped_line = FORSYNINGSART_TO_LINE.get(fa.lower())
-            if mapped_line and mapped_line in line_layers:
-                keys.add(ln)
-    return keys
+    return ler_layers_for_type(utility_type,
+                               set(accbuf_fill) | set(accbuf_outline),
+                               include_components=True) or set()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -827,6 +808,24 @@ for inst_path in _inst_files:
     pcd_class.points = o3d.utility.Vector3dVector(pts_inst)
     pcd_class.colors = o3d.utility.Vector3dVector(np.tile(ut_col, (len(pts_inst), 1)))
 
+    # ── Crown line: the measured counterpart of the registered datum ─────────
+    # LER registers the horizontal centreline carrying the Z of the pipe top, so
+    # the crown polyline is what should be compared against it. The crown comes
+    # from rolling a ball upwards through the cloud (core/crown.py), which stops
+    # at the first surface above it and so returns the pipe rather than anything
+    # resting on it. Measuring it against the same unlowered seg_p1/seg_p2 the
+    # point clouds use makes both sides the top datum, with no radius bias.
+    crown = crown_line(pts_inst)
+    crown_dists = crown_xy_dists = crown_z_dists = np.empty(0)
+    crown_stats = dict(_nan_stats)
+    crown_stats["n_pts"] = crown.n_stations
+    if crown.ok and has_ler:
+        crown_dists, crown_xy_dists, crown_z_dists = (
+            batch_point_to_plane_segment_components(
+                crown.points, seg_p1[seg_mask_all], seg_p2[seg_mask_all],
+                seg_half_width[seg_mask_all]))
+        crown_stats = _make_stats(crown_dists)
+
     inst_data = {
         "name": inst_path.stem,
         "utility_type": utility_type,
@@ -849,6 +848,11 @@ for inst_path in _inst_files:
         "stats": stats,
         "stats_active": stats_act,
         "stats_inactive": stats_inact,
+        "crown": crown,
+        "crown_distances": crown_dists,
+        "crown_xy": crown_xy_dists,
+        "crown_z": crown_z_dists,
+        "crown_stats": crown_stats,
     }
     class_instances.setdefault(utility_type, []).append(inst_data)
 
@@ -875,6 +879,25 @@ for inst_path in _inst_files:
               f"type={ut_label}  "
               f"** No matching LER utility **  [{_ti1 - _ti0:.2f}s]{match_tag}")
 
+    if crown.ok:
+        _r = crown.median_radius
+        _dtxt = f"D={2 * _r * 1000:.0f}mm" if _r else "D=n/a"
+        _crown_dev = (f"mean={crown_stats['mean']*1000:.1f}mm  "
+                      f"P95={crown_stats['p95']*1000:.1f}mm"
+                      if has_ler else "no LER to compare")
+        _arms = (f"{crown.n_parts} of {crown.n_branches} arms"
+                 if crown.n_branches > 1 else "1 arm")
+        print(f"      crown line: {_arms}, {crown.n_stations} stations over "
+              f"{crown.run_length:.2f} m ({crown.coverage*100:.0f}% covered, "
+              f"radius measured at {crown.n_radius})  {_dtxt}  "
+              f"{_crown_dev}")
+    else:
+        print(f"      crown line: none ({crown.reason})")
+    # An arm the footprint found but the crown does not cover is missing from the
+    # statistics, so it is named rather than left implicit.
+    for _note in crown.notes:
+        print(f"        not covered: {_note}")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Per-class summary
 # ─────────────────────────────────────────────────────────────────────────────
@@ -882,14 +905,18 @@ print("\n" + "=" * 72)
 print("  DEVIATION SUMMARY -Instances vs LER (by utility class)")
 print("=" * 72)
 
-# ───── Trench footprint: restricts deviation colouring + statistics ─────
+# ───── Trench footprint: restricts the LER deviation clouds ─────
 # The user marks the trench outline by picking points (Shift+Click) on the
 # cloud at startup; the footprint is the XY polygon through those points
-# (convex hull by default, pick order optionally). Only points whose XY falls
-# inside the polygon are coloured by the deviation modes and counted in the
-# per-class statistics; everything outside is greyed. The polygon is cached in
-# a JSON next to the site PLY so it survives restarts. With no trench defined
-# the whole cloud is coloured / measured as before.
+# (convex hull by default, pick order optionally), cached in a JSON next to the
+# site PLY so it survives restarts.
+#
+# It restricts the LER side only. A registered line spans the whole crop region,
+# so cutting it down to the excavated stretch is what the footprint is for. An
+# instance is already utility exposed in the trench, and a hull through a handful
+# of picked points rarely brackets a pipe running into the trench wall, so
+# restricting the instances only ever clipped their ends out of the colouring and
+# out of the statistics.
 TRENCH_POLYGON_MODE = "hull"          # "hull" (convex) or "order" (pick order)
 # Resolve the trench via the shared cache (load <site>_trench.json, else pick).
 _trench_verts, _trench_mode = load_or_pick_trench(
@@ -906,19 +933,10 @@ def _inside_mask(points_xyz):
     return _trench_path_obj.contains_points(xy)
 
 
-# Inside-trench mask per instance (keyed (ut, i)); absent key => unrestricted.
-_inst_inside = {}
-for _ut, _insts in class_instances.items():
-    for _i, _inst in enumerate(_insts):
-        _m = _inside_mask(np.asarray(_inst["pcd_dev"].points))
-        if _m is not None:
-            _inst_inside[(_ut, _i)] = _m
-
-
 def _build_class_summaries():
-    """Per-class deviation statistics over inside-trench points (or all points
-    when no trench is defined). Reads the current _inst_inside masks so it can
-    be recomputed if the trench changes."""
+    """Per-class deviation statistics over every measured point of the class.
+    The footprint restricts the LER clouds only, so a pipe end reaching past the
+    picked outline still counts here."""
     summaries = {}
     for ut, instances in sorted(class_instances.items()):
         label = UTILITY_TYPE_LABELS.get(ut, f"Unknown({ut})")
@@ -926,23 +944,14 @@ def _build_class_summaries():
         total_act = sum(inst["n_active_segs"] for inst in instances)
         total_inact = sum(inst["n_inactive_segs"] for inst in instances)
 
-        def _masked(idx, arr):
-            if arr is None:
-                return None
-            m = _inst_inside.get((ut, idx))
-            return arr if m is None else arr[m]
-
-        total_pts = 0
-        for idx, inst in enumerate(instances):
-            m = _inst_inside.get((ut, idx))
-            total_pts += int(inst["stats"]["n_pts"] if m is None else int(m.sum()))
+        total_pts = sum(inst["stats"]["n_pts"] for inst in instances)
 
         def _pool(arr_key, only_ler=False):
             parts = []
-            for idx, inst in enumerate(instances):
+            for inst in instances:
                 if only_ler and not inst["has_ler"]:
                     continue
-                a = _masked(idx, inst.get(arr_key))
+                a = inst.get(arr_key)
                 if a is not None and len(a):
                     parts.append(a)
             return np.concatenate(parts) if parts else np.array([])
@@ -955,11 +964,42 @@ def _build_class_summaries():
                     "p95": float(np.percentile(alld, 95)),
                     "max": float(np.max(alld))}
 
+        # ── Crown line (headline metric) ────────────────────────────────────
+        # Pooled over the class's crown lines, station by station. Unrestricted
+        # like the point-cloud metric, so the two now span the same stretch of
+        # pipe and stay comparable.
+        def _crown_pool(arr_key):
+            parts = []
+            for inst in instances:
+                if not inst["crown"].ok or not inst["has_ler"]:
+                    continue
+                a = inst.get(arr_key)
+                if a is not None and len(a):
+                    parts.append(a)
+            return np.concatenate(parts) if parts else np.array([])
+
+        def _crown_agg(arr_key):
+            a = _crown_pool(arr_key)
+            if a.size == 0:
+                return None
+            return {"mean": float(np.mean(a)), "median": float(np.median(a)),
+                    "std": float(np.std(a)), "p95": float(np.percentile(a, 95)),
+                    "max": float(np.max(a)), "n": int(a.size)}
+
+        _crowns = [inst["crown"] for inst in instances if inst["crown"].ok]
+        _radii = [c.median_radius for c in _crowns if c.median_radius]
+
         base = {
             "label": label, "n_instances": len(instances), "n_points": total_pts,
             "has_ler": has_ler,
             "n_active_segs": total_act if has_ler else 0,
             "n_inactive_segs": total_inact if has_ler else 0,
+            "n_crown_lines": len(_crowns),
+            # Independent measurement of udvendigDiameter, from the circle fits.
+            "measured_diameter": 2.0 * float(np.median(_radii)) if _radii else None,
+            "crown": _crown_agg("crown_distances"),
+            "crown_xy": _crown_agg("crown_xy"),
+            "crown_z": _crown_agg("crown_z"),
         }
         matched = _pool("distances", only_ler=True) if has_ler else np.array([])
         if matched.size:
@@ -988,10 +1028,30 @@ for ut in sorted(class_summaries.keys()):
     s = class_summaries[ut]
     print(f"\n  {s['label']} (type {ut})")
     print(f"    Instances:  {s['n_instances']}")
-    print(f"    Points (in trench): {s['n_points']:,}")
+    print(f"    Points:     {s['n_points']:,}")
     print(f"    LER segs:   {s['n_active_segs']} active, {s['n_inactive_segs']} inactive")
+    _cr = s["crown"]
+    _dia = s["measured_diameter"]
+    print(f"    Crown lines: {s['n_crown_lines']}/{s['n_instances']} instances"
+          + (f"   measured D {_dia*1000:.0f} mm" if _dia else ""))
+    if _cr:
+        # Headline: both sides on the registered datum (centreline XY, top Z).
+        print(f"    -- CROWN LINE vs registered line ({_cr['n']} stations) --")
+        print(f"    Mean:       {_cr['mean']*1000:>8.2f} mm")
+        print(f"    Median:     {_cr['median']*1000:>8.2f} mm")
+        print(f"    Std dev:    {_cr['std']*1000:>8.2f} mm")
+        print(f"    P95:        {_cr['p95']*1000:>8.2f} mm")
+        print(f"    Max:        {_cr['max']*1000:>8.2f} mm")
+        for _lbl, _key in (("XY", "crown_xy"), ("Z", "crown_z")):
+            _c = s[_key]
+            if _c:
+                print(f"      {_lbl:<3} mean {_c['mean']*1000:>7.2f} mm   "
+                      f"P95 {_c['p95']*1000:>7.2f} mm   "
+                      f"max {_c['max']*1000:>7.2f} mm")
+    elif s["n_crown_lines"] == 0:
+        print(f"    -- CROWN LINE: none recovered (see per-instance reasons) --")
     if s["has_ler"] and not np.isnan(s["mean"]):
-        print(f"    -- Combined (all matching LER) --")
+        print(f"    -- POINT CLOUD vs registered line (all matching LER) --")
         print(f"    Mean:       {s['mean']*1000:>8.2f} mm")
         print(f"    Median:     {s['median']*1000:>8.2f} mm")
         print(f"    Std dev:    {s['std']*1000:>8.2f} mm")
@@ -1008,7 +1068,7 @@ for ut in sorted(class_summaries.keys()):
             print(f"    Mean:       {ia['mean']*1000:>8.2f} mm   "
                   f"P95: {ia['p95']*1000:.2f} mm   Max: {ia['max']*1000:.2f} mm")
     elif s["has_ler"]:
-        print(f"    ** No measured points inside the trench **")
+        print(f"    ** No measured points carry a deviation **")
     else:
         print(f"    ** No matching LER utility — deviation not computed **")
 
@@ -1202,6 +1262,66 @@ for _ln, _pc in ler_pcd_dev.items():
     if _m is not None:
         _ler_inside[_ln] = _m
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 5c.  Crown line geometry
+# ─────────────────────────────────────────────────────────────────────────────
+# One LineSet per crown line, built once per deviation metric so the colour-mode
+# switch is a geometry swap rather than a recompute. The crown carries whichever
+# metric the current point-cloud deviation mode shows, which keeps it readable
+# against the same legend instead of adding six more entries to the mode list.
+# Drawn as a thin line rather than a tube, like the registered centrelines in
+# label_module: a tube wide enough to see is wide enough to hide the millimetre
+# differences the deviation colours are there to show.
+print("\n--- Building crown line geometry ---")
+CROWN_LINE_WIDTH = 2.5         # px, matches label_module's centrelines
+CROWN_SOLID = "solid"          # key for the non-deviation modes
+
+
+def _crown_lineset(crown, colors):
+    """Polyline through a crown, each segment taking its start station's colour.
+    Segments bridging two parts are skipped, so nothing is drawn across a stretch
+    that was never exposed."""
+    pairs = []
+    for p in range(crown.n_parts):
+        idx = np.where(crown.part == p)[0]
+        pairs.extend(zip(idx[:-1], idx[1:]))
+    if not pairs:
+        return None
+    pts, lines, cols = [], [], []
+    for k, (a, b) in enumerate(pairs):
+        pts.extend([crown.points[a], crown.points[b]])
+        lines.append([2 * k, 2 * k + 1])
+        cols.append(colors[a])
+    ls = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.asarray(pts, dtype=float)),
+        lines=o3d.utility.Vector2iVector(lines))
+    ls.colors = o3d.utility.Vector3dVector(np.asarray(cols, dtype=float))
+    return ls
+
+
+_n_crown_total = 0
+for _ut, _insts in class_instances.items():
+    _ut_col = np.asarray(UTILITY_TYPE_COLORS.get(_ut, [0.5, 0.5, 0.5]), dtype=float)
+    for _i, _inst in enumerate(_insts):
+        _c = _inst["crown"]
+        _inst["crown_linesets"] = {}
+        if not _c.ok:
+            continue
+        _solid = np.tile(_ut_col, (_c.n_stations, 1))
+        _inst["crown_linesets"][CROWN_SOLID] = _crown_lineset(_c, _solid)
+        _n_crown_total += 1
+        if len(_inst["crown_distances"]) != _c.n_stations:
+            continue                      # no LER to compare: solid colour only
+        for _mode, (_vals, _cont) in enumerate((
+                (_inst["crown_distances"], False), (_inst["crown_distances"], True),
+                (_inst["crown_xy"], False), (_inst["crown_xy"], True),
+                (_inst["crown_z"], False), (_inst["crown_z"], True))):
+            _fn = deviation_to_color_continuous if _cont else deviation_to_color
+            _inst["crown_linesets"][_mode] = _crown_lineset(_c, _fn(_vals))
+
+print(f"  {_n_crown_total} crown lines built "
+      f"({sum(len(v) for v in class_instances.values())} instances)")
+
 # Normals for original cloud
 try:
     pcd_orig.estimate_normals(
@@ -1255,8 +1375,8 @@ _LER_MODE_PCD = {
     14: ler_pcd_xydev_klic,   # XY deviation, 2-class KLIC/WIBON pass-fail colours
 }
 _LER_DEV_MODES = tuple(_LER_MODE_PCD)
-# Instance-deviation modes (the measured points themselves are deviation
-# coloured); these are the modes whose instance clouds the trench restricts.
+# Instance-deviation modes: the measured points themselves are deviation
+# coloured, and the crown line carries the same metric.
 _PC_DEV_MODES = (0, 1, 2, 3, 4, 5)
 # Modes that show the discrete accuracy-class heatmap legend (5-class LER scheme)
 _HEATMAP_MODES = (0, 2, 4, 8, 10, 12)
@@ -1300,6 +1420,19 @@ def _srgb_to_linear_arr(c):
 
 def make_mesh_mat(alpha=1.0):
     return mesh_material(alpha)
+
+
+def make_crown_mat():
+    """Thin unlit line for the crown, as label_module draws the registered
+    centrelines. Depth testing is disabled for the same reason it is there: the
+    crown is recovered from the top of the measured cloud and so lies exactly in
+    it, and the points it came from would otherwise swallow the line."""
+    mat = line_material(CROWN_LINE_WIDTH)
+    try:
+        mat.depth_func = "always"
+    except AttributeError:
+        pass                       # older Open3D: the crown depth-tests normally
+    return mat
 
 
 def make_ler_pt_mat(size=6.0, alpha=1.0):
@@ -1526,18 +1659,52 @@ def _update_acc_buffers():
 # Add instance geometries. Visibility is tracked per instance (ut, index) so the
 # utility filter can isolate a single instance; the class checkboxes and the
 # colour-mode switch read the same dict.
+#
+# Type 0 (Unlabeled) has no LER counterpart by definition, so it contributes no
+# deviation and starts hidden; it is still toggleable from the class panel.
+UNLABELED_TYPE = 0
+
 _inst_gnames = []
 _inst_visible = {}
 for ut, instances in class_instances.items():
     for i, inst in enumerate(instances):
         gn = f"inst_{ut}_{i}"
         _inst_gnames.append((ut, i, gn))
-        _inst_visible[(ut, i)] = True
-        # Startup is mode 0 (a deviation mode): inside-trench points get the
-        # deviation colour, outside points keep their original RGB.
-        _init_pcd = _trench_colored_pcd(inst["pcd_dev"], _inst_inside.get((ut, i)),
-                                        np.asarray(inst["pcd_rgb"].colors))
-        scene_widget.scene.add_geometry(gn, _init_pcd, make_pt_mat(4.0))
+        _inst_visible[(ut, i)] = ut != UNLABELED_TYPE
+        # Startup is mode 0, a deviation mode; the cloud carries that colouring
+        # over its whole extent.
+        scene_widget.scene.add_geometry(gn, inst["pcd_dev"], make_pt_mat(4.0))
+        if not _inst_visible[(ut, i)]:
+            scene_widget.scene.show_geometry(gn, False)
+
+# Crown lines, drawn over the instance clouds. Shown by default: the crown line
+# is the headline metric, and it is what the registered geometry is comparable to.
+_crown_show = [True]
+
+
+def _crown_gn(ut, i):
+    return f"crown_{ut}_{i}"
+
+
+def _apply_crown_mode(mode):
+    """(Re)add each crown line with the LineSet matching the current colour mode.
+
+    The crown carries the same metric as the instance points in the point-cloud
+    deviation modes, and the flat class colour everywhere else."""
+    key = mode if mode in _PC_DEV_MODES else CROWN_SOLID
+    for ut, instances in class_instances.items():
+        for i, inst in enumerate(instances):
+            gn = _crown_gn(ut, i)
+            scene_widget.scene.remove_geometry(gn)
+            ls = inst["crown_linesets"].get(key) or inst["crown_linesets"].get(CROWN_SOLID)
+            if ls is None:
+                continue
+            scene_widget.scene.add_geometry(gn, ls, make_crown_mat())
+            scene_widget.scene.show_geometry(
+                gn, _crown_show[0] and _inst_visible.get((ut, i), True))
+
+
+_apply_crown_mode(0)
 
 # Camera
 bounds = scene_widget.scene.bounding_box
@@ -1588,17 +1755,13 @@ def _apply_ler_color_mode(mode):
 def _apply_color_mode(mode):
     _color_mode[0] = mode
     pcd_key = _MODE_INST_PCD[mode]
-    restrict = mode in _PC_DEV_MODES
     for ut, instances in class_instances.items():
         for i, inst in enumerate(instances):
             gn = f"inst_{ut}_{i}"
-            pcd = inst[pcd_key]
-            if restrict:
-                pcd = _trench_colored_pcd(pcd, _inst_inside.get((ut, i)),
-                                          np.asarray(inst["pcd_rgb"].colors))
             scene_widget.scene.remove_geometry(gn)
-            scene_widget.scene.add_geometry(gn, pcd, make_pt_mat(4.0))
+            scene_widget.scene.add_geometry(gn, inst[pcd_key], make_pt_mat(4.0))
             scene_widget.scene.show_geometry(gn, _inst_visible.get((ut, i), True))
+    _apply_crown_mode(mode)
     _apply_ler_color_mode(mode)
     _apply_orig_cloud_mode(mode)
     window.post_redraw()
@@ -1681,6 +1844,25 @@ def _on_orig(c):
 
 orig_cb.set_on_checked(_on_orig)
 panel.add_child(orig_cb)
+
+# Crown line toggle. The count says how many instances yielded one; the rest are
+# shapes the recovery rejected (branches, risers, wells), listed at startup.
+if _n_crown_total:
+    crown_cb = gui.Checkbox(
+        f"Crown line ({_n_crown_total}/{n_inst} instances)")
+    crown_cb.checked = True
+
+    def _on_crown(c):
+        _crown_show[0] = c
+        for _cu, _ci, _ in _inst_gnames:
+            scene_widget.scene.show_geometry(
+                _crown_gn(_cu, _ci), c and _inst_visible.get((_cu, _ci), True))
+        window.post_redraw()
+
+    crown_cb.set_on_checked(_on_crown)
+    panel.add_child(crown_cb)
+else:
+    panel.add_child(gui.Label("Crown line: none recovered"))
 
 # Crop-region toggle (XY AABB + buffer rectangle in rect mode)
 crop_cb = gui.Checkbox("Crop region (XY AABB + buffer)")
@@ -1769,6 +1951,7 @@ def _apply_utility_filter(sel):
             vis = (sel is None or (ut, i) == sel)
             _inst_visible[(ut, i)] = vis
             scene_widget.scene.show_geometry(f"inst_{ut}_{i}", vis)
+            scene_widget.scene.show_geometry(_crown_gn(ut, i), vis and _crown_show[0])
 
     # LER layers: show only those matching the selected instance's type (or all)
     for ln in ler_meshes:
@@ -1985,6 +2168,8 @@ for ut in sorted(class_summaries.keys()):
                 if _u == u:
                     _inst_visible[(_u, _i)] = checked
                     scene_widget.scene.show_geometry(gn, checked)
+                    scene_widget.scene.show_geometry(_crown_gn(_u, _i),
+                                                     checked and _crown_show[0])
             window.post_redraw()
         return _cb
 
@@ -2001,10 +2186,24 @@ for ut in sorted(class_summaries.keys()):
                   if _ler_name != "no LER"
                   else f"{s['label']} (no LER) ({s['n_instances']})")
     cb = gui.Checkbox(_cls_label)
-    cb.checked = True
+    cb.checked = any(_inst_visible[(ut, j)] for j in range(s["n_instances"]))
     cb.set_on_checked(_make_cls_cb(ut))
     _class_checkboxes[ut] = cb
     panel.add_child(make_legend_row(col, cb, em))
+
+    # Crown-line summary under each class: the headline deviation, and the
+    # diameter the circle fits measured (comparable to registered udvendigDiameter).
+    _cr = s["crown"]
+    _dia = s["measured_diameter"]
+    if _cr:
+        panel.add_child(gui.Label(
+            f"     crown: mean {_cr['mean']*1000:.0f} mm, P95 {_cr['p95']*1000:.0f} mm"
+            + (f", D {_dia*1000:.0f} mm" if _dia else "")))
+    elif s["n_crown_lines"]:
+        panel.add_child(gui.Label(
+            f"     crown: {s['n_crown_lines']} line(s), no LER to compare"))
+    else:
+        panel.add_child(gui.Label("     crown: not recoverable"))
     panel.add_fixed(int(0.3 * em))
 
 panel.add_stretch()

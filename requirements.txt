@@ -17,6 +17,8 @@ pyproj==3.7.1          # UTM32 / ETRS89 (EPSG:25832) reprojection
 # ── Numerics & clustering ───────────────────────────────────────────
 numpy==2.2.6
 scikit-learn==1.7.2    # HDBSCAN / DBSCAN instance segmentation
+scipy==1.15.2          # cKDTree (crown, ler_lines), ndimage (crown footprint)
+scikit-image==0.25.2   # skeletonize: plan-view centreline in core/crown.py
 
 # ── Point-cloud format I/O (tools/ply_to_las.py) ────────────────────
 plyfile==1.1

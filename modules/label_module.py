@@ -66,6 +66,7 @@ from core.config import (
     TARGET_CLASS, UTILITY_TO_LER_MATCH, UTILITY_TYPE_COLORS,
     DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
     forsyningsart_color,
+    ler_layers_for_type, trace_forsyningsart, FORSYNINGSART_TO_LINE,
 )
 from core.data_loader import (
     init_site, discover_instances, load_or_pick_ground_level, load_trench,
@@ -73,7 +74,7 @@ from core.data_loader import (
 )
 from core.site_status import (
     LABELED_PREFIX, LABELED_FNAME_RE, ANY_LABELED_FNAME_RE, MATCHES_FILENAME,
-    resolve_labeled_dir, format_label_summary,
+    CONFLICTS_FILENAME, resolve_labeled_dir, format_label_summary,
 )
 from core.gui_helpers import (
     make_legend_row, make_master_pipe_toggle, make_master_comp_toggle,
@@ -255,6 +256,10 @@ INSTANCE_LABEL_OPTIONS = [
 
 _instance_labels = {}
 _instance_ler_match = {}  # idx -> {"layer": str, "gml_id": str} — exclusive LER link
+# idx -> the most recent pick whose LER layer contradicted the instance's label,
+# whether it was refused or deliberately overridden. Persisted next to the
+# matches so a refusal leaves a trace instead of vanishing.
+_instance_match_conflicts = {}
 _current_inst_idx = [0]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1194,6 +1199,9 @@ if _labeled_output_dir and _labeled_output_dir.exists():
         _pidx, _plid = _index_for_fname(_f.name), int(_fm.group(2))
         if _pidx is not None and 1 <= _plid <= len(INSTANCE_LABEL_OPTIONS):
             _instance_labels[_pidx] = INSTANCE_LABEL_OPTIONS[_plid - 1]
+            # Remember the file this label already lives in, so relabelling in a
+            # later session replaces it instead of leaving a second copy.
+            instance_data[_pidx]["saved_as"] = _f
     _n_resumed_matches = _load_matches_json(_labeled_output_dir)
     if _instance_labels or _instance_ler_match:
         print(f"  [resume] {_labeled_output_dir.name}/: {len(_instance_labels)} labels, "
@@ -1315,6 +1323,37 @@ def _write_ler_matches_json():
             json.dump(out, f, indent=2, ensure_ascii=False)
 
 
+def _write_match_conflicts_json():
+    """Persist the refused and overridden picks, keyed by PLY filename.
+
+    Same one-file-per-output-directory rule as the matches, and rewritten in
+    full, so resolving a conflict clears it rather than leaving a stale entry.
+    """
+    by_dir = {}
+    for idx, rec in _instance_match_conflicts.items():
+        if idx not in _instance_labels:
+            continue
+        out_dir = _instance_out_dir(idx)
+        if not out_dir:
+            continue
+        label_id = _LABEL_TO_ID.get(_instance_labels[idx], 0)
+        by_dir.setdefault(out_dir, {})[_instance_fname(idx, label_id)] = rec
+
+    for out_dir in {d for d in map(_instance_out_dir, range(len(instance_data))) if d}:
+        out = by_dir.get(out_dir, {})
+        path = Path(out_dir) / CONFLICTS_FILENAME
+        if not out:
+            if path.is_file():
+                path.unlink()       # last conflict resolved: drop the file
+            continue
+        if out_dir == _labeled_output_dir:
+            _ensure_output_dir()
+        if not path.parent.is_dir():
+            continue
+        with open(str(path), "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2, ensure_ascii=False)
+
+
 def _save_instance_ply(idx, label_name):
     if idx >= len(instance_data) or not _instance_out_dir(idx):
         return
@@ -1328,6 +1367,7 @@ def _save_instance_ply(idx, label_name):
         # deviation_module load the same cloud twice and count it twice.
         out_path = Path(_instance_dir) / fname
         if out_path == inst["path"] and out_path.is_file():
+            inst["saved_as"] = out_path
             _write_ler_matches_json()
             _refresh_window_title()
             return
@@ -1369,10 +1409,21 @@ def _save_instance_ply(idx, label_name):
             parts.append(str(label_id))
             f.write(" ".join(parts) + "\n")
 
-    # A relabelled per-class instance is rewritten under its new type and its
-    # previous file removed, so it keeps exactly one file and the per-point
-    # utility_type inside it (which deviation_module majority-votes) never
-    # disagrees with the type in the name.
+    # Relabelling writes a new filename, so the file written under the previous
+    # type has to go with it. Left behind, deviation_module globs both and counts
+    # the same points twice, in two different utility classes, measured against
+    # two different LER layers.
+    #
+    # Only this instance's own previous save is removed, never a file matched by
+    # name pattern: a hand-split valve can legitimately sit beside its pipe under
+    # the same class and cluster id, distinguished only by the type suffix, and a
+    # pattern-based sweep would delete it.
+    prev = inst.get("saved_as")
+    if prev and prev != out_path and Path(prev).is_file():
+        Path(prev).unlink()
+        print(f"  [replaced] {Path(prev).name}")
+    inst["saved_as"] = out_path
+
     if _is_class_instance(idx):
         old_path = inst["path"]
         if old_path != out_path and old_path.parent == out_path.parent and old_path.is_file():
@@ -1424,14 +1475,31 @@ def _apply_instance_color(idx):
     scene_widget.scene.show_geometry(gn, was_visible)
 
 
+def _label_for_ler_layer(layer_name):
+    """The type label a matched LER layer implies, or None.
+
+    A trace resolves through its forsyningsart, so matching
+    ``Ledningstrace (telekommunikation)`` implies TelecomunicationLine just as
+    ``Telekommunikationsledning`` does. Previously traces mapped to nothing and
+    a match on one left the instance unlabelled.
+    """
+    label_name = _LER_LAYER_TO_LABEL.get(layer_name)
+    if label_name is not None:
+        return label_name
+    fa = trace_forsyningsart(layer_name)
+    if fa:
+        return _LER_LAYER_TO_LABEL.get(FORSYNINGSART_TO_LINE.get(fa))
+    return None
+
+
 def _maybe_autolabel_from_layer(idx, layer_name):
     """When an instance has no type label yet, infer one from the matched LER
-    layer (reverse of UTILITY_TO_LER_MATCH) and save it, so a match recorded on
-    its own still persists a labelled PLY. No-op if the instance is already
-    labelled or the layer has no type mapping (e.g. a Ledningstrace variant)."""
+    layer (reverse of UTILITY_TO_LER_MATCH, traces via forsyningsart) and save
+    it, so a match recorded on its own still persists a labelled PLY. No-op if
+    the instance is already labelled or the layer implies no type."""
     if idx in _instance_labels:
         return
-    label_name = _LER_LAYER_TO_LABEL.get(layer_name)
+    label_name = _label_for_ler_layer(layer_name)
     if label_name is None:
         return
     _instance_labels[idx] = label_name
@@ -1479,6 +1547,18 @@ def _assign_label(label_name):
     idx = _current_inst_idx[0]
     _instance_labels[idx] = label_name
     print(f"  [label] Instance {idx} ({instance_data[idx]['name']}) -> {label_name}")
+    # Relabelling can invalidate a match recorded under the previous label. The
+    # label is the primary datum, so the match yields: it is dropped and logged
+    # rather than left contradicting the label it is stored beside.
+    _existing = _instance_ler_match.get(idx)
+    if (_existing and not _existing.get("no_ler")
+            and _match_conflicts(idx, _existing.get("layer", ""))):
+        _record_match_conflict(idx, _existing.get("layer", ""),
+                               _match_gml_ids(_existing), overridden=False)
+        _instance_ler_match.pop(idx, None)
+        print(f"  [ler-match] cleared: it no longer agrees with {label_name}")
+        _clear_ler_match_highlight()
+        _refresh_ler_match_label(idx)
     _inst_assigned_lbl.text = f"  Label: {label_name}"
     _inst_assigned_lbl.visible = True
     _save_instance_ply(idx, label_name)
@@ -1611,6 +1691,52 @@ def _place_ler_match_highlight(gml_ids):
         scene_widget.scene.add_geometry(LER_MATCH_HIGHLIGHT_GEOM, ls, _highlight_material())
 
 
+# ── Label / match consistency ────────────────────────────────────────────────
+# A match names the registered counterpart of a labelled instance, so the two
+# have to describe the same kind of utility. Nothing enforced this before, and
+# three matches in the dataset ended up contradicting their label. The rule
+# comes from core.config.ler_layers_for_type, the same one the deviation viewer
+# uses to decide which LER layers a type may be measured against, so the two
+# modules cannot drift apart again.
+
+
+def _allowed_layers_for_label(label_name):
+    """Layer keys a labelled instance may match, or None for no restriction.
+
+    None means the label carries no LER mapping (an unlabelled instance, or a
+    class the register has no counterpart layer for), in which case any pick is
+    accepted and the label is inferred from it instead.
+    """
+    if not label_name:
+        return None
+    return ler_layers_for_type(_LABEL_TO_ID.get(label_name),
+                               set(pick_seg_layer))
+
+
+def _match_conflicts(idx, layer_name):
+    """True when ``layer_name`` contradicts the instance's current label."""
+    allowed = _allowed_layers_for_label(_instance_labels.get(idx))
+    return allowed is not None and layer_name not in allowed
+
+
+def _record_match_conflict(idx, layer_name, gml_ids, overridden):
+    """Log a conflicting pick so a refusal is never silently lost.
+
+    Refused picks land here only; an overridden one is also written into the
+    match itself, so the deviation viewer and pipeline_status can count it.
+    """
+    label = _instance_labels.get(idx, "(unlabelled)")
+    rec = {"label": label, "layer": layer_name,
+           "gml_ids": list(gml_ids), "overridden": bool(overridden)}
+    _instance_match_conflicts[idx] = rec
+    verb = "overridden" if overridden else "refused"
+    print(f"  [ler-match] {verb}: instance {idx} "
+          f"({instance_data[idx]['name']}) is labelled {label}, but "
+          f"{layer_display_name(layer_name)} belongs to another utility type."
+          + ("" if overridden else "  Ctrl+click to record it anyway."))
+    _write_match_conflicts_json()
+
+
 def _match_gml_ids(match):
     """The features a stored match covers, newest key first so a record written
     before utility lines existed still resolves."""
@@ -1633,9 +1759,17 @@ def _refresh_ler_match_label(idx):
         gid = m.get("line_id") or m.get("gml_id", "")
         gid_short = gid[-28:] if len(gid) > 28 else gid
         extent = f" (line, {len(ids)} features)" if len(ids) > 1 else ""
+        flag = "  [CONFLICTS WITH LABEL]" if m.get("conflict") else ""
         _ler_match_lbl.text = (f"LER match: {layer_display_name(m['layer'])}{extent}"
-                               f"\n({gid_short})")
-        _ler_match_lbl.text_color = gui.Color(0.3, 1.0, 1.0, 1.0)
+                               f"{flag}\n({gid_short})")
+        _ler_match_lbl.text_color = (gui.Color(1.0, 0.4, 0.4, 1.0) if m.get("conflict")
+                                     else gui.Color(0.3, 1.0, 1.0, 1.0))
+    elif idx in _instance_match_conflicts:
+        _rec = _instance_match_conflicts[idx]
+        _ler_match_lbl.text = (f"LER match: refused "
+                               f"{layer_display_name(_rec['layer'])}"
+                               f"\ndoes not match {_rec['label']}")
+        _ler_match_lbl.text_color = gui.Color(1.0, 0.4, 0.4, 1.0)
     else:
         _ler_match_lbl.text = "LER match: none (click a line)"
         _ler_match_lbl.text_color = gui.Color(0.6, 0.6, 0.6, 1.0)
@@ -1658,10 +1792,14 @@ def _clear_ler_match():
     idx = _current_inst_idx[0]
     if idx in _instance_ler_match:
         del _instance_ler_match[idx]
+    # Clearing the match clears the refusal with it, so the panel does not keep
+    # reporting a conflict the user has just walked away from.
+    _instance_match_conflicts.pop(idx, None)
     _refresh_ler_match_label(idx)
     _clear_ler_match_highlight()
     _clear_suggestion_highlight()
     _write_ler_matches_json()
+    _write_match_conflicts_json()
     window.post_redraw()
 
 
@@ -1718,12 +1856,11 @@ def _suggest_ler_match():
     pts = np.asarray(inst["pcd"].points)
     colors = np.asarray(inst["pcd"].colors) if inst["pcd"].has_colors() else None
 
-    allowed_layers = None
-    label_name = _instance_labels.get(idx)
-    if label_name:
-        match_cfg = UTILITY_TO_LER_MATCH.get(_LABEL_TO_ID.get(label_name))
-        if match_cfg:
-            allowed_layers = match_cfg["layers"]
+    # Restricted through the shared rule, so a Ledningstrace whose forsyningsart
+    # matches the label is offered alongside the utility's own line layer. The
+    # bare UTILITY_TO_LER_MATCH layer set used to exclude every trace, which is
+    # why no trace could ever be suggested for a labelled instance.
+    allowed_layers = _allowed_layers_for_label(_instance_labels.get(idx))
 
     # Scored per utility line, not per feature, so a suggestion covers the whole
     # run instead of whichever fragment happens to sit nearest the instance.
@@ -1747,6 +1884,12 @@ def _accept_suggestion():
         return
     c = cands[_suggestion_state["idx"]]
     idx = _current_inst_idx[0]
+    # Suggestions are already restricted to the label's allowed layers, so this
+    # can only fire for an unlabelled instance whose label arrived in between.
+    if _match_conflicts(idx, c["layer"]):
+        _record_match_conflict(idx, c["layer"], c["gml_ids"], overridden=False)
+        return
+    _instance_match_conflicts.pop(idx, None)
     # Candidates come from the line-merged index, so gml_id is the line_id and
     # gml_ids are the features it covers.
     _instance_ler_match[idx] = {"layer": c["layer"], "gml_id": c["gml_ids"][0],
@@ -1759,11 +1902,13 @@ def _accept_suggestion():
     _place_ler_match_highlight(c["gml_ids"])
     _clear_suggestion_highlight()
     _write_ler_matches_json()
+    _write_match_conflicts_json()
     window.post_redraw()
 
 
 _ler_last_click = [None]
 _ler_last_click_shift = [False]   # shift held: adjust the link, do not replace it
+_ler_last_click_ctrl = [False]    # ctrl held: record a match that contradicts the label
 
 
 def _do_pick_ler(depth_image):
@@ -1800,6 +1945,21 @@ def _do_pick_ler(depth_image):
     layer_name = pick_seg_layer[best_i]
     gml_id = pick_seg_gml_id[best_i]
 
+    # A pick that contradicts the label is refused, because the deviation viewer
+    # trusts the match without rechecking it. Ctrl+click records it anyway and
+    # flags it, for the case where the register genuinely disagrees with the
+    # trench and the disagreement is the finding.
+    conflict = _match_conflicts(idx, layer_name)
+    if conflict:
+        overridden = _ler_last_click_ctrl[0]
+        _record_match_conflict(idx, layer_name, _line_gml_ids(gml_id), overridden)
+        if not overridden:
+            return
+    elif idx in _instance_match_conflicts:
+        # A consistent pick supersedes the recorded conflict for this instance.
+        _instance_match_conflicts.pop(idx, None)
+        _write_match_conflicts_json()
+
     if _ler_last_click_shift[0]:
         # Shift-click adjusts the current link one feature at a time, for the
         # cases the automatic grouping gets wrong: a run the registry leaves a
@@ -1832,12 +1992,20 @@ def _do_pick_ler(depth_image):
               f"-> {layer_name}  line={_line_of.get(gml_id, gml_id)} "
               f"({len(ids)} feature(s), clicked {gml_id})")
 
+    # An overridden match carries the conflict with it, so the deviation viewer
+    # and pipeline_status can count register disagreements rather than treating
+    # the link as an ordinary one.
+    if conflict and idx in _instance_ler_match:
+        _instance_ler_match[idx]["conflict"] = True
+        _instance_ler_match[idx]["label_at_match"] = _instance_labels.get(idx)
+
     def _update():
         _maybe_autolabel_from_layer(idx, layer_name)
         _place_ler_match_highlight(_match_gml_ids(_instance_ler_match.get(idx)))
         _clear_suggestion_highlight()
         _refresh_ler_match_label(idx)
         _write_ler_matches_json()
+        _write_match_conflicts_json()
         window.post_redraw()
     gui.Application.instance.post_to_main_thread(window, _update)
 
@@ -1879,8 +2047,10 @@ def _on_mouse_ler(event):
         _ler_last_click[0] = click_pos
         try:
             _ler_last_click_shift[0] = event.is_modifier_down(gui.KeyModifier.SHIFT)
+            _ler_last_click_ctrl[0] = event.is_modifier_down(gui.KeyModifier.CTRL)
         except AttributeError:
             _ler_last_click_shift[0] = False
+            _ler_last_click_ctrl[0] = False
         scene_widget.scene.scene.render_to_depth_image(_do_pick_ler)
         # HANDLED so Open3D does not also pan/translate the view on this click
         return gui.Widget.EventCallbackResult.HANDLED

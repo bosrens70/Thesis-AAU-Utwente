@@ -548,3 +548,56 @@ UTILITY_TO_LER_MATCH = {
     9: {"layers": {"AndenLedning"}},
     10: {"layers": {"LedningUkendtForsyningsart"}},
 }
+
+# Base GML layer name of a trace. The viewers store one mesh group per
+# forsyningsart under a compound key, "Ledningstrace (vand)", so any code that
+# has to recognise a trace from its storage key tests this prefix.
+LEDNINGSTRACE_LAYER = "Ledningstrace"
+
+
+def trace_forsyningsart(layer_key):
+    """The forsyningsart carried by a Ledningstrace storage key, lowercased.
+
+    ``"Ledningstrace (Vand)"`` gives ``"vand"``. A trace recorded without a
+    forsyningsart gives ``""``, and a key that is not a trace at all gives
+    ``None``, so the return value doubles as the is-a-trace test.
+    """
+    key = str(layer_key)
+    if not key.startswith(LEDNINGSTRACE_LAYER):
+        return None
+    if "(" not in key:
+        return ""
+    return key.split("(")[-1].rstrip(")").strip().lower()
+
+
+def ler_layers_for_type(utility_type, available_layers=(), *,
+                        include_components=False):
+    """The LER layers a given utility type may legitimately be matched against.
+
+    A type maps to its own line layer through UTILITY_TO_LER_MATCH, but a trace
+    is registered under a layer of its own, so ``Ledningstrace (telekommunikation)``
+    is just as valid a counterpart for a telecom instance as
+    ``Telekommunikationsledning`` is. This resolves both, plus optionally the
+    component layers belonging to those lines, against the layer names actually
+    present in ``available_layers``.
+
+    Returns ``None`` when the type carries no mapping at all (an unlabelled
+    instance), which the callers read as "no restriction" rather than "nothing
+    matches". Callers that instead want an empty set there must handle the
+    ``None`` themselves.
+    """
+    match = UTILITY_TO_LER_MATCH.get(utility_type)
+    if match is None:
+        return None
+    line_layers = set(match["layers"])
+    comp_layers = ({c for c, parent in COMP_TO_LINE.items() if parent in line_layers}
+                   if include_components else set())
+    allowed = set()
+    for name in available_layers:
+        if name in line_layers or name in comp_layers:
+            allowed.add(name)
+            continue
+        fa = trace_forsyningsart(name)
+        if fa and FORSYNINGSART_TO_LINE.get(fa) in line_layers:
+            allowed.add(name)
+    return allowed
