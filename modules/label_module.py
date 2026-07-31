@@ -1437,6 +1437,14 @@ def _save_instance_ply(idx, label_name):
     _refresh_window_title()
 
 
+def _instance_confirmed(idx):
+    """True when both halves of an instance are decided: a type label and an LER
+    link. "Not in LER" counts as decided; it is a confirmed answer about the
+    register, not a missing one. A refused pick does not: it lives in
+    _instance_match_conflicts, and the instance still has no link."""
+    return idx in _instance_labels and idx in _instance_ler_match
+
+
 def _check_all_labeled():
     """Show the completion message once every instance carries a label. Shared by
     the label, autolabel, and startup paths so the message is consistent."""
@@ -1563,22 +1571,30 @@ def _assign_label(label_name):
     _inst_assigned_lbl.visible = True
     _save_instance_ply(idx, label_name)
     _apply_instance_color(idx)
-    # Advance to next unlabeled instance, or next instance if all labeled
-    next_idx = None
-    for i in range(idx + 1, len(instance_data)):
-        if i not in _instance_labels:
-            next_idx = i
-            break
-    if next_idx is None:
-        for i in range(0, idx):
+    # Move on only once this instance is finished. A label on its own leaves the
+    # LER link undecided, and advancing there made it easy to label a whole set
+    # and match none of it. Confirming the link does not advance either: a pick
+    # is often corrected by clicking a different line, and shift+click adjusts
+    # the link one feature at a time, so the view has to stay where it is.
+    # Prev / Skip / Next remain the way to move by hand.
+    if _instance_confirmed(idx):
+        next_idx = None
+        for i in range(idx + 1, len(instance_data)):
             if i not in _instance_labels:
                 next_idx = i
                 break
-    if next_idx is not None:
-        _current_inst_idx[0] = next_idx
-        _show_instance(next_idx)
+        if next_idx is None:
+            for i in range(0, idx):
+                if i not in _instance_labels:
+                    next_idx = i
+                    break
+        if next_idx is not None:
+            _current_inst_idx[0] = next_idx
+            _show_instance(next_idx)
     else:
-        _check_all_labeled()
+        print(f"  [label] staying on instance {idx}: LER match not confirmed yet"
+              f"  (click a line, 'Suggest LER match', or 'Mark as NOT in LER')")
+    _check_all_labeled()
     window.set_needs_layout()
     window.post_redraw()
 
