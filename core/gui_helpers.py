@@ -98,6 +98,136 @@ def make_legend_row(color, widget, em, *, srgb_convert=True):
     return row
 
 
+# ── Fitting panel text to the panel width ────────────────────────────────────
+# Open3D labels, checkboxes and comboboxes neither wrap nor clip: a string wider
+# than its panel is drawn straight past the edge, over the 3D scene. Any text
+# built from data (a class name, a list of matched LER layers, a station count)
+# therefore has to be measured against the real panel width rather than assumed
+# short, because how long it gets depends on the site.
+#
+# Text can only be measured through Widget.calc_preferred_size, which needs a
+# gui.LayoutContext, and the one place a LayoutContext exists is the window's
+# layout callback. So the fitting cannot happen while the panel is being built:
+# widgets are registered with a PanelTextFitter there and filled in on the first
+# layout pass, before anything is drawn.
+TEXT_ELLIPSIS = "..."
+
+
+def _shorten_to_fit(text, max_width, measure):
+    """Longest prefix of *text*, ellipsis included, that ``measure`` fits."""
+    if measure(text) <= max_width:
+        return text
+    lo, hi, best = 0, len(text), TEXT_ELLIPSIS
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = text[:mid].rstrip() + TEXT_ELLIPSIS
+        if measure(candidate) <= max_width:
+            best, lo = candidate, mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def fit_widget_text(widget, text, max_width, ctx):
+    """Give *widget* as much of *text* as fits ``max_width`` pixels.
+
+    The full string stays reachable in the widget's tooltip whenever it had to
+    be shortened, so nothing is lost, only moved out of the way.
+
+    Parameters
+    ----------
+    widget : gui.Widget
+        A widget with a settable ``text`` property. In practice ``gui.Label``:
+        a ``gui.Checkbox`` takes its text in the constructor and exposes no way
+        to change it, so a checkbox has to be built with text short enough to
+        fit and cannot be measured at all.
+    max_width : int
+        Pixel budget, e.g. from :func:`legend_text_width`.
+    ctx : gui.LayoutContext
+        The context handed to the window's layout callback.
+
+    Returns
+    -------
+    gui.Widget
+        The same widget.
+    """
+    constraints = gui.Widget.Constraints()
+
+    def measure(candidate):
+        widget.text = candidate
+        return widget.calc_preferred_size(ctx, constraints).width
+
+    fitted = _shorten_to_fit(text, max_width, measure)
+    widget.text = fitted
+    if fitted != text:
+        widget.tooltip = text
+    return widget
+
+
+def fit_text(text, max_width, ctx):
+    """The same shortening for a string with no widget of its own, such as a
+    ``gui.Combobox`` item. Measured on a throwaway label, so the caller has to
+    leave room for whatever chrome the real widget adds around the text."""
+    probe = gui.Label("")
+    constraints = gui.Widget.Constraints()
+
+    def measure(candidate):
+        probe.text = candidate
+        return probe.calc_preferred_size(ctx, constraints).width
+
+    return _shorten_to_fit(text, max_width, measure)
+
+
+class PanelTextFitter:
+    """Panel text to be measured and shortened on the first layout pass.
+
+    Widgets are built with empty text, registered here, and filled in from
+    :meth:`apply`, which the window's layout callback calls. Fitting once is
+    enough while the panel keeps a fixed width; a callback that resizes the
+    panel passes ``force=True``.
+
+    Usage
+    -----
+        fitter = PanelTextFitter()
+        panel.add_child(fitter.add(gui.Label(""), long_text, text_width))
+
+        def on_layout(ctx):
+            fitter.apply(ctx)
+            ...
+    """
+
+    def __init__(self):
+        self._widgets = []      # (widget, full_text, max_width)
+        self._combos = []       # (combo, [full_text, ...], max_width)
+        self._applied = False
+
+    def add(self, widget, text, max_width):
+        """Register a ``gui.Label``; returns it, so it can be added to its
+        container in the same expression. Not usable for a ``gui.Checkbox``,
+        whose text is fixed at construction (see :func:`fit_widget_text`)."""
+        self._widgets.append((widget, text, max_width))
+        return widget
+
+    def add_combo(self, combo, texts, max_width):
+        """Register a ``gui.Combobox`` whose items are already added in full. The
+        items are rewritten in place, so an index into them keeps meaning what it
+        did and the caller's selection logic is unaffected."""
+        self._combos.append((combo, list(texts), max_width))
+        return combo
+
+    def apply(self, ctx, *, force=False):
+        if self._applied and not force:
+            return
+        self._applied = True
+        for widget, text, max_width in self._widgets:
+            fit_widget_text(widget, text, max_width, ctx)
+        for combo, texts, max_width in self._combos:
+            selected = combo.selected_index
+            for i, text in enumerate(texts):
+                combo.change_item(i, fit_text(text, max_width, ctx))
+            combo.selected_index = selected
+
+
 # ── Master toggle helpers for "All segments" / "All components" ───────────────
 
 def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,

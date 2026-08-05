@@ -84,6 +84,7 @@ from core.depth import (clean_coords_with_depth as _core_clean_coords,
                         MAX_DEPTH_BELOW_GROUND)
 from core.gui_helpers import (
     make_legend_row, LerLegendSection,
+    PanelTextFitter,
     pivot_oblique, top_view, trench_or_scene_frame,
 )
 from core.ledningstrace import get_bredde_width, is_trace_key, ribbon_alpha
@@ -1897,7 +1898,18 @@ def _apply_color_mode(mode):
 # 8.  Right panel
 # ─────────────────────────────────────────────────────────────────────────────
 PANEL_WIDTH = int(PANEL_WIDTH_EM * em)
-panel = gui.Vert(int(0.5 * em), gui.Margins(int(em), int(em), int(em), int(em)))
+PANEL_MARGIN_EM = 1.0
+panel = gui.Vert(int(0.5 * em), gui.Margins(int(PANEL_MARGIN_EM * em), int(PANEL_MARGIN_EM * em),
+                                            int(PANEL_MARGIN_EM * em), int(PANEL_MARGIN_EM * em)))
+
+# Pixel budgets for panel text that is built from data and so has no bounded
+# length: a crown summary, the list of LER layers an instance matched.
+# _panel_fitter shortens each to its budget on the first layout pass, with the
+# full string kept in the tooltip.
+_TEXT_W_PLAIN = PANEL_WIDTH - int(2 * PANEL_MARGIN_EM * em)
+# A combobox draws its own frame and drop-down arrow around the item text.
+_TEXT_W_COMBO = _TEXT_W_PLAIN - int(2.5 * em)
+_panel_fitter = PanelTextFitter()
 
 panel.add_child(gui.Label(f"Original: {len(pts_orig):,} pts"))
 total_inst = sum(inst["stats"]["n_pts"] for v in class_instances.values() for inst in v)
@@ -2073,9 +2085,14 @@ _active_filter = [None]   # None = show all
 _class_checkboxes = {}
 
 filter_combo = gui.Combobox()
+# The LER suffix lists every matched layer, traces included, so an entry can run
+# several times the panel width. Items are shortened to fit; _filter_entries
+# keeps the full text, which the tooltip shows for whichever is selected.
 for _flbl, _ in _filter_entries:
     filter_combo.add_item(_flbl)
 filter_combo.selected_index = 0
+filter_combo.tooltip = _filter_entries[0][0]
+_panel_fitter.add_combo(filter_combo, [_l for _l, _ in _filter_entries], _TEXT_W_COMBO)
 
 
 def _apply_utility_filter(sel):
@@ -2124,7 +2141,8 @@ def _apply_utility_filter(sel):
 
 
 def _on_filter(val, idx):
-    _, sel = _filter_entries[idx]
+    _full, sel = _filter_entries[idx]
+    filter_combo.tooltip = _full
     _apply_utility_filter(sel)
 
 
@@ -2315,37 +2333,36 @@ for ut in sorted(class_summaries.keys()):
             window.post_redraw()
         return _cb
 
-    _match = UTILITY_TO_LER_MATCH.get(ut)
-    if _match:
-        _ler_layers = _match["layers"]
-        if _ler_layers:
-            _ler_name = sorted(_ler_layers)[0]
-        else:
-            _ler_name = "no LER"
-    else:
-        _ler_name = "no LER"
-    _cls_label = (f"{s['label']} -> {layer_display_name(_ler_name)} ({s['n_instances']})"
-                  if _ler_name != "no LER"
-                  else f"{s['label']} (no LER) ({s['n_instances']})")
-    cb = gui.Checkbox(_cls_label)
+    # Which LER layer a class is reconciled against is fixed by
+    # UTILITY_TO_LER_MATCH, so naming it here would only repeat the class name.
+    # Name and count alone also keep the row inside the panel: a checkbox takes
+    # its text in the constructor and Open3D exposes no way to change it later,
+    # so this text cannot be measured and has to be short by construction. The
+    # longest it can get is the longest UTILITY_TYPE_LABELS entry, which is fixed
+    # in config, not data-driven.
+    cb = gui.Checkbox(f"{s['label']} ({s['n_instances']})")
     cb.checked = any(_inst_visible[(ut, j)] for j in range(s["n_instances"]))
     cb.set_on_checked(_make_cls_cb(ut))
     _class_checkboxes[ut] = cb
     panel.add_child(make_legend_row(col, cb, em))
 
-    # Crown-line summary under each class: the headline deviation, and the
-    # diameter the circle fits measured (comparable to registered udvendigDiameter).
+    # Detail lines under each class: whether the register holds a counterpart at
+    # all (which varies per package, unlike the layer mapping), the headline
+    # crown deviation, and the diameter the circle fits measured (comparable to
+    # registered udvendigDiameter). Labels, so these can be measured and fitted.
     _cr = s["crown"]
     _dia = s["measured_diameter"]
+    _rows = [] if s["has_ler"] else ["  no LER counterpart"]
     if _cr:
-        panel.add_child(gui.Label(
-            f"     crown: mean {_cr['mean']*1000:.0f} mm, P95 {_cr['p95']*1000:.0f} mm"
-            + (f", D {_dia*1000:.0f} mm" if _dia else "")))
+        _rows.append(f"  crown: mean {_cr['mean']*1000:.0f}, P95 {_cr['p95']*1000:.0f} mm")
+        if _dia:
+            _rows.append(f"  measured D: {_dia*1000:.0f} mm")
     elif s["n_crown_lines"]:
-        panel.add_child(gui.Label(
-            f"     crown: {s['n_crown_lines']} line(s), no LER to compare"))
+        _rows.append(f"  crown: {s['n_crown_lines']} line(s), not compared")
     else:
-        panel.add_child(gui.Label("     crown: not recoverable"))
+        _rows.append("  crown: not recoverable")
+    for _row_txt in _rows:
+        panel.add_child(_panel_fitter.add(gui.Label(""), _row_txt, _TEXT_W_PLAIN))
     panel.add_fixed(int(0.3 * em))
 
 panel.add_stretch()
@@ -2388,6 +2405,9 @@ scene_widget.set_on_key(on_key)
 
 
 def on_layout(ctx):
+    # Only place a LayoutContext exists, so the only place panel text can be
+    # measured. Runs before the first draw, so nothing overflowing is shown.
+    _panel_fitter.apply(ctx)
     r = window.content_rect
     scene_widget.frame = gui.Rect(r.x, r.y, r.width - PANEL_WIDTH, r.height)
     panel.frame = gui.Rect(r.x + r.width - PANEL_WIDTH, r.y, PANEL_WIDTH, r.height)
