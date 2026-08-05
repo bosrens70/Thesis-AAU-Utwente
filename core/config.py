@@ -387,12 +387,15 @@ SIGNATURE_HAZARD_COLOR    = [0.80, 0.0, 0.0]   # linear red (legend triangles)
 # DEVIATION HEATMAP
 # ─────────────────────────────────────────────────────────────────────────────
 DEVIATION_THRESHOLDS = [0.00, 0.25, 0.50, 1.00, 2.00]
+# The five-class palette of the whole project: a measured deviation binned into
+# these classes and a registered accuracy class (ACCURACY_CLASS_COLORS below)
+# share it, so a colour always means the same class bound wherever it appears.
 DEVIATION_COLORS = [
-    [0.0, 0.7, 0.2],   # Class 1: <= 0.25 m - green
-    [0.6, 0.9, 0.0],   # Class 2: <= 0.50 m - yellow-green
-    [1.0, 0.8, 0.0],   # Class 3: <= 1.00 m - yellow
-    [1.0, 0.4, 0.0],   # Class 4: <= 2.00 m - orange
-    [0.8, 0.0, 0.0],   # Class 5: > 2.00 m  - red
+    [0.00, 0.70, 0.20],   # Class 1: <= 0.25 m - green
+    [1.00, 0.95, 0.00],   # Class 2: <= 0.50 m - yellow
+    [1.00, 0.25, 0.00],   # Class 3: <= 1.00 m - orange
+    [0.60, 0.00, 0.00],   # Class 4: <= 2.00 m - dark red
+    [0.55, 0.15, 0.75],   # Class 5: > 2.00 m  - purple
 ]
 
 DEVIATION_CLASS_LABELS = [
@@ -412,8 +415,9 @@ DEVIATION_GRADIENT_TICKS = [0.00, 0.25, 0.50, 0.75, 1.00, 1.50, 2.00]
 # mode, matching Dutch KLIC/WIBON excavation practice: a 1 m horizontal
 # deviation is treated as a single pass/fail threshold rather than a graded
 # accuracy scale (see the WIBON minimum-tolerance discussion in the thesis
-# background chapter). Reuses the same green/red as classes 1 and 5 of
-# DEVIATION_COLORS for visual consistency with the 5-class scheme.
+# background chapter). Its own pass/fail pair, not two colours borrowed from
+# DEVIATION_COLORS: green/red carries "within tolerance" directly, which a rank
+# on a five-class scale does not.
 KLIC_XY_THRESHOLDS = [0.00, 1.00]
 KLIC_XY_COLORS = [
     [0.0, 0.7, 0.2],   # Class 1: <= 1.00 m - green (within KLIC tolerance)
@@ -436,10 +440,17 @@ ACCURACY_CLASS_FIELD = "noejagtighedsklasse"
 # registered upper bound. A display convention only, not a registered value.
 ACCURACY_OPEN_CLASS_WIDTH = 2.00
 
+# Display colours for the five registered classes. Deliberately the same palette
+# as the deviation classes: the bounds are identical, so a colour reads as one
+# class throughout. Named separately because the two are different quantities (a
+# registered claim, not a measured deviation), and only the legend header and the
+# colour mode say which is on screen. Give this its own list to break the tie.
+ACCURACY_CLASS_COLORS = DEVIATION_COLORS
+
 # Colour for a feature that registers no usable accuracy class, used wherever
-# geometry is painted by class (DEVIATION_COLORS gives the five classes). Kept
-# distinct from every class colour: an unregistered class is missing data, not a
-# coarse one, and how often it happens is itself a result.
+# geometry is painted by class (ACCURACY_CLASS_COLORS gives the five classes).
+# Kept distinct from every class colour: an unregistered class is missing data,
+# not a coarse one, and how often it happens is itself a result.
 ACCURACY_UNREGISTERED_COLOR = [0.55, 0.55, 0.55]
 ACCURACY_UNREGISTERED_LABEL = "not registered"
 
@@ -447,8 +458,8 @@ ACCURACY_UNREGISTERED_LABEL = "not registered"
 def accuracy_class_color(class_idx):
     """Display colour for a registered accuracy class index (1..5), or the
     unregistered grey for 0 / None / anything outside that range."""
-    if class_idx and 1 <= int(class_idx) <= len(DEVIATION_COLORS):
-        return DEVIATION_COLORS[int(class_idx) - 1]
+    if class_idx and 1 <= int(class_idx) <= len(ACCURACY_CLASS_COLORS):
+        return ACCURACY_CLASS_COLORS[int(class_idx) - 1]
     return ACCURACY_UNREGISTERED_COLOR
 
 

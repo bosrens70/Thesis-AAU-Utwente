@@ -55,7 +55,7 @@ from core.config import (
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
     DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
     DEVIATION_GRADIENT_TICKS,
-    ACCURACY_UNREGISTERED_COLOR, ACCURACY_UNREGISTERED_LABEL,
+    ACCURACY_CLASS_COLORS, ACCURACY_UNREGISTERED_COLOR, ACCURACY_UNREGISTERED_LABEL,
     accuracy_class_color,
     KLIC_XY_THRESHOLDS, KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS,
     FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
@@ -586,7 +586,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
         if tol is None:
             continue                      # in view but accuracy class not registered
         half_width, cls_idx = tol
-        color = DEVIATION_COLORS[cls_idx - 1]
+        color = ACCURACY_CLASS_COLORS[cls_idx - 1]
         # Drape the flat buffer onto the utility's depth profile: each buffer
         # vertex takes the Z of the nearest point on the registered centerline.
         _lines_xyz = local_lines_xyz
@@ -1933,14 +1933,15 @@ for _tick_m, _col in zip(_grad_ticks_m, _grad_tick_cols):
     _gradient_legend.add_child(make_legend_row(_col, gui.Label(_lbl), em))
 _gradient_legend.visible = False
 
-# Registered accuracy class legend (ACC_CLASS_MODE). Same five colours as the
-# heatmap above, so the header has to say which of the two is on screen: here
-# they are the class LER registers for its own geometry, not a measured
-# deviation. The count is of features within the view, components included.
+# Registered accuracy class legend (ACC_CLASS_MODE). Same five colours and
+# bounds as the heatmap above, so the header has to say which of the two is on
+# screen: here they are the class LER registers for its own geometry, not a
+# measured deviation. The count is of features within the view, components
+# included.
 _acc_class_legend = gui.Vert(0)
 _acc_class_legend.add_child(gui.Label(
     f"Registered accuracy class ({_acc_view_reg}/{_acc_view_total}):"))
-for _col, _lbl in zip(DEVIATION_COLORS, DEVIATION_CLASS_LABELS):
+for _col, _lbl in zip(ACCURACY_CLASS_COLORS, DEVIATION_CLASS_LABELS):
     _acc_class_legend.add_child(make_legend_row(_col, gui.Label(_lbl), em))
 _acc_class_legend.add_child(make_legend_row(
     ACCURACY_UNREGISTERED_COLOR, gui.Label(ACCURACY_UNREGISTERED_LABEL), em))
