@@ -432,6 +432,7 @@ if n_total_segs == 0:
 print("\n--- Loading LER utility components within bbox ---")
 comp_meshes = {}        # layer_name -> merged TriangleMesh
 comp_meshes_acc = {}    # layer_name -> same mesh, painted by registered accuracy class
+comp_meshes_flat = {}   # layer_name -> same mesh, centres moved to street level
 comp_stats = {}         # layer_name -> int count
 _comp_acc_cov_rows = [] # (layer, has_column, n_registered_total, n_total)
 
@@ -446,6 +447,7 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
     color = comp_cfg["color"]
     n_comp = 0
     spheres = []
+    spheres_flat = []   # same spheres, centres at street level (_FLAT_LER_MODES)
     comp_acc = []       # (n_vertices, class_idx) per sphere, in merge order
 
     parent_line = COMP_TO_LINE.get(comp_layer)
@@ -474,6 +476,11 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         sphere.translate(pt)
         sphere.paint_uniform_color(color)
         spheres.append(sphere)
+        # Twin for the modes that draw the register flat. A translation, not a
+        # flattening: the component keeps its shape, only its centre moves.
+        _flat = copy.deepcopy(sphere)
+        _flat.translate([0.0, 0.0, GROUND_Z - pt[2]])
+        spheres_flat.append(_flat)
         _tol_c = feature_accuracy_tolerance(row)
         _cls_c = _tol_c[1] if _tol_c is not None else 0
         comp_acc.append((len(sphere.vertices), _cls_c))
@@ -492,6 +499,11 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         _m_acc = _acc_colored_mesh(m, comp_acc)
         if _m_acc is not None:
             comp_meshes_acc[comp_layer] = _m_acc
+        _mf = spheres_flat[0]
+        for s in spheres_flat[1:]:
+            _mf += s
+        _mf.compute_vertex_normals()
+        comp_meshes_flat[comp_layer] = _mf
     if n_comp > 0:
         print(f"  {comp_layer:<35} {n_comp:>4} components")
 
@@ -1314,11 +1326,19 @@ for ln in ler_meshes:
     samp_pts = np.concatenate(samp_chunks)
     _n_samples_total += len(samp_pts)
 
-    def _make_pc(color_chunks):
+    def _make_pc(color_chunks, pts=None):
         pc = o3d.geometry.PointCloud()
-        pc.points = o3d.utility.Vector3dVector(samp_pts)
+        pc.points = o3d.utility.Vector3dVector(samp_pts if pts is None else pts)
         pc.colors = o3d.utility.Vector3dVector(np.concatenate(color_chunks))
         return pc
+
+    # The KLIC cloud is drawn flat at street level (_FLAT_LER_MODES): KLIC
+    # registers no depth, so any depth on screen there would be the Danish
+    # register's, read as a claim KLIC does not make. Display only. The
+    # deviations were measured from the registered samples above and the LAS
+    # export reads those, so no number changes.
+    _samp_flat = samp_pts.copy()
+    _samp_flat[:, 2] = GROUND_Z
 
     ler_pcd_dev[ln] = _make_pc(col_chunks)
     ler_pcd_dev_cont[ln] = _make_pc(col_cont_chunks)
@@ -1326,7 +1346,7 @@ for ln in ler_meshes:
     ler_pcd_zdev_cont[ln] = _make_pc(zcol_cont_chunks)
     ler_pcd_xydev[ln] = _make_pc(xycol_chunks)
     ler_pcd_xydev_cont[ln] = _make_pc(xycol_cont_chunks)
-    ler_pcd_xydev_klic[ln] = _make_pc(xycol_klic_chunks)
+    ler_pcd_xydev_klic[ln] = _make_pc(xycol_klic_chunks, _samp_flat)
     ler_raw_xyz[ln] = np.concatenate(dev_chunks)
     ler_raw_xy[ln] = np.concatenate(xydev_chunks)
     ler_raw_z[ln] = np.concatenate(zdev_chunks)
@@ -1470,6 +1490,11 @@ _HEATMAP_MODES = (0, 2, 4, 9, 11, 13)
 _GRADIENT_MODES = (1, 3, 5, 10, 12, 14)
 # Modes that show the 2-class KLIC/WIBON pass-fail legend
 _KLIC_MODES = (15,)
+# Modes that draw the registered geometry flat at street level. KLIC/WIBON
+# registers no depth, so the only depth available to draw is the Danish
+# register's, which in a KLIC comparison would read as a claim KLIC does not
+# make. Separate from _KLIC_MODES, which is about the legend, not the geometry.
+_FLAT_LER_MODES = (15,)
 
 app = gui.Application.instance
 app.initialize()
@@ -1637,8 +1662,16 @@ def _solid_ler_mesh(ln):
     return ler_meshes_acc.get(ln, ler_meshes[ln]) if _acc_class_active() else ler_meshes[ln]
 
 
+def _flat_ler_active():
+    return _color_mode[0] in _FLAT_LER_MODES
+
+
 def _solid_comp_mesh(ln):
-    return comp_meshes_acc.get(ln, comp_meshes[ln]) if _acc_class_active() else comp_meshes[ln]
+    if _acc_class_active():
+        return comp_meshes_acc.get(ln, comp_meshes[ln])
+    if _flat_ler_active():
+        return comp_meshes_flat.get(ln, comp_meshes[ln])
+    return comp_meshes[ln]
 
 
 def _solid_trace_centerlines():
@@ -1965,6 +1998,8 @@ _klic_legend = gui.Vert(0)
 _klic_legend.add_child(gui.Label("KLIC tolerance (1 m):"))
 for i, (col, lbl) in enumerate(zip(KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS)):
     _klic_legend.add_child(make_legend_row(col, gui.Label(lbl), em))
+# Said on screen, so a screenshot of this mode cannot be read as a depth claim.
+_klic_legend.add_child(gui.Label("  LER drawn at street level"))
 _klic_legend.visible = False
 
 
