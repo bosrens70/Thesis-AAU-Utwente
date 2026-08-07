@@ -61,7 +61,7 @@ from core.config import (
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LEDNINGSPAKKE_LABEL, layer_display_name,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
-    COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER,
+    COMPONENT_SPHERE_RADIUS, TRACE_CENTERLINE_RADIUS, PIPE_LEGEND_UI_ORDER,
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
     TARGET_CLASS, UTILITY_TO_LER_MATCH, UTILITY_TYPE_COLORS,
     DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
@@ -807,8 +807,13 @@ def _centerline_gn(ln): return f"centerline_{ln}"
 # Per-layer visibility state (True = shown)
 _layer_visible = {ln: True for ln in LINE_LAYERS}
 _layer_visible.update({ln: False for ln in COMPONENT_LAYERS})  # start with all components hidden
-if "Ledningstrace" in _layer_visible:
-    _layer_visible["Ledningstrace"] = False  # start with Ledningstrace hidden
+# Traces start hidden. Every lookup keys on the storage key, which for a trace
+# is the per-forsyningsart variant ("Ledningstrace (el)"), so hiding the bare
+# layer name alone left each variant on its True default and the layer showed
+# anyway. _storage_key_colors holds the variants this site actually loaded.
+for _ln in list(_layer_visible) + list(_storage_key_colors):
+    if is_trace_key(_ln):
+        _layer_visible[_ln] = False
 
 pipe_opacity = [1.0]
 origin_pt    = np.array([0.0, 0.0, 0.0])
@@ -1665,6 +1670,16 @@ def _clear_ler_match_highlight():
         pass
 
 
+# A pipe's cylinder is drawn a radius below the registered line (see the load
+# loop), which leaves the line itself clear and a highlight on it visible. A
+# trace has no such gap: its corridor ribbon is exactly coplanar with the line
+# and its centreline tube is centred on it, so a highlight drawn there is
+# buried inside both. Lift it clear of the tube to put a trace highlight where
+# every other layer's already sits.
+_TRACE_HIGHLIGHT_LIFT = np.array([0.0, 0.0, TRACE_CENTERLINE_RADIUS + 0.005])
+_NO_LIFT = np.zeros(3)
+
+
 def _line_lineset(gml_ids, color):
     """LineSet over every loaded segment of the given features, or None when
     none of them is present in this footprint."""
@@ -1673,7 +1688,9 @@ def _line_lineset(gml_ids, color):
     for _i, _gid in enumerate(pick_seg_gml_id):
         if _gid not in wanted:
             continue
-        pts.extend([pick_seg_p1[_i], pick_seg_p2[_i]])
+        _lift = (_TRACE_HIGHLIGHT_LIFT if is_trace_key(pick_seg_layer[_i])
+                 else _NO_LIFT)
+        pts.extend([pick_seg_p1[_i] + _lift, pick_seg_p2[_i] + _lift])
         lines.append([len(pts) - 2, len(pts) - 1])
     if not lines:
         return None
@@ -1688,7 +1705,11 @@ def _line_lineset(gml_ids, color):
 def _highlight_material():
     mat = line_material(6.0)
     try:
-        mat.depth_func = "always"  # stay visible through occluding pipe meshes
+        # Would draw through occluding pipe meshes, but MaterialRecord has no
+        # depth_func in Open3D 0.19, so this is a no-op here and the highlight
+        # depth-tests normally. Placing it clear of the geometry (above) is
+        # what actually keeps it visible.
+        mat.depth_func = "always"
     except AttributeError:
         pass
     return mat
