@@ -610,9 +610,10 @@ def ler_layers_for_type(utility_type, available_layers=(), *,
     present in ``available_layers``.
 
     Returns ``None`` when the type carries no mapping at all (an unlabelled
-    instance), which the callers read as "no restriction" rather than "nothing
-    matches". Callers that instead want an empty set there must handle the
-    ``None`` themselves.
+    instance). ``None`` means "this type says nothing about which layers apply",
+    not "every layer applies": each caller decides what to do with it, and the
+    deviation module treats it as matching no layer so that a missing label
+    cannot produce a deviation against arbitrary geometry.
     """
     match = UTILITY_TO_LER_MATCH.get(utility_type)
     if match is None:

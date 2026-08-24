@@ -69,7 +69,9 @@ from core.data_loader import (
     instance_base_name,
     feature_accuracy_tolerance, accuracy_class_coverage,
 )
-from core.site_status import instance_dir_for, resolve_labeled_dir
+from core.site_status import (
+    instance_dir_for, resolve_labeled_dir, root_class_instances,
+)
 from core.geometry import (
     batch_point_to_segments, batch_point_to_plane_segments,
     batch_point_to_plane_segment_components,
@@ -675,8 +677,13 @@ def _get_matching_segment_mask(utility_type, active_only=None):
     """
     allowed = ler_layers_for_type(utility_type, set(all_seg_layer))
     if allowed is None:
-        # No mapping for this type (an unlabelled instance): nothing to restrict.
-        mask = np.ones(len(seg_p1), dtype=bool)
+        # No mapping for this type, so the instance carries no usable label.
+        # Match nothing rather than everything: widening to all layers would
+        # measure the instance against the nearest geometry of any utility and
+        # return a finite, plausible-looking deviation built on no information.
+        # This also matches _get_matching_ler_names(), which already returns an
+        # empty set here.
+        mask = np.zeros(len(seg_p1), dtype=bool)
     else:
         mask = np.array([ln in allowed for ln in all_seg_layer], dtype=bool)
         if not len(mask):
@@ -728,13 +735,23 @@ if _perm_dir.is_dir():
         for _sd in _superseded_labeled:
             print(f"  [note] ignoring superseded label session {_sd.path.name}/")
     # Always include top-level PLY files (e.g. water instance 0_instance_0_type_7.ply).
+    # root_class_instances() is the same predicate tools/pipeline_status.py counts
+    # with, so the reported instance count and the measured population agree by
+    # construction. It also keeps out the hand-split parts that CloudCompare left
+    # beside the pipes ("0_instance_1_type_valve.ply", "..._type_tiewrap.ply"):
+    # those carry no utility_type property and no numeric type token, so they used
+    # to resolve to type 0 and be measured against every LER layer at once.
     # A root file shadowed by a same-named file in the label session is dropped:
     # label_module writes the per-class instances back to the root rather than
     # copying them, but an older session may still hold a copy, and loading both
     # would count the same points twice.
     _labeled_names = {p.name for p in _inst_files}
-    _top_level_plys = [p for p in sorted(_perm_dir.glob("*.ply"))
-                       if p.name not in _labeled_names]
+    _root_insts = root_class_instances(_perm_dir)
+    _kept_root_names = {p.name for p in _root_insts}
+    for _sp in sorted(_perm_dir.glob("*.ply")):
+        if _sp.name not in _kept_root_names:
+            print(f"  [skip] {_sp.name}: not a labelled instance, not measured")
+    _top_level_plys = [p for p in _root_insts if p.name not in _labeled_names]
     if _top_level_plys:
         _inst_files = _top_level_plys + _inst_files
     # Fallback: top-level only when no labeled instances exist
@@ -802,6 +819,10 @@ for inst_path in _inst_files:
     if utility_type == 0:
         utility_type = utility_type_from_filename(inst_path.name)
     ut_label = UTILITY_TYPE_LABELS.get(utility_type, f"Unknown({utility_type})")
+    if utility_type == 0:
+        print(f"  [warn] {inst_path.name}: no utility_type in the PLY and no "
+              f"numeric type in the filename. It matches no LER layer, so it is "
+              f"reported without a deviation.")
 
     ler_match = _ler_matches.get(inst_path.name)
     confirmed_no_ler = bool(ler_match and ler_match.get("no_ler"))
