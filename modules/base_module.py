@@ -333,13 +333,7 @@ if all_pipe_coords:
 # 6.  Load utility components (points) within bbox
 # ─────────────────────────────────────────────────────────────────────────────
 # Map component layer -> corresponding line layer for depth estimation
-_COMP_TO_LINE = {
-    "Vandkomponent":               "Vandledning",
-    "Afloebskomponent":            "Afloebsledning",
-    "Gaskomponent":                "Gasledning",
-    "Elkomponent":                 "Elledning",
-    "Telekommunikationskomponent": "Telekommunikationsledning",
-}
+_COMP_TO_LINE = COMP_TO_LINE
 
 print("\n--- Loading utility components within bbox ---")
 _t_comp0 = time.perf_counter()

@@ -7,6 +7,12 @@ _archive/
 # ── Personal notes (report drafts, not part of the codebase) ────
 notes/
 
+# ── Interview recordings and transcripts ────────────────────────
+# Named recordings and transcripts of identifiable participants. The
+# thesis reports them anonymised (R1-R8); this repo is public, so the
+# raw material must never be tracked. Keep the files on disk, not in git.
+11_Interviews/
+
 # ── Presentations / slide decks (not part of the codebase) ──────
 *.pptx
 
@@ -51,3 +57,5 @@ make_ler_appendix.py
 # ── Active site selection (per-machine, see its docstring) ──────
 core/site_local.py
 /tools
+*.png
+*.json

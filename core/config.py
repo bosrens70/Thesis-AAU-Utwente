@@ -76,16 +76,18 @@ LEDNINGSPAKKE_LABEL = (f"{_lp_match.group(1)} {_lp_match.group(2)}"
 # Crop region shape (load-time switch).
 #   "circle" — disc of radius CROP_RADIUS around the cloud XY centroid (the cloud
 #              is cropped to that disc).
-#   "rect"   — the cloud is kept in full; its 3D axis-aligned bounding box (AABB)
-#              is expanded by UTILITY_RECT_BUFFER in X, Y and Z, and utilities are
-#              selected and clipped to that box.  CROP_RADIUS is not used here.
+#   "rect"   — the cloud is kept in full; its XY bounding box is expanded by
+#              UTILITY_RECT_BUFFER, and utilities are selected and clipped to that
+#              box.  Selection is XY-only, so a utility passing through the
+#              footprint is kept whatever its depth.  CROP_RADIUS is not used here.
 # Honoured by the point-cloud crop (every init_site viewer) and by utility
 # selection in base_module / label_module / deviation_module.  Other modules keep
 # their own selection logic.  Set to "circle" to restore the legacy disc crop.
 CROP_MODE = "rect"
 
-# Margin (metres) added around the point-cloud AABB in every dimension (X, Y, Z)
-# when selecting utilities in "rect" mode (the "additional crop distance").
+# Margin (metres) added around the point-cloud XY bounding box when selecting
+# utilities in "rect" mode (the "additional crop distance").  CropRegion applies
+# it in X and Y only; there is no Z bound.
 UTILITY_RECT_BUFFER = 2.0
 # Circular crop radius (metres) around the point cloud centroid (XY).
 CROP_RADIUS = 2.0

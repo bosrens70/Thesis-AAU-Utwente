@@ -209,21 +209,33 @@ def batch_point_to_plane_segment_components(pts, seg_p1, seg_p2, seg_half_width,
     the horizontal (XY) and vertical (Z) components of the deviation evaluated
     at the nearest segment.
 
-    Returns ``(dist, xy, z)`` where ``dist`` matches
+    Returns ``(dist, xy, z, z_signed)`` where ``dist`` matches
     :func:`batch_point_to_plane_segments` and ``dist == sqrt(xy**2 + z**2)``.
     For plane segments the XY component is the lateral offset reduced by the
     half-width (``lat_eff``); for centerline segments it is the horizontal
-    Euclidean component. The vertical component is ``|dz|`` in both cases.
+    Euclidean component. The vertical component is ``|dz|`` in both cases, so
+    the identity above still holds.
+
+    ``z_signed`` is that same vertical offset with its sign kept: ``pts`` minus
+    the registered geometry, so **positive means the measured point sits above
+    the registered line**. LER registers the top of the utility and the crown
+    line measures the same top, so on crown points a positive value says the
+    utility is *shallower* than registered. A magnitude cannot express that
+    direction, which is why this is returned separately rather than replacing
+    ``z``. It is NaN rather than ``inf`` when there is no segment to measure
+    against: for a signed quantity ``inf`` would read as "infinitely far
+    above" instead of "unknown".
     """
     N = len(pts)
     M = len(seg_p1)
     if M == 0:
         inf = np.full(N, np.inf)
-        return inf, inf.copy(), inf.copy()
+        return inf, inf.copy(), inf.copy(), np.full(N, np.nan)
 
     min_dists = np.full(N, np.inf)
     xy_out = np.full(N, np.inf)
     z_out = np.full(N, np.inf)
+    z_signed_out = np.full(N, np.nan)
 
     d = seg_p2 - seg_p1
     seg_len2 = np.einsum('ij,ij->i', d, d)
@@ -252,7 +264,8 @@ def batch_point_to_plane_segment_components(pts, seg_p1, seg_p2, seg_half_width,
         closest = seg_p1[None, :, :] + t[:, :, None] * d[None, :, :]
         diff = p[:, None, :] - closest
 
-        dz = np.abs(diff[:, :, 2])                                  # (B, M)
+        dz_signed = diff[:, :, 2]                                   # (B, M)
+        dz = np.abs(dz_signed)                                      # (B, M)
         xy_eucl = np.sqrt(diff[:, :, 0] ** 2 + diff[:, :, 1] ** 2)  # (B, M)
         lat_comp = np.abs(np.einsum('ijk,jk->ij', diff, lat_dir))  # (B, M)
         lat_eff = np.maximum(0.0, lat_comp - hw[None, :])          # (B, M)
@@ -266,8 +279,9 @@ def batch_point_to_plane_segment_components(pts, seg_p1, seg_p2, seg_half_width,
         min_dists[start:end] = np.sqrt(dists2[rows, am])
         xy_out[start:end] = xy_comp[rows, am]
         z_out[start:end] = dz[rows, am]
+        z_signed_out[start:end] = dz_signed[rows, am]
 
-    return min_dists, xy_out, z_out
+    return min_dists, xy_out, z_out, z_signed_out
 
 
 def discretize_segment(p1, p2, radius=0.0, half_width=0.0,

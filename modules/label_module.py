@@ -65,6 +65,7 @@ from core.config import (
     INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
     TARGET_CLASS, UTILITY_TO_LER_MATCH, UTILITY_TYPE_COLORS,
     DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
+    PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     forsyningsart_color,
     ler_layers_for_type, trace_forsyningsart, FORSYNINGSART_TO_LINE,
 )
@@ -89,8 +90,7 @@ from core.geometry import (
     linear_to_srgb,
 )
 from core.crop import CropRegion
-from core.depth import (clean_coords_with_depth as _core_clean_coords,
-                        MAX_DEPTH_BELOW_GROUND)
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.ledningstrace import (
     get_ledningstrace_display_info, get_storage_key, get_bredde_width,
     is_trace_key, ribbon_alpha,
@@ -292,12 +292,14 @@ _segments_in_bbox     = _crop_region.polyline_in_region_utm
 _clip_segment_to_bbox = _crop_region.clip_local
 
 
-def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm):
+def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
+                             cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
     """UTM -> local translation + DepthSource fallback (core.depth), bound to
     this viewer's flat ground level. Returns (coords, sources); the caller
     counts the fallback statistics from ``sources``."""
     return _core_clean_coords(coords_raw, vejledende_dybde_mm,
-                              TX=TX, TY=TY, TZ=TZ, ground_z_at=_ground_z_at)
+                              TX=TX, TY=TY, TZ=TZ, ground_z_at=_ground_z_at,
+                              cfg=cfg, parent_avg_z=parent_avg_z)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 5.  Load utility lines (pipes / cables) within bbox
@@ -542,14 +544,7 @@ if all_pipe_coords:
 # 6.  Load utility components (points) within bbox
 # ─────────────────────────────────────────────────────────────────────────────
 # Map component layer -> corresponding line layer for depth estimation
-_COMP_TO_LINE = {
-    "Vandkomponent":               "Vandledning",
-    "Afloebskomponent":            "Afloebsledning",
-    "Gaskomponent":                "Gasledning",
-    "Elkomponent":                 "Elledning",
-    "Telekommunikationskomponent": "Telekommunikationsledning",
-    "TermiskKomponent":            "TermiskLedning",
-}
+_COMP_TO_LINE = COMP_TO_LINE
 
 print("\n--- Loading utility components within bbox ---")
 all_comp_meshes    = []     # flat list (kept for count reporting)
@@ -585,23 +580,23 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         if not _point_in_bbox(g.x, g.y):
             continue
 
-        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+        # Same resolver and the same component configuration as every other
+        # module: REGISTERED -> LAYER_MEAN -> GROUND_PLANE.
+        pt_arr, _src_arr = _clean_coords_with_depth(
+            np.array([[g.x, g.y, g.z]], dtype=float), None,
+            cfg=COMPONENT_DEPTH_CONFIG, parent_avg_z=parent_avg_z,
+        )
+        pt = pt_arr[0]
 
         # Crop to local buffered bbox
         if not _pt_in_local_bbox(pt[0], pt[1]):
             continue
 
-        _gz_local = _ground_z_at(pt[0], pt[1])
-        if g.z == -99 or pt[2] <= -98 or pt[2] < _gz_local - MAX_DEPTH_BELOW_GROUND:
-            # Component has no reliable Z — estimate from parent pipe depth
-            # or from ground model
-            if parent_avg_z is not None:
-                # Use average depth of the corresponding utility type
-                pt[2] = parent_avg_z
-                _comp_depth_stats["from_pipe_avg"] += 1
-            else:
-                pt[2] = _gz_local
-                _comp_depth_stats["from_ground"] += 1
+        _comp_src = DepthSource(int(_src_arr[0]))
+        if _comp_src == DepthSource.LAYER_MEAN:
+            _comp_depth_stats["from_pipe_avg"] += 1
+        elif _comp_src == DepthSource.GROUND_PLANE:
+            _comp_depth_stats["from_ground"] += 1
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12
@@ -807,13 +802,9 @@ def _centerline_gn(ln): return f"centerline_{ln}"
 # Per-layer visibility state (True = shown)
 _layer_visible = {ln: True for ln in LINE_LAYERS}
 _layer_visible.update({ln: False for ln in COMPONENT_LAYERS})  # start with all components hidden
-# Traces start hidden. Every lookup keys on the storage key, which for a trace
-# is the per-forsyningsart variant ("Ledningstrace (el)"), so hiding the bare
-# layer name alone left each variant on its True default and the layer showed
-# anyway. _storage_key_colors holds the variants this site actually loaded.
-for _ln in list(_layer_visible) + list(_storage_key_colors):
-    if is_trace_key(_ln):
-        _layer_visible[_ln] = False
+# Traces start shown, like every other line layer. A trace keys on its
+# per-forsyningsart storage key ("Ledningstrace (el)"), which is absent from
+# LINE_LAYERS, so it relies on the True default of every _layer_visible lookup.
 
 pipe_opacity = [1.0]
 origin_pt    = np.array([0.0, 0.0, 0.0])

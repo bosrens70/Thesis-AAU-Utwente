@@ -48,8 +48,7 @@ from core.gui_helpers import (
 )
 from core.geometry import fit_plane_z, srgb_to_linear, linear_to_srgb
 from core.crop import clip_segment_to_rect
-from core.depth import (clean_coords_with_depth as _core_clean_coords,
-                        MAX_DEPTH_BELOW_GROUND)
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core import symbology as sym
 from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
@@ -1003,21 +1002,17 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
         if not _point_in_bbox(gx, gy):
             continue
 
-        pt = np.array([gx - TX, gy - TY, gz - TZ], dtype=float)
+        # Same resolver and the same component configuration as every other
+        # module: REGISTERED -> LAYER_MEAN -> GROUND_PLANE.
+        pt_arr, _src_arr = _clean_coords_with_depth(
+            np.array([[gx, gy, gz]], dtype=float), None,
+            cfg=COMPONENT_DEPTH_CONFIG, parent_avg_z=parent_avg_z,
+        )
+        pt = pt_arr[0]
         if not _pt_in_local_bbox(pt[0], pt[1]):
             continue
 
-        _gz_local = _ground_z_at(pt[0], pt[1])
-        if gz <= -98 or pt[2] <= -98 or pt[2] < _gz_local - MAX_DEPTH_BELOW_GROUND:
-            # Component depth hierarchy: LAYER_MEAN (parent pipe) -> GROUND_PLANE
-            if parent_avg_z is not None:
-                pt[2] = parent_avg_z
-                _comp_src = DepthSource.LAYER_MEAN
-            else:
-                pt[2] = _gz_local
-                _comp_src = DepthSource.GROUND_PLANE
-        else:
-            _comp_src = DepthSource.REGISTERED
+        _comp_src = DepthSource(int(_src_arr[0]))
 
         # Top-view plan: flatten the component to the ground plane.
         pt[2] = PLAN_Z

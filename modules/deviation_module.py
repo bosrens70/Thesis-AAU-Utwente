@@ -52,6 +52,7 @@ from core.config import (
     PANEL_WIDTH_EM, LEDNINGSPAKKE_LABEL, layer_display_name,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
+    PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
     DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
     DEVIATION_GRADIENT_TICKS,
@@ -80,8 +81,7 @@ from core.geometry import (
 )
 from core.crop import CropRegion
 from core.crown import crown_line
-from core.depth import (clean_coords_with_depth as _core_clean_coords,
-                        MAX_DEPTH_BELOW_GROUND)
+from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     PanelTextFitter,
@@ -160,6 +160,11 @@ all_seg_crown_offset = [] # top->axis lowering per segment: the tube radius for 
                           # pipe (registered or fallback diameter), 0 for traces
 all_seg_gml_id = []       # GML gml_id per segment — identifies the whole feature
 all_seg_acc_class = []    # registered noejagtighedsklasse per segment: 1..5, 0 = none
+all_seg_depth_source = [] # DepthSource per segment: how its Z was arrived at. The
+                          # worst of the two endpoints, so a segment counts as
+                          # REGISTERED only when both ends genuinely are.
+all_seg_owner = []        # ledningsejer per segment (mandatory on every feature)
+all_seg_etabl = []        # etableringstidspunkt per segment, "" when absent
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
 ler_meshes_acc = {}       # layer -> same mesh, painted by registered accuracy class
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
@@ -172,13 +177,21 @@ _in_crop_utm          = _crop_region.polyline_in_region_utm
 _clip_segment_to_crop = _crop_region.clip_local
 
 
-def _to_local(coords_utm, vejl_dybde_mm=None):
+def _to_local(coords_utm, vejl_dybde_mm=None,
+              cfg=PIPE_DEPTH_CONFIG, parent_avg_z=None):
     """UTM -> local translation + DepthSource fallback (core.depth), bound to
-    this viewer's flat ground level. Per-vertex sources are discarded."""
-    coords, _ = _core_clean_coords(coords_utm, vejl_dybde_mm,
-                                   TX=TX, TY=TY, TZ=TZ,
-                                   ground_z_at=lambda x, y: GROUND_Z)
-    return coords
+    this viewer's flat ground level.
+
+    Returns ``(coords, sources)``. The per-vertex sources are kept rather than
+    dropped because they decide whether a vertical comparison means anything: a
+    vertex resolved by GROUND_PLANE carries the ground level picked from this very
+    point cloud, so measuring the cloud against it is circular. Only
+    DepthSource.REGISTERED is an independent claim about depth.
+    """
+    return _core_clean_coords(coords_utm, vejl_dybde_mm,
+                              TX=TX, TY=TY, TZ=TZ,
+                              ground_z_at=lambda x, y: GROUND_Z,
+                              cfg=cfg, parent_avg_z=parent_avg_z)
 
 
 # Accuracy-class colouring of the utility geometry itself (the "Colour by
@@ -280,12 +293,18 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
         _tol = feature_accuracy_tolerance(row)
         acc_class = _tol[1] if _tol is not None else 0
 
+        # Owner and establishment date, carried per segment. They separate an
+        # independently registered feature from one surveyed by the same campaign
+        # that captured the point cloud, which a deviation figure must not pool.
+        owner_val = str(row.get("ledningsejer", "") or "").strip()
+        etabl_val = str(row.get("etableringstidspunkt", "") or "").strip()[:10]
+
         hit = False
         for sub in subs:
             coords_raw = np.array(sub.coords, dtype=float)
             if not _in_crop_utm(coords_raw):
                 continue
-            coords = _to_local(coords_raw, vejl)
+            coords, z_src = _to_local(coords_raw, vejl)
             _layer_z_vals.extend(coords[:, 2].tolist())
             hit = True
             for i in range(len(coords) - 1):
@@ -311,6 +330,11 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_crown_offset.append(crown_offset)
                 all_seg_gml_id.append(gml_id_val)
                 all_seg_acc_class.append(acc_class)
+                # DepthSource is ordered worst-last, so max() of the two endpoints
+                # is the weaker claim of the pair.
+                all_seg_depth_source.append(int(max(z_src[i], z_src[i + 1])))
+                all_seg_owner.append(owner_val)
+                all_seg_etabl.append(etabl_val)
                 if bredde_m is not None:
                     mesh = segment_to_plane(cp1, cp2, bredde_m, color)
                 else:
@@ -398,6 +422,12 @@ seg_radius = np.array(all_seg_radius, dtype=float) if all_seg_radius else np.emp
 seg_crown_offset = np.array(all_seg_crown_offset, dtype=float) if all_seg_crown_offset else np.empty(0, dtype=float)
 seg_gml_id = np.array(all_seg_gml_id, dtype=object) if all_seg_gml_id else np.empty(0, dtype=object)
 seg_acc_class = np.array(all_seg_acc_class, dtype=int) if all_seg_acc_class else np.empty(0, dtype=int)
+seg_depth_source = (np.array(all_seg_depth_source, dtype=int) if all_seg_depth_source
+                    else np.empty(0, dtype=int))
+seg_owner = (np.array(all_seg_owner, dtype=object) if all_seg_owner
+             else np.empty(0, dtype=object))
+seg_etabl = (np.array(all_seg_etabl, dtype=object) if all_seg_etabl
+             else np.empty(0, dtype=object))
 n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
@@ -460,16 +490,16 @@ for comp_layer, comp_cfg in COMPONENT_LAYERS.items():
         if not _crop_region.contains_utm(g.x, g.y):
             continue
 
-        pt = np.array([g.x - TX, g.y - TY, g.z - TZ], dtype=float)
+        # Same resolver and the same component configuration as every other
+        # module: REGISTERED -> LAYER_MEAN -> GROUND_PLANE.
+        pt_arr, _comp_src_arr = _to_local(
+            np.array([[g.x, g.y, g.z]], dtype=float), None,
+            cfg=COMPONENT_DEPTH_CONFIG, parent_avg_z=parent_avg_z,
+        )
+        pt = pt_arr[0]
 
         if not _crop_region.contains_local(pt[0], pt[1]):
             continue
-
-        if g.z == -99 or pt[2] <= -98 or pt[2] < GROUND_Z - MAX_DEPTH_BELOW_GROUND:
-            if parent_avg_z is not None:
-                pt[2] = parent_avg_z
-            else:
-                pt[2] = GROUND_Z
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(
             radius=COMPONENT_SPHERE_RADIUS, resolution=12)
@@ -588,7 +618,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
             cr = np.array(sub.coords, dtype=float)
             if not _in_crop_utm(cr):
                 continue
-            cl = _to_local(cr, vejl)
+            cl, _ = _to_local(cr, vejl)
             local_lines.append(cl[:, :2])
             local_lines_xyz.append(cl)
         if not local_lines:
@@ -824,10 +854,30 @@ for inst_path in _inst_files:
     _nan_stats = {"mean": np.nan, "median": np.nan, "std": np.nan,
                   "p95": np.nan, "max": np.nan, "min": np.nan, "n_pts": len(pts_inst)}
 
+    def _signed_stats(d):
+        """Summary of a signed vertical offset (measured minus registered).
+
+        Deliberately not _make_stats: a magnitude's mean is positive whatever
+        the direction, so it cannot answer "does the register sit above or below
+        the utility". The median and the share above zero can. p5/p95 rather
+        than min/max, because a single crown station at the end of a run is a
+        poor witness for a systematic offset.
+        """
+        f = np.asarray(d, dtype=float)
+        f = f[np.isfinite(f)]
+        if len(f) == 0:
+            return {"mean": np.nan, "median": np.nan, "p5": np.nan,
+                    "p95": np.nan, "frac_above": np.nan, "n_pts": 0}
+        return {"mean": float(np.mean(f)), "median": float(np.median(f)),
+                "p5": float(np.percentile(f, 5)), "p95": float(np.percentile(f, 95)),
+                "frac_above": float(np.mean(f > 0.0)), "n_pts": len(f)}
+
     # Combined (active + inactive) for heatmap colouring. The XY and Z
     # components are taken at the same nearest segment, so XYZ^2 = XY^2 + Z^2.
+    # z_signed keeps the direction the magnitude throws away: positive means the
+    # measured point sits above the registered line (see core/geometry.py).
     if has_ler:
-        dists, xy_dists, z_dists = batch_point_to_plane_segment_components(
+        dists, xy_dists, z_dists, z_signed = batch_point_to_plane_segment_components(
             pts_inst, seg_p1[seg_mask_all], seg_p2[seg_mask_all],
             seg_half_width[seg_mask_all])
         stats = _make_stats(dists)
@@ -835,6 +885,7 @@ for inst_path in _inst_files:
         dists = np.full(len(pts_inst), np.nan)
         xy_dists = np.full(len(pts_inst), np.nan)
         z_dists = np.full(len(pts_inst), np.nan)
+        z_signed = np.full(len(pts_inst), np.nan)
         stats = dict(_nan_stats)
 
     # Separate stats for active / inactive
@@ -907,11 +958,11 @@ for inst_path in _inst_files:
     # resting on it. Measuring it against the same unlowered seg_p1/seg_p2 the
     # point clouds use makes both sides the top datum, with no radius bias.
     crown = crown_line(pts_inst)
-    crown_dists = crown_xy_dists = crown_z_dists = np.empty(0)
+    crown_dists = crown_xy_dists = crown_z_dists = crown_z_signed = np.empty(0)
     crown_stats = dict(_nan_stats)
     crown_stats["n_pts"] = crown.n_stations
     if crown.ok and has_ler:
-        crown_dists, crown_xy_dists, crown_z_dists = (
+        crown_dists, crown_xy_dists, crown_z_dists, crown_z_signed = (
             batch_point_to_plane_segment_components(
                 crown.points, seg_p1[seg_mask_all], seg_p2[seg_mask_all],
                 seg_half_width[seg_mask_all]))
@@ -939,10 +990,14 @@ for inst_path in _inst_files:
         "stats": stats,
         "stats_active": stats_act,
         "stats_inactive": stats_inact,
+        "z_signed": z_signed,
+        "z_signed_stats": _signed_stats(z_signed),
         "crown": crown,
         "crown_distances": crown_dists,
         "crown_xy": crown_xy_dists,
         "crown_z": crown_z_dists,
+        "crown_z_signed": crown_z_signed,
+        "crown_z_signed_stats": _signed_stats(crown_z_signed),
         "crown_stats": crown_stats,
     }
     class_instances.setdefault(utility_type, []).append(inst_data)
@@ -982,6 +1037,15 @@ for inst_path in _inst_files:
               f"{crown.run_length:.2f} m ({crown.coverage*100:.0f}% covered, "
               f"radius measured at {crown.n_radius})  {_dtxt}  "
               f"{_crown_dev}")
+        # Both sides are the top of the utility, so the sign is readable as a
+        # depth statement rather than just an offset.
+        _sz = inst_data["crown_z_signed_stats"]
+        if has_ler and np.isfinite(_sz["median"]):
+            _above = _sz["median"] > 0
+            print(f"        vertical: crown sits {abs(_sz['median'])*1000:.0f}mm "
+                  f"{'above' if _above else 'below'} the registered top (median), "
+                  f"so measured {'shallower' if _above else 'deeper'} than "
+                  f"registered  [{_sz['frac_above']*100:.0f}% of stations above]")
     else:
         print(f"      crown line: none ({crown.reason})")
     # An arm the footprint found but the crown does not cover is missing from the
@@ -1077,6 +1141,19 @@ def _build_class_summaries():
                     "std": float(np.std(a)), "p95": float(np.percentile(a, 95)),
                     "max": float(np.max(a)), "n": int(a.size)}
 
+        def _crown_signed_agg(arr_key):
+            """Pooled signed vertical offset. Separate from _crown_agg because a
+            max over a signed set names the most extreme station in one direction
+            only, which says nothing about a systematic bias; p5/p95 bracket both
+            directions and frac_above states which way the class leans."""
+            a = _crown_pool(arr_key)
+            a = a[np.isfinite(a)] if a.size else a
+            if a.size == 0:
+                return None
+            return {"mean": float(np.mean(a)), "median": float(np.median(a)),
+                    "p5": float(np.percentile(a, 5)), "p95": float(np.percentile(a, 95)),
+                    "frac_above": float(np.mean(a > 0.0)), "n": int(a.size)}
+
         _crowns = [inst["crown"] for inst in instances if inst["crown"].ok]
         _radii = [c.median_radius for c in _crowns if c.median_radius]
 
@@ -1091,6 +1168,7 @@ def _build_class_summaries():
             "crown": _crown_agg("crown_distances"),
             "crown_xy": _crown_agg("crown_xy"),
             "crown_z": _crown_agg("crown_z"),
+            "crown_z_signed": _crown_signed_agg("crown_z_signed"),
         }
         matched = _pool("distances", only_ler=True) if has_ler else np.array([])
         if matched.size:
@@ -1139,6 +1217,14 @@ for ut in sorted(class_summaries.keys()):
                 print(f"      {_lbl:<3} mean {_c['mean']*1000:>7.2f} mm   "
                       f"P95 {_c['p95']*1000:>7.2f} mm   "
                       f"max {_c['max']*1000:>7.2f} mm")
+        _cz = s["crown_z_signed"]
+        if _cz:
+            print(f"      Z signed (+ = crown above the registered top, so "
+                  f"shallower than registered)")
+            print(f"          median {_cz['median']*1000:>+7.2f} mm   "
+                  f"mean {_cz['mean']*1000:>+7.2f} mm   "
+                  f"P5..P95 {_cz['p5']*1000:>+7.2f} .. {_cz['p95']*1000:>+7.2f} mm   "
+                  f"{_cz['frac_above']*100:.0f}% above")
     elif s["n_crown_lines"] == 0:
         print(f"    -- CROWN LINE: none recovered (see per-instance reasons) --")
     if s["has_ler"] and not np.isnan(s["mean"]):
