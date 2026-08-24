@@ -952,8 +952,6 @@ if all_pipe_coords:
 _t_step = time.perf_counter()
 print("\n--- Building utility component meshes ---")
 
-_COMP_TO_LINE = COMP_TO_LINE
-
 comp_meshes = {}
 comp_meshes_depth = {}           # layer_name -> depth-source-coloured mesh
 _comp_seg_dsrc = {}              # layer_name -> [DepthSource, ...] per component
@@ -973,7 +971,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     comp_mesh_list = []
     comp_src_list  = []   # DepthSource per component (parallel to comp_mesh_list)
 
-    parent_line = _COMP_TO_LINE.get(layer_name)
+    parent_line = COMP_TO_LINE.get(layer_name)
     parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
 
     for _, row in gdf_c.iterrows():

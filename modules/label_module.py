@@ -543,9 +543,6 @@ if all_pipe_coords:
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  Load utility components (points) within bbox
 # ─────────────────────────────────────────────────────────────────────────────
-# Map component layer -> corresponding line layer for depth estimation
-_COMP_TO_LINE = COMP_TO_LINE
-
 print("\n--- Loading utility components within bbox ---")
 all_comp_meshes    = []     # flat list (kept for count reporting)
 _comp_layer_spheres = {}    # layer_name -> [TriangleMesh, ...]  per-layer
@@ -567,7 +564,7 @@ for layer_name, cfg in COMPONENT_LAYERS.items():
     n_comp = 0
 
     # Get the average depth of the corresponding line layer for fallback
-    parent_line = _COMP_TO_LINE.get(layer_name)
+    parent_line = COMP_TO_LINE.get(layer_name)
     parent_avg_z = _layer_avg_depth_local.get(parent_line) if parent_line else None
 
     for _, row in gdf_c.iterrows():
