@@ -62,6 +62,7 @@ from core.config import (
     FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
     ler_layers_for_type,
+    LEDNINGSTRACE_FALLBACK_WIDTH,
 )
 from core.data_loader import (
     init_site, read_ply_with_utility_type, utility_type_from_filename,
@@ -269,7 +270,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
 
         bredde_m = get_bredde_width(row)
         if is_trace and bredde_m is None:
-            bredde_m = 0.25
+            bredde_m = LEDNINGSTRACE_FALLBACK_WIDTH
 
         # Resolve display name and colour for Ledningstrace via forsyningsart
         if is_trace and "forsyningsart" in row.index:

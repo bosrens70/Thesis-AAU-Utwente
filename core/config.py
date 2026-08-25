@@ -534,6 +534,16 @@ DEPTH_STATS_KEY = {
     DepthSource.GROUND_PLANE: "fallback_global",
 }
 
+# Features whose registered Z came from the same survey campaign that captured
+# the point clouds, so the two sides of the comparison are not independent and
+# a vertical agreement between them measures the capture, not the register.
+# Identified from the evidence rather than assumed: this owner's water main is
+# registered on one date across 45 sites and its measured crown agrees with the
+# registered top to within 75 micrometres, which no pair of independent
+# measurements achieves. Keyed on (ledningsejer, etableringstidspunkt) so a
+# later package cannot silently inherit the exemption.
+SAME_SURVEY_CAMPAIGN = {("31884993", "2022-06-09")}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SEGMENT VIEWER DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -581,6 +591,16 @@ UTILITY_TO_LER_MATCH = {
 # forsyningsart under a compound key, "Ledningstrace (vand)", so any code that
 # has to recognise a trace from its storage key tests this prefix.
 LEDNINGSTRACE_LAYER = "Ledningstrace"
+
+# Corridor width (metres) assumed for a Ledningstrace that registers no bredde.
+# 186 of the 516 traces in package 2803288 carry none; the 330 that do all carry
+# 500 mm. This is deliberately half that, because the half-width is subtracted
+# from the measured offset and clamped at zero, so a narrower assumed corridor
+# can only increase the deviation reported. Erring towards reporting a deviation
+# is the safe direction, but it makes any deviation measured against this value
+# a departure from an assumption rather than from a registered corridor, which
+# is why the reported figures state how many instances reached it.
+LEDNINGSTRACE_FALLBACK_WIDTH = 0.25
 
 
 def trace_forsyningsart(layer_key):
