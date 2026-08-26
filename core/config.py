@@ -245,7 +245,9 @@ FORSYNINGSART_TO_LINE = {
 #   * Foeringsroer is "roer hvori der kan foeres en eller flere ledninger", a
 #     conduit lines *can* run in. Whether any do is what indeholderLedninger
 #     records, so the type itself is not an empty conduit.
-# "Ledningstrace" is used as a term in the report and is kept as-is.
+# "Ledningstrace" is the one value that is not the name Section 4.1 uses: that
+# section introduces it as "Utility Trace", but Chapter 6 and its figures call
+# it "Trace", so the short form is what is shown.
 LAYER_DISPLAY_EN = {
     # Utility lines
     "Vandledning":                 "Water Pipe",
@@ -258,7 +260,7 @@ LAYER_DISPLAY_EN = {
     "Foeringsroer":                "Conduit",
     "LedningUkendtForsyningsart":  "Utility Line of Unknown Service Type",
     "AndenLedning":                "Other Utility Line",
-    "Ledningstrace":               "Ledningstrace",
+    "Ledningstrace":               "Trace",
     # Components, each defined as a component belonging to the matching line
     "Vandkomponent":               "Water Component",
     "Afloebskomponent":            "Drainage Component",
