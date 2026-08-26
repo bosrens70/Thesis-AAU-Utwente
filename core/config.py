@@ -234,29 +234,40 @@ FORSYNINGSART_TO_LINE = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Keys are the real GML layer names, which stay Danish everywhere in code and
 # data access (gpd.read_file layer names, dict keys, geometry names, JSON);
-# only the text shown in the GUI is translated. Terms follow the thesis
-# manuscript ("water pipe", "conduit", "district heating"); "Ledningstrace" is
-# itself used as a term in the report and is kept as-is.
+# only the text shown in the GUI is translated.
+#
+# The values are the names Section 4.1 of the manuscript introduces, each one
+# checked against the class definition in the LER 2025 featurekatalog, which
+# carries no English of its own. Two of them are not the obvious translation:
+#   * TermiskLedning is "hvorigennem varme eller kulde foeres", heat *or* cold,
+#     and forsyningsart carries both fjernvarme and fjernkoeling, so it is not
+#     a district heating pipe;
+#   * Foeringsroer is "roer hvori der kan foeres en eller flere ledninger", a
+#     conduit lines *can* run in. Whether any do is what indeholderLedninger
+#     records, so the type itself is not an empty conduit.
+# "Ledningstrace" is used as a term in the report and is kept as-is.
 LAYER_DISPLAY_EN = {
-    "Vandledning":                 "Water pipe",
-    "Afloebsledning":              "Drainage pipe",
-    "Gasledning":                  "Gas pipe",
-    "Elledning":                   "Power line",
-    "Telekommunikationsledning":   "Telecommunication line",
+    # Utility lines
+    "Vandledning":                 "Water Pipe",
+    "Afloebsledning":              "Drainage Pipe",
+    "Gasledning":                  "Gas Pipe",
+    "Olieledning":                 "Oil Pipe",
+    "Elledning":                   "Electricity Cable",
+    "Telekommunikationsledning":   "Telecommunication Cable",
+    "TermiskLedning":              "Thermal Pipe",
     "Foeringsroer":                "Conduit",
-    "LedningUkendtForsyningsart":  "Unknown-type line",
+    "LedningUkendtForsyningsart":  "Utility Line of Unknown Service Type",
+    "AndenLedning":                "Other Utility Line",
     "Ledningstrace":               "Ledningstrace",
-    "TermiskLedning":              "District heating pipe",
-    "Olieledning":                 "Oil pipe",
-    "AndenLedning":                "Other line",
-    "Vandkomponent":               "Water component",
-    "Afloebskomponent":            "Drainage component",
-    "Gaskomponent":                "Gas component",
-    "Elkomponent":                 "Power component",
-    "Telekommunikationskomponent": "Telecom component",
-    "TermiskKomponent":            "District heating component",
-    "Oliekomponent":               "Oil component",
-    "AndenKomponent":              "Other component",
+    # Components, each defined as a component belonging to the matching line
+    "Vandkomponent":               "Water Component",
+    "Afloebskomponent":            "Drainage Component",
+    "Gaskomponent":                "Gas Component",
+    "Oliekomponent":               "Oil Component",
+    "Elkomponent":                 "Electricity Component",
+    "Telekommunikationskomponent": "Telecommunication Component",
+    "TermiskKomponent":            "Thermal Component",
+    "AndenKomponent":              "Other Component",
 }
 
 # forsyningsart attribute values (Danish, straight from the GML) -> English,
@@ -268,7 +279,7 @@ FORSYNINGSART_DISPLAY_EN = {
     "spildevand":        "wastewater",
     "vejafvanding":      "road drainage",
     "gas":               "gas",
-    "el":                "power",
+    "el":                "electricity",
     "telekommunikation": "telecommunication",
     "fjernvarme":        "district heating",
     "fjernkoeling":      "district cooling",
