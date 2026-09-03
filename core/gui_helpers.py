@@ -232,7 +232,7 @@ class PanelTextFitter:
 
 def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
                              scene_widget, pipe_gn, make_mesh_material,
-                             pipe_opacity, window):
+                             pipe_opacity, window, signatures_on=None):
     """
     Create a callback for the "All segments" master checkbox.
 
@@ -256,6 +256,10 @@ def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
         List containing current pipe opacity [alpha].
     window : gui.Window
         The window to trigger redraws.
+    signatures_on : list of bool, optional
+        One-element list holding the "LER signatures" state. Given, the layer's
+        signature overlay follows this master checkbox too; omitted, the
+        overlay is left alone.
 
     Returns
     -------
@@ -263,16 +267,20 @@ def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
         Callback suitable for checkbox.set_on_checked().
     """
     from core.trace_render import set_layer_material
+    from core.signature_render import set_signature_material
 
     def _on_toggle_all_pipes(checked):
         for ln, cb in pipe_checkboxes:
             cb.checked = checked
             layer_visible[ln] = checked
+            alpha = pipe_opacity[0] if checked else 0.0
             if ln in pipe_layer_meshes:
-                alpha = pipe_opacity[0] if checked else 0.0
                 # Trace ribbon/centreline split handled centrally
                 set_layer_material(scene_widget.scene, pipe_gn(ln), ln, alpha,
                                    make_mesh_material)
+            if signatures_on is not None:
+                set_signature_material(scene_widget.scene, ln, alpha,
+                                       make_mesh_material, signatures_on[0])
         window.post_redraw()
     return _on_toggle_all_pipes
 

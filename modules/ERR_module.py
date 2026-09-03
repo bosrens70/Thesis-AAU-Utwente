@@ -40,16 +40,19 @@ from core.config import (
     DepthSource, DepthConfig, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     forsyningsart_color,
     SIGNATURE_LINE_WIDTH_M, SIGNATURE_TRACE_WIDTH_M, SIGNATURE_COMP_LINE_WIDTH_M,
-    SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
 )
 from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     pivot_top_down, top_view, trench_or_scene_frame,
 )
 from core.geometry import fit_plane_z, srgb_to_linear, linear_to_srgb
+from core.signature_legend import SignatureLegendSection, STYLE_PLAN
 from core.crop import clip_segment_to_rect
 from core.depth import clean_coords_with_depth as _core_clean_coords
 from core import symbology as sym
+from core.signature_render import (
+    segments_to_ribbon_mesh, feature_signature_meshes_plan,
+)
 from core.rendering import (
     point_material_flat, mesh_material, line_material, flat_material,
     setup_scene_lighting,
@@ -511,81 +514,13 @@ def _dsrc_linear(src):
     return [srgb_to_linear(c) for c in s]
 
 
-# ── LER signature geometry (flat ribbons in the ground plane) ─────────────────
+# ── LER signature geometry (flat ribbons in the ground plane) ────────────────
 # This viewer is a top-down plan: every LER feature is flattened to PLAN_Z and
 # drawn with its cartographic signature. Lines are rendered as thin horizontal
 # ribbon quads (not tubes) so the existing TriangleMesh pipeline — opacity,
-# depth toggle, visibility, picking — keeps working unchanged.
-def _segments_to_ribbon_mesh(points, lines, width, color):
-    """Flat horizontal ribbon quads (two triangles per segment) for the line
-    segments in (points, lines). ``width`` is the ribbon width in metres."""
-    pts = np.asarray(points, dtype=float)
-    lines = np.asarray(lines, dtype=int)
-    if len(lines) == 0:
-        return None
-    hw = width / 2.0
-    up = np.array([0.0, 0.0, 1.0])
-    verts, tris = [], []
-    for a, b in lines:
-        p0 = pts[a]
-        p1 = pts[b]
-        fwd = p1 - p0
-        n = np.linalg.norm(fwd)
-        if n < 1e-9:
-            continue
-        side = np.cross(fwd / n, up)
-        sn = np.linalg.norm(side)
-        side = side / sn * hw if sn > 1e-9 else np.array([hw, 0.0, 0.0])
-        k = len(verts)
-        verts.extend([p0 + side, p0 - side, p1 - side, p1 + side])
-        tris.extend([[k, k + 1, k + 2], [k, k + 2, k + 3]])
-    if not verts:
-        return None
-    m = o3d.geometry.TriangleMesh()
-    m.vertices = o3d.utility.Vector3dVector(np.asarray(verts, dtype=float))
-    m.triangles = o3d.utility.Vector3iVector(np.asarray(tris, dtype=np.int32))
-    m.paint_uniform_color(color)
-    m.compute_vertex_normals()
-    return m
-
-
-def _faces_to_mesh(verts, faces, color):
-    """Build a coloured TriangleMesh from vertex/face arrays (danger triangles)."""
-    faces = np.asarray(faces, dtype=int)
-    if len(faces) == 0:
-        return None
-    m = o3d.geometry.TriangleMesh()
-    m.vertices = o3d.utility.Vector3dVector(np.asarray(verts, dtype=float))
-    m.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
-    m.paint_uniform_color(color)
-    m.compute_vertex_normals()
-    return m
-
-
-def _feature_signature_meshes(coords, style, color, width, hazard, tick_count):
-    """Ribbon + decorators for one polyline already flattened to PLAN_Z."""
-    coords = np.asarray(coords, dtype=float)
-    meshes = []
-    if len(coords) < 2:
-        return meshes
-    if style == "dashed":
-        p, l = sym.dash_segments(coords)
-    else:
-        p, l = sym.polyline_lines(coords)
-    base = _segments_to_ribbon_mesh(p, l, width, color)
-    if base is not None:
-        meshes.append(base)
-    if tick_count > 0:
-        tp, tl = sym.tick_bars(coords, tick_count)
-        tm = _segments_to_ribbon_mesh(tp, tl, SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_TICK_COLOR)
-        if tm is not None:
-            meshes.append(tm)
-    if hazard:
-        hv, hf = sym.triangle_markers(coords)
-        hm = _faces_to_mesh(hv, hf, SIGNATURE_HAZARD_COLOR)
-        if hm is not None:
-            meshes.append(hm)
-    return meshes
+# depth toggle, visibility, picking — keeps working unchanged. The mesh
+# builders live in core/signature_render.py, shared with the 3D viewers so the
+# plan and the 3D scenes cannot drift apart.
 
 
 def _ribbon_from_coords(coords_local, width, color, closed=False):
@@ -600,7 +535,7 @@ def _ribbon_from_coords(coords_local, width, color, closed=False):
     if closed and len(coords) >= 2 and not np.allclose(coords[0], coords[-1]):
         coords = np.vstack([coords, coords[0]])
     p, l = sym.polyline_lines(coords)
-    return _segments_to_ribbon_mesh(p, l, width, color)
+    return segments_to_ribbon_mesh(p, l, width, color)
 
 
 def _polygon_fill_mesh(ext_local, color):
@@ -840,13 +775,7 @@ for layer_name, cfg in LINE_LAYERS.items():
 
         # LER signature choice (top-view plan): dashed for "under etablering",
         # red triangles for "meget farlig", El voltage tick marks, thick trace.
-        _sig_style = sym.line_style_from_driftsstatus(
-            row.get("driftsstatus", "") if "driftsstatus" in row.index else "")
-        _sig_hazard = sym.is_hazard(
-            row.get("fareklasse", "") if "fareklasse" in row.index else "")
-        _sig_ticks = (sym.voltage_tick_count(row.get("spaendingsniveau"))
-                      if layer_name == "Elledning" and "spaendingsniveau" in row.index
-                      else 0)
+        _sig_style, _sig_hazard, _sig_ticks = sym.signature_choice(row, layer_name)
         _sig_width = SIGNATURE_TRACE_WIDTH_M if is_trace else SIGNATURE_LINE_WIDTH_M
 
         row_attrs = []
@@ -901,8 +830,8 @@ for layer_name, cfg in LINE_LAYERS.items():
             for piece in pieces:
                 pc = np.asarray(piece, dtype=float)
                 pc[:, 2] = PLAN_Z
-                for m in _feature_signature_meshes(pc, _sig_style, color, _sig_width,
-                                                   _sig_hazard, _sig_ticks):
+                for m in feature_signature_meshes_plan(pc, _sig_style, color, _sig_width,
+                                                       _sig_hazard, _sig_ticks):
                     layer_mesh_list.append(m)
                     layer_src_list.append(_feat_src)
 
@@ -1501,6 +1430,12 @@ def _on_ler_toggle(checked):
 
 _ler_section.set_on_master(window, _on_ler_toggle)
 _ler_section.add_to(panel)
+
+# -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
+# The utility legend above explains colour; this one explains form, which is
+# the half a colour swatch cannot show. Collapsed by default, like LER's own.
+_sig_legend = SignatureLegendSection(em, components="plan", style=STYLE_PLAN)
+_sig_legend.add_to(panel)
 
 panel.add_stretch()
 

@@ -38,11 +38,17 @@ from core.config import (
 )
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
+from core.signature_legend import SignatureLegendSection
 from core.gui_helpers import (
     pivot_oblique, top_view as _shared_top_view, trench_or_scene_frame,
 )
 from core.rendering import point_material_flat, mesh_material, setup_scene_lighting
 from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
+from core import symbology as sym
+from core.signature_render import (
+    PolylineDash, line_segment_mesh,
+    feature_signature_meshes_3d, merge_meshes, signature_gn, show_signatures,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1.  Load site data + ground picking
@@ -124,6 +130,7 @@ _pc_aabb_box = _box(_bbox_min_utm[0], _bbox_min_utm[1],
 _ledningstrace_variants = {}
 
 _util_meshes = {}
+_sig_meshes = {}
 for layer_name, gdf in gdfs.items():
     if layer_name not in LINE_LAYERS:
         continue
@@ -131,6 +138,7 @@ for layer_name, gdf in gdfs.items():
     default_color = cfg["color"]
     radius = cfg["fallback_radius"]
     cyls = []
+    sig_parts = []
     for _, row in gdf.iterrows():
         geom = row.geometry
         if geom is None:
@@ -146,6 +154,10 @@ for layer_name, gdf in gdfs.items():
         bredde_m = get_bredde_width(row)
         if is_trace and bredde_m is None:
             bredde_m = 0.25
+        # LER signature choice: dashed for driftsstatus "under etablering", red
+        # triangles for fareklasse "meget farlig", El voltage ticks. The dash is
+        # cut into the line itself; the markers are a separate overlay.
+        sig_style, sig_hazard, sig_ticks = sym.signature_choice(row, layer_name)
         sub_geoms = list(geom.geoms) if geom.geom_type == "MultiLineString" else [geom]
         for sg in sub_geoms:
             coords = np.array(sg.coords, dtype=float)
@@ -154,20 +166,30 @@ for layer_name, gdf in gdfs.items():
             coords[:, 0] -= TX
             coords[:, 1] -= TY
             coords[:, 2] -= TZ
+            # Dash phase belongs to the whole polyline, so it is resolved once
+            # here and read per segment; taken per segment it would restart at
+            # every vertex and lose any dash straddling one.
+            dash = PolylineDash(coords) if sig_style == "dashed" else None
             for i in range(len(coords) - 1):
                 p1, p2 = coords[i], coords[i + 1]
-                if bredde_m is not None:
-                    mesh = segment_to_plane(p1, p2, bredde_m, color)
-                else:
-                    mesh = segment_to_cylinder(p1, p2, radius, color)
+                mesh = line_segment_mesh(p1, p2, color, radius=radius,
+                                         width=bredde_m, dash=dash, index=i)
                 if mesh is not None:
                     cyls.append(mesh)
+            # A feature is drawn in full here (no per-segment trimming), so the
+            # signature runs over the whole sub-geometry.
+            sig_parts.extend(feature_signature_meshes_3d(
+                coords, color, hazard=sig_hazard,
+                tick_count=sig_ticks, radius=radius, width=bredde_m))
     if cyls:
         merged = cyls[0]
         for c in cyls[1:]:
             merged += c
         merged.compute_vertex_normals()
         _util_meshes[layer_name] = merged
+    sig_merged = merge_meshes(sig_parts)
+    if sig_merged is not None:
+        _sig_meshes[layer_name] = sig_merged
 
 n_segs = sum(len(v.triangles) // 12 for v in _util_meshes.values()) if _util_meshes else 0
 print(f"  Utility meshes: {len(_util_meshes)} layers, ~{n_segs} segments  "
@@ -461,6 +483,11 @@ mat_mesh = mesh_material(0.8)
 for layer_name, mesh in _util_meshes.items():
     scene_widget.scene.add_geometry(f"util_{layer_name}", mesh, mat_mesh)
 
+# LER signature overlays, on by default so this viewer reads like the ERR plan
+_signatures_on = [True]
+for layer_name, mesh in _sig_meshes.items():
+    scene_widget.scene.add_geometry(signature_gn(layer_name), mesh, mat_mesh)
+
 bounds = scene_widget.scene.bounding_box
 scene_widget.setup_camera(60, bounds, cloud_centroid.tolist())
 
@@ -557,6 +584,7 @@ def hide_layer(name):
     def _hide():
         if scene_widget.scene.has_geometry(gn):
             scene_widget.scene.show_geometry(gn, False)
+        show_signatures(scene_widget.scene, name, False, _signatures_on[0])
         window.post_redraw()
     _pending_gui_actions.append(_hide)
 
@@ -568,6 +596,7 @@ def show_layer(name):
     def _show():
         if scene_widget.scene.has_geometry(gn):
             scene_widget.scene.show_geometry(gn, True)
+        show_signatures(scene_widget.scene, name, True, _signatures_on[0])
         window.post_redraw()
     _pending_gui_actions.append(_show)
 
@@ -620,6 +649,32 @@ panel.add_child(gui.Label(f"Site: {_ply_path.stem}"))
 panel.add_child(gui.Label(f"Area: {area.area_name}  |  Points: {len(pts):,}"))
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
 panel.add_child(gui.Label(f"Utilities near site: {n_total:,} features"))
+panel.add_fixed(int(0.5 * em))
+
+# LER signatures ("Signaturforklaring"): dashed "under etablering", red
+# "meget farlig" triangles, El voltage ticks.
+sig_cb = gui.Checkbox("LER signatures")
+sig_cb.checked = _signatures_on[0]
+if not _sig_meshes:
+    sig_cb.enabled = False
+
+
+def _on_sig(checked):
+    _signatures_on[0] = checked
+    for _ln in _sig_meshes:
+        show_signatures(scene_widget.scene, _ln,
+                        _layer_visible.get(_ln, True), checked)
+    window.post_redraw()
+
+
+sig_cb.set_on_checked(_on_sig)
+panel.add_child(sig_cb)
+
+# -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
+# The utility legend above explains colour; this one explains form, which is
+# the half a colour swatch cannot show. Collapsed by default, like LER's own.
+_sig_legend = SignatureLegendSection(em, components="point")
+_sig_legend.add_to(panel)
 panel.add_fixed(int(0.5 * em))
 
 # Camera reset — reframe on the point cloud (utilities at -99 distort the view)

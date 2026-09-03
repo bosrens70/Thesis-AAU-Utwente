@@ -38,9 +38,9 @@ from core.config import (
 )
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import (
-    segment_to_cylinder, segment_to_plane, point_to_segment_dists,
-    srgb_to_linear, linear_to_srgb,
+    point_to_segment_dists, srgb_to_linear, linear_to_srgb,
 )
+from core.signature_legend import SignatureLegendSection
 from core.crop import CropRegion
 from core.depth import clean_coords_with_depth as _core_clean_coords
 from core.rendering import (
@@ -58,6 +58,12 @@ from core.ledningstrace import (
 )
 from core.trace_render import (
     build_trace_centerlines, add_trace_centerlines, set_layer_material,
+)
+from core import symbology as sym
+from core.signature_render import (
+    PolylineDash, line_segment_mesh,
+    feature_signature_meshes_3d, stitch_clipped_segments, merge_meshes,
+    add_signature_meshes, set_signature_material,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,6 +161,7 @@ _t_pipes0 = time.perf_counter()
 all_pipe_meshes   = []          # flat list — kept for count reporting
 _pipe_layer_cyls  = {}          # layer_name -> [TriangleMesh, ...]  per-layer
 _pipe_seg_dsrc    = {}          # layer_name -> [DepthSource, ...]   per-segment
+_sig_layer_meshes = {}          # layer_name -> [TriangleMesh, ...]  signatures
 layer_stats = {}
 all_pipe_coords  = []
 all_pipe_sources = []   # per-vertex DepthSource arrays, parallel to all_pipe_coords
@@ -165,6 +172,9 @@ pick_seg_p2        = []   # list of np.array([x,y,z])  — segment end
 pick_seg_midpoints = []   # list of np.array([x,y,z])  — for highlight placement
 pick_seg_attrs     = []   # list of [(label, value), ...]
 pick_seg_layer     = []   # layer name per segment
+# Dash pattern per segment, (PolylineDash, index in its polyline) or None. Only
+# how the segment is drawn: the arrays above still hold every segment in full.
+pick_seg_dash      = []
 
 # Store per-utility-type average depth for component fallback
 _layer_avg_depth_local = {}
@@ -215,10 +225,18 @@ for layer_name, cfg in LINE_LAYERS.items():
         is_trace, display_fa, color = get_ledningstrace_display_info(layer_name, row, default_color)
         if is_trace and display_fa and display_fa not in _ledningstrace_variants:
             _ledningstrace_variants[display_fa] = color
+        storage_key = get_storage_key(layer_name, display_fa)
 
         bredde_m = get_bredde_width(row)
         if is_trace and bredde_m is None:
             bredde_m = 0.25  # fallback: 25 cm
+
+        # LER signature choice: dashed for driftsstatus "under etablering", red
+        # triangles for fareklasse "meget farlig", El voltage ticks. The dash is
+        # cut into the line itself below; the markers are a separate overlay.
+        # Neither reaches the picking arrays.
+        _sig_style, _sig_hazard, _sig_ticks = sym.signature_choice(row, layer_name)
+        _sig_any = _sig_hazard or _sig_ticks > 0
 
         # Get indicative depth for this feature
         vejl_dybde = None
@@ -246,21 +264,28 @@ for layer_name, cfg in LINE_LAYERS.items():
             _layer_z_vals.extend(coords[:, 2].tolist())
             feature_hit = True
 
+            # Registered Z is the pipe crown (top), not its axis; lower the drawn
+            # cylinder by its radius so its crown sits on the line. The pick line
+            # below stays on the registered crown. A trace's ribbon is already at
+            # the registered top level, so it drops by nothing.
+            _axis_dz = np.array([0.0, 0.0, 0.0 if bredde_m is not None else radius])
+            # Dash phase belongs to the whole polyline, so it is resolved once per
+            # polyline and read per segment; taken per segment it would restart at
+            # every vertex and lose any dash straddling one.
+            _dash = PolylineDash(coords - _axis_dz) if _sig_style == "dashed" else None
+
+            _sig_chords = []
             for i in range(len(coords) - 1):
                 clipped = _clip_segment_to_bbox(coords[i], coords[i + 1])
                 if clipped is None:
                     continue
-                if bredde_m is not None:
-                    cyl = segment_to_plane(clipped[0], clipped[1], bredde_m, color)
-                else:
-                    # Registered Z is the pipe crown (top), not its axis; lower the
-                    # drawn cylinder by its radius so its crown sits on the line.
-                    # The pick line (below) stays on the registered crown.
-                    _dz = np.array([0.0, 0.0, radius])
-                    cyl = segment_to_cylinder(clipped[0] - _dz, clipped[1] - _dz, radius, color)
+                _ax1, _ax2 = clipped[0] - _axis_dz, clipped[1] - _axis_dz
+                cyl = line_segment_mesh(_ax1, _ax2, color, radius=radius,
+                                        width=bredde_m, dash=_dash, index=i)
                 if cyl is not None:
                     all_pipe_meshes.append(cyl)
-                    storage_key = get_storage_key(layer_name, display_fa)
+                    if _sig_any:
+                        _sig_chords.append((_ax1, _ax2))
                     _pipe_layer_cyls.setdefault(storage_key, []).append(cyl)
                     # Track color for this storage key
                     if storage_key not in _storage_key_colors:
@@ -274,7 +299,14 @@ for layer_name, cfg in LINE_LAYERS.items():
                     pick_seg_midpoints.append(midpt)
                     pick_seg_attrs.append(row_attrs)
                     pick_seg_layer.append(storage_key)
+                    pick_seg_dash.append((_dash, i) if _dash is not None else None)
                     n_segments += 1
+
+            for _piece in stitch_clipped_segments(_sig_chords):
+                _sig_layer_meshes.setdefault(storage_key, []).extend(
+                    feature_signature_meshes_3d(
+                        _piece, color, hazard=_sig_hazard,
+                        tick_count=_sig_ticks, radius=radius, width=bredde_m))
 
         if feature_hit:
             n_features += 1
@@ -317,12 +349,22 @@ for _ln, _cyls in _pipe_layer_cyls.items():
     _m.compute_vertex_normals()
     _pipe_layer_meshes[_ln] = _m
 
+# Per-layer merged signature overlays. Held apart from the pipe mesh because the
+# legend colours of a signature are fixed: merged in, they would be repainted by
+# the depth-hierarchy recolouring and stop meaning what the legend says.
+_sig_meshes = {}
+for _ln, _sms in _sig_layer_meshes.items():
+    _m = merge_meshes(_sms)
+    if _m is not None:
+        _sig_meshes[_ln] = _m
+
 # Trace centrelines: a trace's corridor ribbon is drawn transparent (see
 # core/trace_render.py), so its registered centreline is drawn separately as a
 # thin tube, like any other utility. Built from the picking arrays above.
 _trace_centerlines = build_trace_centerlines(
     pick_seg_p1, pick_seg_p2, pick_seg_layer,
-    lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]))
+    lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]),
+    dash_of_index=lambda i: pick_seg_dash[i])
 
 # Pipe centroid
 pipe_centroid = np.array([0.0, 0.0, 0.0])
@@ -597,6 +639,7 @@ origin_pt    = np.array([0.0, 0.0, 0.0])
 pick_active  = [False]
 class_labels_active = [False]   # toggled by L key or checkbox
 origin_frame_visible  = [False]  # toggled by the "Show origin axis" checkbox
+signatures_on         = [True]   # toggled by the "LER signatures" checkbox
 
 _t_gui0 = time.perf_counter()
 app = gui.Application.instance
@@ -629,6 +672,12 @@ for _ln, _mesh in _pipe_layer_meshes.items():
 add_trace_centerlines(
     scene_widget.scene, _trace_centerlines, pipe_opacity[0], make_mesh_material,
     visible_of=lambda k: _layer_visible.get(k, True))
+
+# Add the LER signature overlays, at the unscaled opacity for the same reason
+add_signature_meshes(
+    scene_widget.scene, _sig_meshes, pipe_opacity[0], make_mesh_material,
+    visible_of=lambda k: _layer_visible.get(k, True),
+    signatures_on=signatures_on[0])
 
 # Add per-layer component meshes (hidden by default)
 for _ln, _mesh in _comp_layer_meshes.items():
@@ -748,6 +797,27 @@ def _on_origin_toggle(checked):
 origin_toggle_cb.set_on_checked(_on_origin_toggle)
 panel.add_child(origin_toggle_cb)
 
+# ── LER Signature Toggle ────────────────────────────────────────────────────
+# The cartographic signatures of the LER "Signaturforklaring", on by default so
+# this viewer reads like the ERR plan and like LER itself.
+signature_toggle_cb = gui.Checkbox("LER signatures")
+signature_toggle_cb.checked = signatures_on[0]
+if not _sig_meshes:
+    signature_toggle_cb.enabled = False
+
+
+def _on_signature_toggle(checked):
+    signatures_on[0] = checked
+    for ln in _sig_meshes:
+        alpha = pipe_opacity[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
+        set_signature_material(scene_widget.scene, ln, alpha,
+                               make_mesh_material, checked)
+    window.post_redraw()
+
+
+signature_toggle_cb.set_on_checked(_on_signature_toggle)
+panel.add_child(signature_toggle_cb)
+
 panel.add_fixed(int(0.8 * em))
 
 # ── Class Label Toggle ──────────────────────────────────────────────────────
@@ -799,6 +869,11 @@ def _apply_opacity(val: float):
         set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                            make_mesh_material)
 
+    for ln in _sig_meshes:
+        alpha = val if _layer_visible.get(ln, True) else 0.0
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
+                               signatures_on[0])
+
     for ln in _comp_layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
         scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
@@ -815,10 +890,12 @@ _comp_checkboxes = []
 def _make_pipe_toggle(ln):
     def _cb(checked):
         _layer_visible[ln] = checked
+        alpha = pipe_opacity[0] if checked else 0.0
         if ln in _pipe_layer_meshes:
-            alpha = pipe_opacity[0] if checked else 0.0
             set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                                make_mesh_material)
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
+                               signatures_on[0])
         window.post_redraw()
     return _cb
 
@@ -838,10 +915,12 @@ def _on_toggle_all_pipes(checked):
     for ln, cb in _pipe_checkboxes:
         cb.checked = checked
         _layer_visible[ln] = checked
+        alpha = pipe_opacity[0] if checked else 0.0
         if ln in _pipe_layer_meshes:
-            alpha = pipe_opacity[0] if checked else 0.0
             set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                                make_mesh_material)
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
+                               signatures_on[0])
     window.post_redraw()
 
 _all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
@@ -905,6 +984,10 @@ def _on_ler_toggle(checked):
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                            make_mesh_material)
+    for ln in _sig_meshes:
+        alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
+                               signatures_on[0])
     for ln in _comp_layer_meshes:
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
@@ -912,6 +995,12 @@ def _on_ler_toggle(checked):
 
 _ler_section.set_on_master(window, _on_ler_toggle)
 _ler_section.add_to(panel)
+
+# -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
+# The utility legend above explains colour; this one explains form, which is
+# the half a colour swatch cannot show. Collapsed by default, like LER's own.
+_sig_legend = SignatureLegendSection(em, components="point")
+_sig_legend.add_to(panel)
 
 panel.add_stretch()
 

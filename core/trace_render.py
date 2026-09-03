@@ -32,7 +32,8 @@ def trace_centerline_gn(storage_key):
 
 def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
                             radius=TRACE_CENTERLINE_RADIUS,
-                            color_of_index=None):
+                            color_of_index=None,
+                            dash_of_index=None):
     """Build one merged centreline tube mesh per Ledningstrace storage key.
 
     Reads the per-segment arrays the viewers already keep for picking, so no
@@ -47,6 +48,13 @@ def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
                              per feature rather than per layer (e.g. by
                              registered accuracy class), where one layer's
                              centreline is no longer one colour.
+    ``dash_of_index``        optional callable ``segment index -> (PolylineDash,
+                             polyline segment index)`` or ``None``. A trace
+                             registered as driftsstatus "under etablering" is
+                             drawn dashed, and its centreline has to gap with
+                             its corridor ribbon rather than stay solid over it.
+                             Omitted, every centreline is solid, which is what
+                             it was before.
 
     Returns ``{storage_key: TriangleMesh}``, empty when there are no traces.
     """
@@ -66,7 +74,15 @@ def build_trace_centerlines(seg_p1, seg_p2, seg_layer, color_of,
         # ribbon plane sits, so the two coincide rather than one floating above
         # the other.
         col = color_of_index(i) if color_of_index is not None else color_of(key)
-        cyl = segment_to_cylinder(p1[i], p2[i], radius, col)
+        dash = dash_of_index(i) if dash_of_index is not None else None
+        if dash is None:
+            cyl = segment_to_cylinder(p1[i], p2[i], radius, col)
+        else:
+            # The dash phase belongs to the whole registered polyline, so the
+            # caller hands over the pattern it built for the corridor ribbon
+            # together with this segment's place in it.
+            pattern, seg_index = dash
+            cyl = pattern.segment_mesh(seg_index, p1[i], p2[i], col, radius=radius)
         if cyl is not None:
             by_key.setdefault(key, []).append(cyl)
 

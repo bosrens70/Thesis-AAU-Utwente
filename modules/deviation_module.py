@@ -78,10 +78,10 @@ from core.geometry import (
     batch_point_to_plane_segment_components,
     discretize_segment,
     deviation_to_color, deviation_to_color_continuous,
-    segment_to_cylinder, segment_to_plane,
     accuracy_buffer_polygon, polygon_to_o3d_mesh, polygon_to_o3d_lineset,
     merge_linesets, drape_z_from_polylines,
 )
+from core.signature_legend import SignatureLegendSection
 from core.crop import CropRegion
 from core.crown import crown_line
 from core.depth import clean_coords_with_depth as _core_clean_coords
@@ -93,6 +93,12 @@ from core.gui_helpers import (
 from core.ledningstrace import get_bredde_width, is_trace_key, ribbon_alpha
 from core.trace_render import (
     build_trace_centerlines, add_trace_centerlines, trace_centerline_gn,
+)
+from core import symbology as sym
+from core.signature_render import (
+    PolylineDash, line_segment_mesh,
+    feature_signature_meshes_3d, stitch_clipped_segments, merge_meshes,
+    signature_gn, show_signatures,
 )
 from core.rendering import (
     point_material_shaded, point_material_flat, mesh_material, line_material,
@@ -168,8 +174,13 @@ all_seg_depth_source = [] # DepthSource per segment: how its Z was arrived at. T
                           # REGISTERED only when both ends genuinely are.
 all_seg_owner = []        # ledningsejer per segment (mandatory on every feature)
 all_seg_etabl = []        # etableringstidspunkt per segment, "" when absent
+# Dash pattern per segment, (PolylineDash, index in its polyline) or None. Only
+# how the segment is drawn: every array above still holds every segment in full,
+# so nothing the deviation is measured against changes.
+all_seg_dash = []
 ler_meshes = {}           # layer -> merged TriangleMesh (for visualisation)
 ler_meshes_acc = {}       # layer -> same mesh, painted by registered accuracy class
+_sig_layer_meshes = {}    # layer -> [TriangleMesh, ...] LER signature overlay parts
 _layer_avg_depth_local = {}  # layer_name -> float (average local Z for component depth fallback)
 ler_stats = {}            # layer -> (n_feat_active, n_seg_active, n_feat_inactive, n_seg_inactive)
 
@@ -302,6 +313,22 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
         owner_val = str(row.get("ledningsejer", "") or "").strip()
         etabl_val = str(row.get("etableringstidspunkt", "") or "").strip()[:10]
 
+        # LER signature choice: dashed for driftsstatus "under etablering", red
+        # triangles for fareklasse "meget farlig", El voltage ticks. Purely a
+        # display choice: neither the dash cut into the line nor the markers
+        # enter the segment arrays the deviation is measured against.
+        _sig_style, _sig_hazard, _sig_ticks = sym.signature_choice(row, layer_name)
+        _sig_any = _sig_hazard or _sig_ticks > 0
+        # The registered vertical coordinate is the crown (top) of the utility,
+        # not its axis, for every LER utility (featurekatalog, geometri
+        # attribute: "Vertikale koordinater af geometrien angives for overkanten
+        # af ledningen"), so the drawn cylinder is lowered by its radius and its
+        # crown lands on the registered line. A trace's ribbon is already at that
+        # level and drops by nothing. Per feature, not per segment: the dash
+        # phase below needs the whole polyline on the axis actually drawn.
+        _crown_offset = radius if bredde_m is None else 0.0
+        _axis_dz = np.array([0.0, 0.0, _crown_offset])
+
         hit = False
         for sub in subs:
             coords_raw = np.array(sub.coords, dtype=float)
@@ -310,6 +337,11 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
             coords, z_src = _to_local(coords_raw, vejl)
             _layer_z_vals.extend(coords[:, 2].tolist())
             hit = True
+            # Dash phase belongs to the whole polyline, so it is resolved once per
+            # polyline and read per segment; taken per segment it would restart at
+            # every vertex and lose any dash straddling one.
+            _dash = PolylineDash(coords - _axis_dz) if _sig_style == "dashed" else None
+            _sig_chords = []
             for i in range(len(coords) - 1):
                 clipped = _clip_segment_to_crop(coords[i], coords[i + 1])
                 if clipped is None:
@@ -321,16 +353,7 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_active.append(is_active)
                 all_seg_half_width.append(bredde_m / 2.0 if bredde_m is not None else 0.0)
                 all_seg_radius.append(radius)
-                # The registered vertical coordinate is the crown (top) of the
-                # utility, not its axis, for every LER utility (featurekatalog,
-                # geometri attribute: "Vertikale koordinater af geometrien angives
-                # for overkanten af ledningen"). crown_offset is how far to lower
-                # the registered line so the built cylinder's crown sits on it: the
-                # tube radius for every pipe (whether the diameter is registered or
-                # a fallback is used), and 0 for traces, which are flat ribbons
-                # already at the registered top level.
-                crown_offset = radius if bredde_m is None else 0.0
-                all_seg_crown_offset.append(crown_offset)
+                all_seg_crown_offset.append(_crown_offset)
                 all_seg_gml_id.append(gml_id_val)
                 all_seg_acc_class.append(acc_class)
                 # DepthSource is ordered worst-last, so max() of the two endpoints
@@ -338,11 +361,12 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                 all_seg_depth_source.append(int(max(z_src[i], z_src[i + 1])))
                 all_seg_owner.append(owner_val)
                 all_seg_etabl.append(etabl_val)
-                if bredde_m is not None:
-                    mesh = segment_to_plane(cp1, cp2, bredde_m, color)
-                else:
-                    _dz = np.array([0.0, 0.0, crown_offset])
-                    mesh = segment_to_cylinder(cp1 - _dz, cp2 - _dz, radius, color)
+                all_seg_dash.append((_dash, i) if _dash is not None else None)
+                _ax1, _ax2 = cp1 - _axis_dz, cp2 - _axis_dz
+                mesh = line_segment_mesh(_ax1, _ax2, color, radius=radius,
+                                         width=bredde_m, dash=_dash, index=i)
+                if _sig_any:
+                    _sig_chords.append((_ax1, _ax2))
                 if mesh is not None:
                     _part = (len(mesh.vertices), acc_class)
                     if is_trace:
@@ -355,6 +379,11 @@ for layer_name, cfg in list(LINE_LAYERS.items()):
                     n_seg_act += 1
                 else:
                     n_seg_inact += 1
+            for _piece in stitch_clipped_segments(_sig_chords):
+                _sig_layer_meshes.setdefault(display_name, []).extend(
+                    feature_signature_meshes_3d(
+                        _piece, color, hazard=_sig_hazard,
+                        tick_count=_sig_ticks, radius=radius, width=bredde_m))
         if hit:
             _acc_view_total += 1
             if acc_class:
@@ -435,6 +464,15 @@ n_total_segs = len(seg_p1)
 n_active_segs = int(seg_active.sum()) if len(seg_active) else 0
 n_inactive_segs = n_total_segs - n_active_segs
 
+# Per-layer merged signature overlays. Kept out of ler_meshes because that mesh
+# is swapped for a deviation-coloured cloud and repainted by accuracy class,
+# neither of which a fixed legend colour may follow.
+sig_meshes = {}
+for _sln, _sms in _sig_layer_meshes.items():
+    _sm = merge_meshes(_sms)
+    if _sm is not None:
+        sig_meshes[_sln] = _sm
+
 # Trace centrelines: the corridor ribbon is drawn transparent (see
 # core/trace_render.py), so the registered centreline is drawn as a thin tube
 # through the same mesh material as the pipes. Shown only in the solid colour
@@ -442,7 +480,8 @@ n_inactive_segs = n_total_segs - n_active_segs
 # centreline cloud, which this tube would cover.
 _trace_centerlines = build_trace_centerlines(
     seg_p1, seg_p2, all_seg_layer,
-    lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]))
+    lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]),
+    dash_of_index=lambda i: all_seg_dash[i])
 # Second set for the accuracy-class colouring. The centreline is the visible
 # part of a trace (the corridor ribbon is nearly transparent), so it has to
 # carry the class too, per segment: one trace layer holds several features and
@@ -450,7 +489,8 @@ _trace_centerlines = build_trace_centerlines(
 _trace_centerlines_acc = build_trace_centerlines(
     seg_p1, seg_p2, all_seg_layer,
     lambda k: LINE_LAYERS.get(k, {}).get("color", [0.5, 0.5, 0.5]),
-    color_of_index=lambda i: accuracy_class_color(seg_acc_class[i]))
+    color_of_index=lambda i: accuracy_class_color(seg_acc_class[i]),
+    dash_of_index=lambda i: all_seg_dash[i])
 
 _t_ler1 = time.perf_counter()
 print(f"\n  Total: {n_total_segs:,} LER segments loaded in {_t_ler1 - _t_ler0:.1f}s"
@@ -1799,6 +1839,12 @@ for ln, mesh in ler_meshes.items():
 # Trace centrelines, at the unscaled opacity so they read like the pipes.
 add_trace_centerlines(scene_widget.scene, _trace_centerlines, 0.6, make_mesh_mat)
 
+# LER signature overlays, at the unscaled opacity for the same reason. On by
+# default, so this viewer reads like the ERR plan and like LER itself.
+_sig_on = [True]
+for _sln, _smesh in sig_meshes.items():
+    scene_widget.scene.add_geometry(signature_gn(_sln), _smesh, make_mesh_mat(0.6))
+
 # Add LER component meshes
 _comp_visible = {}
 for ln, mesh in comp_meshes.items():
@@ -1977,6 +2023,21 @@ def _sync_trace_centerlines():
                 gn, _on and _ler_master_on[0] and _ler_visible.get(ln, True))
 
 
+def _signatures_visible():
+    """The LER signatures belong to the solid colour modes only. In a deviation
+    mode the colour of the LER geometry carries a measurement, so a fixed red
+    hazard triangle beside it would read as a deviation class."""
+    return _sig_on[0] and _color_mode[0] not in _LER_DEV_MODES
+
+
+def _sync_signatures():
+    """Match every signature overlay to the master, its layer, and the mode."""
+    _on = _signatures_visible()
+    for ln in sig_meshes:
+        show_signatures(scene_widget.scene, ln,
+                        _ler_master_on[0] and _ler_visible.get(ln, True), _on)
+
+
 def _apply_ler_color_mode(mode):
     """Swap each LER layer between its solid mesh and a discretized deviation
     point cloud. The cloud carries the metric (XYZ or Z) and colouring
@@ -1997,6 +2058,7 @@ def _apply_ler_color_mode(mode):
                 gn, _solid_ler_mesh(ln), make_mesh_mat(ribbon_alpha(ln, _ler_opacity[0])))
         scene_widget.scene.show_geometry(gn, _ler_master_on[0] and _ler_visible.get(ln, True))
     _sync_trace_centerlines()
+    _sync_signatures()
 
 
 def _apply_ler_solid_colors():
@@ -2161,6 +2223,23 @@ if _n_crown_total:
 else:
     panel.add_child(gui.Label("Crown line: none recovered"))
 
+# LER signature toggle: the cartographic signatures of the LER
+# "Signaturforklaring", shown in the solid colour modes only (_signatures_visible).
+sig_cb = gui.Checkbox("LER signatures")
+sig_cb.checked = _sig_on[0]
+if not sig_meshes:
+    sig_cb.enabled = False
+
+
+def _on_sig(c):
+    _sig_on[0] = c
+    _sync_signatures()
+    window.post_redraw()
+
+
+sig_cb.set_on_checked(_on_sig)
+panel.add_child(sig_cb)
+
 # Crop-region toggle (XY AABB + buffer rectangle in rect mode)
 crop_cb = gui.Checkbox("Crop region (XY AABB + buffer)")
 crop_cb.checked = True
@@ -2264,6 +2343,7 @@ def _apply_utility_filter(sel):
         _ler_visible[ln] = vis
         scene_widget.scene.show_geometry(f"ler_{ln}", vis and _ler_master_on[0])
     _sync_trace_centerlines()
+    _sync_signatures()
 
     # Accuracy buffers follow the same per-utility matching as the LER layers.
     matching_acc = _get_matching_accbuf_keys(sel_ut) if sel_ut is not None else None
@@ -2309,9 +2389,14 @@ def _on_ler_opacity(val):
             mat = (make_ler_pt_mat(6.0, val) if in_ler_dev
                    else make_mesh_mat(ribbon_alpha(ln, val)))
             scene_widget.scene.modify_geometry_material(f"ler_{ln}", mat)
-    # Trace centrelines follow the slider at the unscaled opacity
+    # Trace centrelines and signature overlays follow the slider at the
+    # unscaled opacity
     for ln in _trace_centerlines:
         gn = trace_centerline_gn(ln)
+        if scene_widget.scene.has_geometry(gn):
+            scene_widget.scene.modify_geometry_material(gn, make_mesh_mat(val))
+    for ln in sig_meshes:
+        gn = signature_gn(ln)
         if scene_widget.scene.has_geometry(gn):
             scene_widget.scene.modify_geometry_material(gn, make_mesh_mat(val))
     for ln in comp_meshes:
@@ -2333,10 +2418,17 @@ def _on_ler_master(checked):
         scene_widget.scene.show_geometry(f"comp_{c_ln}",
                                          checked and _comp_visible.get(c_ln, False))
     _sync_trace_centerlines()
+    _sync_signatures()
 
 
 _ler_section.set_on_master(window, _on_ler_master)
 _ler_section.add_to(panel)
+
+# -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
+# The utility legend above explains colour; this one explains form, which is
+# the half a colour swatch cannot show. Collapsed by default, like LER's own.
+_sig_legend = SignatureLegendSection(em, components="point")
+_sig_legend.add_to(panel)
 
 # Export the trench-restricted discrete LER deviation modes (XYZ, XY, Z) to LAS
 # for QGIS. Only the samples inside the picked trench are written; with no
@@ -2393,6 +2485,7 @@ def _on_toggle_all_ler(checked):
         _ler_visible[_ln] = checked
         scene_widget.scene.show_geometry(f"ler_{_ln}", checked and _ler_master_on[0])
     _sync_trace_centerlines()
+    _sync_signatures()
     window.post_redraw()
 
 
@@ -2419,6 +2512,7 @@ for ln in LINE_LAYERS:
             _ler_visible[layer] = checked
             scene_widget.scene.show_geometry(f"ler_{layer}", checked and _ler_master_on[0])
             _sync_trace_centerlines()
+            _sync_signatures()
             window.post_redraw()
         return _cb
 

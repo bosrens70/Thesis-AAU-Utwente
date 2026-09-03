@@ -383,7 +383,14 @@ SIGNATURE_TRACE_WIDTH_M     = 0.30   # m, Ledningstrace ribbon ("Trace")
 SIGNATURE_COMP_LINE_WIDTH_M = 0.20   # m, component line ribbon ("Komponent linje")
 SIGNATURE_TICK_BAR_WIDTH_M  = 0.05   # m, thickness of an El voltage tick bar
 SIGNATURE_TICK_COLOR        = [0.0, 0.0, 0.0]   # linear black (voltage ticks)
-SIGNATURE_Z_LIFT            = 0.03   # m, lift decorators above the base line (avoid z-fight)
+# Clearance of a marker above the line it annotates, in metres, in both the plan
+# and the 3D views. A marker is meant to read as sitting ON the registered line,
+# which vertically is the crown, so this is only the margin that keeps it off
+# that line: a horizontal marker at exactly crown height is tangent to the tube
+# and z-fights along it, and Open3D 0.19 has no depth_func to resolve that, so
+# the separation has to be geometric. Raise it if markers flicker when the plan
+# view is zoomed far out, where depth precision is coarsest.
+SIGNATURE_Z_LIFT            = 0.002  # m
 
 # El voltage classes -> number of tick-mark groups (spaendingsniveau in kV).
 # Legend bins: < 1, 1-29, 30-130, > 131 kV  ->  0, 1, 2, 3 ticks.
@@ -397,6 +404,50 @@ SIGNATURE_HAZARD_VALUES   = ("meget farlig",)
 SIGNATURE_HAZARD_SPACING  = 1.50   # m between triangles along the line
 SIGNATURE_HAZARD_SIZE     = 0.40   # m, triangle edge scale
 SIGNATURE_HAZARD_COLOR    = [0.80, 0.0, 0.0]   # linear red (legend triangles)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LER LINE SIGNATURES (3D viewers)
+# ─────────────────────────────────────────────────────────────────────────────
+# Same signatures on a true 3D scene (core.signature_render). The plan above
+# draws a utility as a 0.10 m ribbon, so its 0.40 m triangles read at 4:1; a 3D
+# viewer draws the registered tube, often ~0.01 m in radius, where a marker that
+# size would swallow the utility it annotates. Roughly a third of the plan
+# sizes, spacing included, so the marker-to-gap proportions of the
+# "Signaturforklaring" survive at the tighter zoom of a single trench.
+# Colours are shared with the plan (SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR):
+# a signature must not change meaning between two viewers.
+SIGNATURE_3D_DASH_LEN         = 0.20   # m, dash length for driftsstatus "under etablering"
+SIGNATURE_3D_GAP_LEN          = 0.13   # m, gap between dashes
+SIGNATURE_3D_TICK_SPACING     = 0.50   # m between tick groups along the line
+SIGNATURE_3D_TICK_LEN         = 0.17   # m, full width of a tick bar across the line
+SIGNATURE_3D_TICK_GAP         = 0.05   # m between ticks within a 2- or 3-tick group
+SIGNATURE_3D_TICK_BAR_WIDTH_M = 0.02   # m, thickness of an El voltage tick bar
+SIGNATURE_3D_HAZARD_SPACING   = 0.50   # m between triangles along the line
+SIGNATURE_3D_HAZARD_SIZE      = 0.14   # m, triangle edge scale
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LER SIGNATURE LEGEND ("Signaturforklaring" panel section)
+# ─────────────────────────────────────────────────────────────────────────────
+# The legend explains the FORM of a signature; the utility legend above it
+# explains colour. So the generic rows are drawn in neutral ink and only the
+# colours that are themselves part of a signature (the hazard red, the tick
+# black, the El red) are taken from the layer and signature tables.
+#
+# Sizes are in em, so the strip scales with the panel font rather than fixing a
+# pixel size that would be wrong at another DPI. Colours here are sRGB, unlike
+# the linear layer colours above: they are rasterised straight into an image
+# rather than handed to Open3D as a material.
+SIGNATURE_LEGEND_TITLE       = "Signaturforklaring"
+SIGNATURE_LEGEND_BG          = [0.96, 0.96, 0.96]   # sRGB, the light legend card
+SIGNATURE_LEGEND_INK         = [0.05, 0.05, 0.05]   # sRGB, generic line ink
+SIGNATURE_LEGEND_TRACE_INK   = [0.72, 0.72, 0.72]   # sRGB, the wide trace band
+SIGNATURE_LEGEND_SWATCH_W_EM = 5.0    # em, width of one symbol swatch
+SIGNATURE_LEGEND_SWATCH_H_EM = 1.20   # em, height of one symbol swatch
+
+# The driftsstatus that draws a line dashed. Named here rather than written
+# into the rule and the legend label separately, so the two cannot disagree
+# about what the dash means.
+SIGNATURE_DASH_DRIFTSSTATUS  = "under etablering"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DEVIATION HEATMAP

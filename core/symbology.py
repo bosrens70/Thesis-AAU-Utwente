@@ -21,7 +21,7 @@ from core.config import (
     VOLTAGE_KV_THRESHOLDS,
     SIGNATURE_TICK_SPACING, SIGNATURE_TICK_LEN, SIGNATURE_TICK_GAP,
     SIGNATURE_HAZARD_VALUES, SIGNATURE_HAZARD_SPACING, SIGNATURE_HAZARD_SIZE,
-    SIGNATURE_Z_LIFT,
+    SIGNATURE_Z_LIFT, SIGNATURE_DASH_DRIFTSSTATUS,
 )
 
 _UP = np.array([0.0, 0.0, 1.0])
@@ -32,7 +32,8 @@ _UP = np.array([0.0, 0.0, 1.0])
 # ─────────────────────────────────────────────────────────────────────────────
 def line_style_from_driftsstatus(value):
     """Return ``"dashed"`` for driftsstatus "under etablering", else ``"solid"``."""
-    return "dashed" if "under etablering" in str(value or "").strip().lower() else "solid"
+    return ("dashed" if SIGNATURE_DASH_DRIFTSSTATUS in str(value or "").strip().lower()
+            else "solid")
 
 
 def is_hazard(fareklasse_value, trigger=SIGNATURE_HAZARD_VALUES):
@@ -58,6 +59,24 @@ def voltage_tick_count(spaendingsniveau_kv, thresholds=VOLTAGE_KV_THRESHOLDS):
     if np.isnan(v):
         return 0
     return int(np.searchsorted(np.asarray(thresholds, dtype=float), v, side="right"))
+
+
+def signature_choice(row, layer_name):
+    """The three signature rules read off one GML feature row.
+
+    Returns ``(style, hazard, tick_count)``. Every attribute behind a rule is
+    optional in the GML, so a missing column falls back to that rule's neutral
+    answer instead of raising. Voltage ticks are an Elledning signature only:
+    a spaendingsniveau on any other layer is not a legend class.
+    """
+    idx = getattr(row, "index", ())
+    style = line_style_from_driftsstatus(
+        row.get("driftsstatus", "") if "driftsstatus" in idx else "")
+    hazard = is_hazard(
+        row.get("fareklasse", "") if "fareklasse" in idx else "")
+    ticks = (voltage_tick_count(row.get("spaendingsniveau"))
+             if layer_name == "Elledning" and "spaendingsniveau" in idx else 0)
+    return style, hazard, ticks
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,6 +123,36 @@ def polyline_lines(coords):
     return coords, lines.astype(int)
 
 
+def dash_intervals(total, dash_len=SIGNATURE_DASH_LEN, gap_len=SIGNATURE_GAP_LEN):
+    """Dash [start, end] arc-length intervals along a line of length ``total``.
+
+    Returns a (K, 2) array. The phase belongs to the whole line: a viewer that
+    draws the line one segment at a time must intersect these intervals with
+    each segment rather than restart the pattern at every vertex.
+    """
+    if total <= 1e-9:
+        return np.empty((0, 2))
+    period = max(dash_len + gap_len, 1e-6)
+    spans, s = [], 0.0
+    while s < total:
+        s0, s1 = s, min(s + dash_len, total)
+        if s1 - s0 > 1e-6:
+            spans.append([s0, s1])
+        s += period
+    if not spans:
+        return np.empty((0, 2))
+    return np.asarray(spans, dtype=float)
+
+
+def polyline_dash_spans(coords, dash_len=SIGNATURE_DASH_LEN, gap_len=SIGNATURE_GAP_LEN):
+    """(cumulative arc length per vertex, dash intervals) for one polyline."""
+    coords = np.asarray(coords, dtype=float)
+    if len(coords) < 2:
+        return np.zeros(len(coords)), np.empty((0, 2))
+    cum, total = _arc_length(coords)
+    return cum, dash_intervals(total, dash_len, gap_len)
+
+
 def dash_segments(coords, dash_len=SIGNATURE_DASH_LEN, gap_len=SIGNATURE_GAP_LEN):
     """Dashed line ("under etablering"): (points (2K,3), lines (K,2)).
 
@@ -113,20 +162,14 @@ def dash_segments(coords, dash_len=SIGNATURE_DASH_LEN, gap_len=SIGNATURE_GAP_LEN
     coords = np.asarray(coords, dtype=float)
     if len(coords) < 2:
         return np.empty((0, 3)), np.empty((0, 2), dtype=int)
-    cum, total = _arc_length(coords)
-    if total <= 1e-9:
-        return np.empty((0, 3)), np.empty((0, 2), dtype=int)
-    period = max(dash_len + gap_len, 1e-6)
-    pts, lines, s = [], [], 0.0
-    while s < total:
-        s0, s1 = s, min(s + dash_len, total)
-        if s1 - s0 > 1e-6:
-            p0, _ = _point_and_dir(coords, cum, s0)
-            p1, _ = _point_and_dir(coords, cum, s1)
-            k = len(pts)
-            pts.extend([p0, p1])
-            lines.append([k, k + 1])
-        s += period
+    cum, spans = polyline_dash_spans(coords, dash_len, gap_len)
+    pts, lines = [], []
+    for s0, s1 in spans:
+        p0, _ = _point_and_dir(coords, cum, s0)
+        p1, _ = _point_and_dir(coords, cum, s1)
+        k = len(pts)
+        pts.extend([p0, p1])
+        lines.append([k, k + 1])
     if not pts:
         return np.empty((0, 3)), np.empty((0, 2), dtype=int)
     return np.asarray(pts, dtype=float), np.asarray(lines, dtype=int)
