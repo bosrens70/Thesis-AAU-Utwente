@@ -1,6 +1,6 @@
-# Python dependencies for the utility depth-reconciliation toolkit.
+# Python dependencies for the utility geometric-reconciliation toolkit.
 # Versions pinned to the environment the thesis was developed against
-# (conda env "thesis", Python 3.9+). Install with:  pip install -r requirements.txt
+# (conda env "thesis", Python 3.10+). Install with:  pip install -r requirements.txt
 #
 # Note: the agent_module talks to the Anthropic API directly over urllib,
 # so no SDK package is required, only an API key in API-KEY.env.
@@ -19,6 +19,7 @@ numpy==2.2.6
 scikit-learn==1.7.2    # HDBSCAN / DBSCAN instance segmentation
 scipy==1.15.2          # cKDTree (crown, ler_lines), ndimage (crown footprint)
 scikit-image==0.25.2   # skeletonize: plan-view centreline in core/crown.py
+matplotlib==3.10.8     # Path (trench footprint, core/data_loader), colors (segment_module)
 
 # ── Point-cloud format I/O (tools/ply_to_las.py) ────────────────────
 plyfile==1.1
