@@ -4,8 +4,9 @@ LER line signatures as plain geometry arrays.
 =============================================
 Reproduces the cartographic line styles of the LER "Signaturforklaring"
 (solid / dashed lines, danger-class triangles, El voltage tick marks) as plain
-numpy point / line / triangle arrays. The ERR_module top-view builds Open3D
-``LineSet`` / ``TriangleMesh`` objects from these arrays.
+numpy point / line / triangle arrays. core/signature_render.py turns them into
+Open3D ``TriangleMesh`` objects, for the ERR_module top-down plan and for the
+3D viewers alike.
 
 This module is numpy only (no open3d import) so the geometry generators and the
 attribute rules can be unit-tested headless, the way ``core.ler_las_export`` is.

@@ -31,13 +31,13 @@ import json as _json
 
 from core.config import PLY_FILE, PANEL_WIDTH_EM, LINE_LAYERS
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
-from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
+from core.geometry import segment_to_cylinder, segment_to_plane
 from core.signature_legend import SignatureLegendSection
 from core.gui_helpers import (
     pivot_oblique, top_view as _shared_top_view, trench_or_scene_frame,
 )
 from core.rendering import point_material_flat, mesh_material, setup_scene_lighting
-from core.ledningstrace import get_ledningstrace_display_info, get_storage_key, get_bredde_width
+from core.ledningstrace import get_ledningstrace_display_info, get_bredde_width
 from core import symbology as sym
 from core.signature_render import (
     PolylineDash, line_segment_mesh,
@@ -70,11 +70,6 @@ print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 # Local bounding box for utility filtering
 _bbox_min_utm = pc_min + np.array([TX, TY, 0])
 _bbox_max_utm = pc_max + np.array([TX, TY, 0])
-
-
-def _in_bbox_utm(x, y):
-    return (_bbox_min_utm[0] <= x <= _bbox_max_utm[0] and
-            _bbox_min_utm[1] <= y <= _bbox_max_utm[1])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -661,8 +656,9 @@ sig_cb.set_on_checked(_on_sig)
 panel.add_child(sig_cb)
 
 # -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
-# The utility legend above explains colour; this one explains form, which is
-# the half a colour swatch cannot show. Collapsed by default, like LER's own.
+# Explains form, the half a colour swatch cannot show. Unlike the other
+# viewers, this one has no utility colour legend above it. Collapsed by
+# default, like LER's own.
 _sig_legend = SignatureLegendSection(em, components="point")
 _sig_legend.add_to(panel)
 panel.add_fixed(int(0.5 * em))

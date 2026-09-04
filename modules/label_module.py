@@ -49,28 +49,22 @@ import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 import geopandas as gpd
 import numpy as np
-import re
-import time
 import json
-import glob as _globmod
 from datetime import datetime
 
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PLY_FILE, GML_PATH, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     PANEL_WIDTH_EM,
-    CLASS_LABELS, DEFAULT_CLASS_COLOR,
     LEDNINGSPAKKE_LABEL, layer_display_name,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
-    COMPONENT_SPHERE_RADIUS, TRACE_CENTERLINE_RADIUS, PIPE_LEGEND_UI_ORDER,
-    INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
+    COMPONENT_SPHERE_RADIUS, TRACE_CENTERLINE_RADIUS, INSTANCE_COLORS, INSTANCE_LABEL_OPTIONS,
     TARGET_CLASS, UTILITY_TO_LER_MATCH, UTILITY_TYPE_COLORS,
     DepthSource, DEPTH_STATS_KEY as _STATS_KEY,
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
-    forsyningsart_color,
     ler_layers_for_type, trace_forsyningsart, FORSYNINGSART_TO_LINE,
 )
 from core.data_loader import (
-    init_site, discover_instances, load_or_pick_ground_level, load_trench,
+    init_site, load_or_pick_ground_level, load_trench,
     utility_type_from_filename,
 )
 from core.site_status import (
@@ -78,7 +72,7 @@ from core.site_status import (
     CONFLICTS_FILENAME, resolve_labeled_dir, format_label_summary,
 )
 from core.gui_helpers import (
-    make_legend_row, make_master_pipe_toggle, make_master_comp_toggle,
+    make_master_pipe_toggle, make_master_comp_toggle,
     LerLegendSection,
     pivot_top_down, top_view, trench_or_scene_frame,
 )
@@ -87,7 +81,6 @@ from core.ler_matching import (build_feature_index, score_candidates,
 from core.ler_lines import group_features_into_lines, line_members
 from core.geometry import (
     point_to_segment_dists,
-    linear_to_srgb,
 )
 from core.signature_legend import SignatureLegendSection
 from core.crop import CropRegion
@@ -119,8 +112,6 @@ site = init_site(load_gml=False, load_instances=True)
 
 # Unpack area info
 TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
-AREA_NUMBER = site.area.area_number
-AREA_NAME   = site.area.area_name
 
 # Unpack point cloud data
 pcd             = site.pc.pcd
@@ -154,18 +145,6 @@ INSTANCE_DIR = str(site.instance_dir) if site.instance_dir else ""
 # ─────────────────────────────────────────────────────────────────────────────
 # 2b. Load instance PLY files and compute bounding boxes
 # ─────────────────────────────────────────────────────────────────────────────
-INSTANCE_COLORS = [
-    [1.00, 0.20, 0.20],  # red
-    [0.20, 0.60, 1.00],  # blue
-    [0.20, 0.90, 0.20],  # green
-    [1.00, 0.60, 0.00],  # orange
-    [0.80, 0.20, 1.00],  # purple
-    [0.00, 0.90, 0.90],  # cyan
-    [1.00, 1.00, 0.20],  # yellow
-    [1.00, 0.40, 0.70],  # pink
-    [0.60, 0.40, 0.20],  # brown
-    [0.50, 1.00, 0.50],  # lime
-]
 
 _instance_dir = Path(INSTANCE_DIR)
 _instance_files = site.instance_files if site.instance_files else []
@@ -240,18 +219,6 @@ if instance_data:
 else:
     print(f"\n  [warn] No instance PLY files found in {INSTANCE_DIR}")
 
-INSTANCE_LABEL_OPTIONS = [
-    "PowerLine",
-    "DrainageLine",
-    "OilPipeLine",
-    "GasLine",
-    "ThermalLine",
-    "Conduit",
-    "WaterLine",
-    "TelecomunicationLine",
-    "OtherLine",
-    "LineUnknownServiceType",
-]
 
 _instance_labels = {}
 _instance_ler_match = {}  # idx -> {"layer": str, "gml_id": str} — exclusive LER link
@@ -304,7 +271,7 @@ def _clean_coords_with_depth(coords_raw, vejledende_dybde_mm,
 # 5.  Load utility lines (pipes / cables) within bbox
 # ─────────────────────────────────────────────────────────────────────────────
 print("\n--- Loading utility lines within bbox ---")
-all_pipe_meshes   = []          # flat list — kept for wireframe merge only
+all_pipe_meshes   = []          # flat list, kept for count reporting only
 _pipe_layer_cyls  = {}          # layer_name -> [TriangleMesh, ...]  per-layer
 _sig_layer_meshes = {}          # layer_name -> [TriangleMesh, ...]  signatures
 _pipe_layer_seg_pts = {}        # layer_name -> ([p1, ...], [p2, ...]) for XRay centerlines
@@ -526,8 +493,9 @@ for _ln, _sms in _sig_layer_meshes.items():
     if _m is not None:
         _sig_meshes[_ln] = _m
 
-# Per-layer XRay centerline LineSets — one line per clipped segment, rendered
-# with depth_func="always" so thin pipes are visible through thick ones.
+# Per-layer XRay centerline LineSets, one line per clipped segment. Built and
+# added to the scene but never shown: centerline_xray_active is never set true,
+# and Open3D 0.19 has no depth_func, so neither half of the effect is live.
 # Traces are excluded: they always carry their own centreline tube (below), so
 # an XRay line for them would just double it up.
 _pipe_layer_centerlines = {}
@@ -556,7 +524,8 @@ _trace_centerlines = build_trace_centerlines(
     lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]),
     dash_of_index=lambda i: pick_seg_dash[i])
 
-# Combined wireframe (all layers) for the wireframe overlay toggle.
+# Combined wireframe (all layers). Added to the scene but hidden: there is no
+# wireframe toggle, so pipe_wireframe_active never becomes true.
 # Build from per-layer meshes using the non-mutating `+` operator so that
 # _pipe_layer_meshes entries are not corrupted (using `+=` on all_pipe_meshes[0]
 # would mutate the first layer's merged mesh to contain all layers).
@@ -671,17 +640,16 @@ for _ln, _spheres in _comp_layer_spheres.items():
     _m.compute_vertex_normals()
     _comp_layer_meshes[_ln] = _m
 
-_t_load = time.perf_counter()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  Coordinate frame + circular crop wireframe + point cloud normals
+# 7.  Coordinate frame + crop wireframe + point cloud normals
 # ─────────────────────────────────────────────────────────────────────────────
 frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
     size=0.5, origin=cloud_centroid
 )
 
-# Estimate normals on the cropped point cloud so we can shade it with the
-# `defaultLit` shader.  
+# Estimate normals on the cropped point cloud. The cloud itself is drawn unlit
+# and flat (point_material_flat), so this does not affect its own shading.
 try:
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.15, max_nn=30)
@@ -793,11 +761,13 @@ def make_pipe_wire_material() -> rendering.MaterialRecord:
 def make_centerline_material() -> rendering.MaterialRecord:
     mat = line_material(2.5)
     try:
-        # Render centerlines through all occluding geometry so thin pipes
-        # remain visible even when embedded inside thick pipe cylinders.
+        # Intended to render centerlines through occluding geometry so thin
+        # pipes stay visible inside thick ones. Open3D 0.19 has no
+        # MaterialRecord.depth_func, so this is a no-op and they depth-test
+        # normally.
         mat.depth_func = "always"
     except AttributeError:
-        pass  # older Open3D — centerlines depth-test normally
+        pass
     return mat
 
 
@@ -818,12 +788,10 @@ POINT_CLOUD_GEOM = "point_cloud"
 PIPE_WIRE_GEOM   = "pipes_wire"
 FRAME_GEOM       = "frame"
 BBOX_GEOM        = "bbox_wire"
-HIGHLIGHT_GEOM   = "highlight"
 
 def _inst_bbox_gn(idx): return f"inst_bbox_{idx}"
 def _inst_pts_gn(idx):  return f"inst_pts_{idx}"
 
-_instance_visible = {i: True for i in range(len(instance_data))}
 
 # Per-layer geometry names
 def _pipe_gn(ln):       return f"pipe_{ln}"
@@ -838,11 +806,11 @@ _layer_visible.update({ln: False for ln in COMPONENT_LAYERS})  # start with all 
 # LINE_LAYERS, so it relies on the True default of every _layer_visible lookup.
 
 pipe_opacity = [1.0]
-origin_pt    = np.array([0.0, 0.0, 0.0])
-pick_active  = [False]
 origin_frame_visible  = [False] # toggled by the "Show origin axis" checkbox
-pipe_wireframe_active = [False] # toggled by the "Wireframe pipes" checkbox
-centerline_xray_active = [False] # toggled by the "XRay centerlines" checkbox
+# Both overlays are built, but neither has a checkbox, so these stay False for
+# the whole session and the geometry they gate is never shown.
+pipe_wireframe_active = [False]
+centerline_xray_active = [False]
 ler_utilities_visible = [True]   # toggled by the "Show LER utilities" checkbox
 signatures_on         = [True]   # toggled by the "LER signatures" checkbox
 
@@ -922,7 +890,6 @@ for _idx, _inst in enumerate(instance_data):
     scene_widget.scene.show_geometry(_inst_bbox_gn(_idx), _show)
     scene_widget.scene.show_geometry(_inst_pts_gn(_idx), _show)
 
-bounds = scene_widget.scene.bounding_box
 _init_d = max(1.0, np.linalg.norm(pc_max - pc_min) * 0.6)
 _init_eye = cloud_centroid + np.array([0.0, 0.0, _init_d])
 scene_widget.look_at(cloud_centroid.tolist(), _init_eye.tolist(), [0.0, 1.0, 0.0])
@@ -980,7 +947,6 @@ panel.add_fixed(int(0.5 * em))
 
 # ── Utility Legend (uniform LerLegendSection, see core/gui_helpers.py) ───────
 _ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL)
-ler_toggle_cb = _ler_section.master_cb
 opacity_slider = _ler_section.opacity_slider
 
 
@@ -1050,7 +1016,7 @@ _pipe_checkboxes = []
 _comp_checkboxes = []
 
 # "Toggle all segments" master checkbox
-_all_pipes_cb = _ler_section.add_all_segments(
+_ler_section.add_all_segments(
     True, make_master_pipe_toggle(_pipe_checkboxes, _layer_visible,
                                   _pipe_layer_meshes, scene_widget,
                                   _pipe_gn, make_mesh_material,
@@ -1084,7 +1050,7 @@ if _ledningstrace_variants:
         _pipe_checkboxes.append((variant_key, cb))
 
 # "Toggle all components" master checkbox
-_all_comps_cb = _ler_section.add_all_components(
+_ler_section.add_all_components(
     False, make_master_comp_toggle(_comp_checkboxes, _layer_visible,
                                    _comp_layer_meshes, scene_widget,
                                    _comp_gn, make_mesh_material,
@@ -1721,7 +1687,6 @@ if instance_data:
     left_panel.add_child(_save_info)
 
 left_panel.add_stretch()
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────

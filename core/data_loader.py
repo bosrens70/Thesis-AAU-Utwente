@@ -20,9 +20,7 @@ import json
 from core.config import (
     PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE,
     CLASS_LABELS, DEFAULT_CLASS_COLOR,
-    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
-    COMPONENT_SPHERE_RADIUS,
-    ACCURACY_CLASS_FIELD, accuracy_class_halfwidth,
+    LINE_LAYERS, COMPONENT_LAYERS, ACCURACY_CLASS_FIELD, accuracy_class_halfwidth,
 )
 # Directory-layout conventions live in core/site_status.py so the headless
 # status tool and the viewers resolve the same folders.  Re-exported here
@@ -68,7 +66,8 @@ class PointCloudData:
 
 @dataclass
 class GMLData:
-    """Raw GeoDataFrames loaded from GML, filtered to crop area."""
+    """Raw GeoDataFrames loaded from GML: whole layers, unfiltered. Crop
+    selection happens per viewer via CropRegion, not here."""
     line_gdfs: dict      # layer_name -> GeoDataFrame
     component_gdfs: dict # layer_name -> GeoDataFrame
 
@@ -491,40 +490,6 @@ def utility_type_from_filename(filename):
         if name == token:
             return uid
     return 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 6. COORDINATE TRANSLATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def translate_coords_to_local(coords_raw, TX, TY, TZ):
-    """
-    Translate UTM coordinates to local coordinates.
-    Returns coords (N, 3) with X -= TX, Y -= TY, Z -= TZ.
-    """
-    coords = coords_raw.copy().astype(float)
-    if coords.shape[1] == 2:
-        coords = np.hstack([coords, np.zeros((len(coords), 1))])
-    coords[:, 0] -= TX
-    coords[:, 1] -= TY
-    coords[:, 2] -= TZ
-    return coords
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 7. EXTRACT GML ROW ATTRIBUTES (for picking display)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_row_attrs(row):
-    """Extract all non-geometry attributes from a GeoDataFrame row as (label, value) pairs."""
-    attrs = []
-    for col in row.index:
-        if col == "geometry":
-            continue
-        val = row[col]
-        val_str = str(val) if (val is not None and str(val) != "nan") else "—"
-        attrs.append((col, val_str))
-    return attrs
 
 
 # ─────────────────────────────────────────────────────────────────────────────

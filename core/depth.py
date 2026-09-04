@@ -129,7 +129,6 @@ def clean_coords_with_depth(coords_raw, vejledende_dybde_mm, *, TX, TY, TZ,
                     sources[idx] = level
                     break
 
-    # Translate Z to local
     coords[:, 2] -= TZ
 
     if clamp_z is not None:

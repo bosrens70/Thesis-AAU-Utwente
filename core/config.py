@@ -3,8 +3,10 @@
 Centralised configuration for all viewers and tools.
 =====================================================
 The active site and Ledningspakke are set in core/site_local.py (gitignored);
-everything else is defined here. All other scripts import from here, nothing
-is duplicated.
+everything else is defined here, and other scripts import from here. One known
+exception survives: the 0.25 m Ledningstrace fallback width is still hardcoded
+in base_module, label_module and agent_module instead of importing
+LEDNINGSTRACE_FALLBACK_WIDTH.
 """
 
 import os
@@ -70,7 +72,6 @@ LEDNINGSPAKKE_NAME = _ledningspakke_dir
 _lp_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _ledningspakke_dir, re.IGNORECASE)
 LEDNINGSPAKKE_LABEL = (f"{_lp_match.group(1)} {_lp_match.group(2)}"
                        if _lp_match else _ledningspakke_dir)
-
 
 
 # Crop region shape (load-time switch).
@@ -358,15 +359,6 @@ INSTANCE_COLORS = [
     [0.50, 1.00, 0.50],  # lime
 ]
 
-# Vandledning diameter -> colour mapping
-DIAMETER_COLORS = {
-    0:   [0.502, 0.502, 0.502],
-    32:  [0.702, 0.851, 1.000],
-    63:  [0.400, 0.698, 1.000],
-    120: [0.102, 0.459, 1.000],
-    150: [0.000, 0.278, 0.800],
-    160: [0.000, 0.180, 0.522],
-}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LER LINE SIGNATURES (ERR_module top-view plan)
@@ -557,7 +549,7 @@ def accuracy_class_halfwidth(value):
     return edges[j], j + 1
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEPTH HIERARCHY: enum, config (used by BASE1 and LABEL1)
+# DEPTH HIERARCHY: enum, config (used by the base, label, deviation and ERR viewers)
 # ─────────────────────────────────────────────────────────────────────────────
 class DepthSource(IntEnum):
     REGISTERED   = 1

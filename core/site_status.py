@@ -56,8 +56,7 @@ DEVIATION_DIR_SUFFIX = "_LER_deviation_LAS"
 
 # segment_module writes "<class>_instance_<cluster_id>.ply"; label_module writes
 # "<class>_instance_<index>_type_<utility_type>.ply".  The two integers are NOT
-# the same thing: see instance_order_matches_labels().
-SEGMENT_FNAME_RE = re.compile(rf"^{TARGET_CLASS}_instance_(\d+)\.ply$")
+# the same thing: see ordered_instance_files().
 LABELED_FNAME_RE = re.compile(rf"^{TARGET_CLASS}_instance_(\d+)_type_(\d+)\.ply$")
 
 # Any class, used to spot the loose main-utility instance that
@@ -246,13 +245,6 @@ def resolve_labeled_dir(instance_dir):
     live = [s for s in sessions if s.n_ply]
     empty = [s for s in sessions if not s.n_ply]
     return (live[0] if live else None), empty, live[1:]
-
-
-def authoritative_labeled_dir(instance_dir):
-    """Path of the labelled folder that wins, or None. Convenience wrapper for
-    callers that do not care about the leftovers."""
-    live, _empty, _superseded = resolve_labeled_dir(instance_dir)
-    return live.path if live else None
 
 
 def read_labeled_indices(labeled_dir):

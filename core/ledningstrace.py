@@ -68,15 +68,10 @@ def get_bredde_width(row):
     return None
 
 
-def is_ledningstrace(layer_name):
-    """Check if a layer is Ledningstrace."""
-    return layer_name == LEDNINGSTRACE_LAYER
-
-
 def is_trace_key(storage_key):
     """Check if a *storage key* denotes a Ledningstrace.
 
-    Unlike ``is_ledningstrace``, this also matches the per-forsyningsart
+    Unlike a plain layer-name comparison, this also matches the per-forsyningsart
     variants the viewers store meshes under ("Ledningstrace (vand)"), which is
     the form the rendering code works with.
     """

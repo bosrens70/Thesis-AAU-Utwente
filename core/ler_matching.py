@@ -24,9 +24,10 @@ import numpy as np
 from sklearn.decomposition import PCA
 
 # Danish "udvendigFarve" (exterior colour) attribute -> approximate RGB (0-1).
-# Best-effort only: LER text values are free-form, and this dataset has known
-# encoding issues with non-ASCII Danish letters (æ/ø/å), so lookups strip
-# all non-letter characters and match case-insensitively against ASCII keys.
+# Best-effort only: LER text values are free-form. Lookups strip non-letter
+# characters and match case-insensitively against the ASCII keys below. Note
+# that str.isalpha() counts æ/ø/å as letters, so they survive the strip and
+# never match an ASCII key: "blaa" resolves, "blå" does not.
 _DANISH_COLOR_RGB = {
     "sort":   (0.05, 0.05, 0.05),
     "hvid":   (0.95, 0.95, 0.95),
@@ -223,13 +224,16 @@ def score_candidates(inst_pts, inst_colors, feature_index, allowed_layers=None,
     allowed_layers : optional set/iterable restricting candidates to these
                   layer names (e.g. once the instance's utility type is
                   known via UTILITY_TO_LER_MATCH); None searches every layer.
-    max_dist    : centroid-proximity pre-filter (metres). LER accuracy classes
-                  in this dataset go beyond 2 m, so this defaults generously
-                  rather than to a tight "obviously nearby" radius.
+    max_dist    : proximity pre-filter (metres). A feature passes when either
+                  its centroid or its nearest segment midpoint is within this
+                  distance. LER accuracy classes in this dataset go beyond 2 m,
+                  so it defaults generously rather than to a tight radius.
 
     Returns a list of dicts sorted by descending score (best first), each:
         {"gml_id", "layer", "score", "breakdown": {...},
-         "rep_segment": (p1, p2)}  — the feature's own segment nearest the
+         "gml_ids": [...],            every feature in the merged run; "gml_id"
+                                      alone is only the representative,
+         "rep_segment": (p1, p2)}     the feature's own segment nearest the
                                       instance, for placing a UI highlight.
     """
     if len(inst_pts) == 0 or not feature_index:

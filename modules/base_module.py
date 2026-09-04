@@ -26,19 +26,16 @@ import numpy as np
 import time
 import copy
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PLY_FILE, GML_PATH, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     PANEL_WIDTH_EM,
-    CLASS_LABELS, DEFAULT_CLASS_COLOR,
-    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    CLASS_LABELS, LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS, PIPE_LEGEND_UI_ORDER, LEDNINGSPAKKE_LABEL,
     layer_display_name,
-    DepthSource, DepthConfig,
-    PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
-    forsyningsart_color,
+    DepthSource, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
 )
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import (
-    point_to_segment_dists, srgb_to_linear, linear_to_srgb,
+    point_to_segment_dists, srgb_to_linear,
 )
 from core.signature_legend import SignatureLegendSection
 from core.crop import CropRegion
@@ -77,8 +74,6 @@ _t_script_start = time.perf_counter()
 
 # Unpack area info
 TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
-AREA_NUMBER = site.area.area_number
-AREA_NAME   = site.area.area_name
 
 # Unpack point cloud data
 pcd             = site.pc.pcd
@@ -104,8 +99,6 @@ _rect_max_y = pc_max[1] + UTILITY_RECT_BUFFER
 
 _ply_path = Path(PLY_FILE)
 
-# Alias for backward compat
-_DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEWER-SPECIFIC CODE BELOW (ground picking, mesh creation, GUI)
@@ -117,7 +110,8 @@ GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)
 _pick_method = site.pc.ground_z_method
 print(f"  Ground level (UTM)   = {GROUND_Z + TZ:.3f} m")
 
-# Flat ground plane (a*x + b*y + c) — within a 2 m crop radius the tilt is negligible.
+# Flat ground plane (a*x + b*y + c); the crop region is small enough that the
+# tilt is negligible.
 _ground_a, _ground_b, _ground_c = 0.0, 0.0, GROUND_Z
 
 
@@ -530,7 +524,7 @@ _t_load = time.perf_counter()
 print(f"\nAll data loaded in {_t_load - _t_script_start:.2f}s")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7.  Coordinate frame + circular crop wireframe + point cloud normals
+# 7.  Coordinate frame + crop wireframe + point cloud normals
 # ─────────────────────────────────────────────────────────────────────────────
 frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
     size=0.5, origin=cloud_centroid
@@ -846,8 +840,6 @@ panel.add_fixed(int(0.8 * em))
 # ── Utility Legend (uniform LerLegendSection, see core/gui_helpers.py) ───────
 _ler_active = [True]
 _ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL)
-ler_toggle_cb = _ler_section.master_cb
-_ler_legend_container = _ler_section.container
 opacity_slider = _ler_section.opacity_slider
 
 
@@ -915,7 +907,7 @@ def _on_toggle_all_pipes(checked):
                                signatures_on[0])
     window.post_redraw()
 
-_all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
+_ler_section.add_all_segments(True, _on_toggle_all_pipes)
 
 # Line layers — only show legend entry if the layer produced actual geometry
 for layer_name in PIPE_LEGEND_UI_ORDER:
@@ -954,7 +946,7 @@ def _on_toggle_all_comps(checked):
             scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))
     window.post_redraw()
 
-_all_comps_cb = _ler_section.add_all_components(False, _on_toggle_all_comps)
+_ler_section.add_all_components(False, _on_toggle_all_comps)
 
 # Component layers — only show legend entry if the layer produced actual geometry
 for layer_name, cfg in COMPONENT_LAYERS.items():

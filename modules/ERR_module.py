@@ -26,26 +26,21 @@ o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Warning)
 import geopandas as gpd
 import numpy as np
 import matplotlib.path as mpath
-from shapely.geometry import Polygon
-from shapely.ops import unary_union
 import re
 import time
 from core.config import (
-    GML_PATH, AREA_REF_GEOJSON, PLY_BASE_DIR, CROP_RADIUS,
-    PANEL_WIDTH_EM,
+    GML_PATH, AREA_REF_GEOJSON, PLY_BASE_DIR, PANEL_WIDTH_EM,
     LEDNINGSPAKKE_LABEL, layer_display_name,
-    CLASS_LABELS, DEFAULT_CLASS_COLOR,
-    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
+    CLASS_LABELS, LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
-    DepthSource, DepthConfig, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
-    forsyningsart_color,
+    DepthSource, PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     SIGNATURE_LINE_WIDTH_M, SIGNATURE_TRACE_WIDTH_M, SIGNATURE_COMP_LINE_WIDTH_M,
 )
 from core.gui_helpers import (
     make_legend_row, LerLegendSection,
     pivot_top_down, top_view, trench_or_scene_frame,
 )
-from core.geometry import fit_plane_z, srgb_to_linear, linear_to_srgb
+from core.geometry import fit_plane_z, srgb_to_linear
 from core.signature_legend import SignatureLegendSection, STYLE_PLAN
 from core.crop import clip_segment_to_rect
 from core.depth import clean_coords_with_depth as _core_clean_coords
@@ -58,24 +53,20 @@ from core.rendering import (
     setup_scene_lighting,
 )
 from core.ledningstrace import (
-    get_ledningstrace_display_info, get_storage_key, get_bredde_width,
-    ribbon_alpha,
+    get_ledningstrace_display_info, ribbon_alpha,
 )
 
 # Buffer (metres) around the Graveforesp polygon
 BUFFER = 2.0
 
-# ── Ground-plane fit settings ────────────────────────────────────────────────
-# The ground level is a single best-fit plane through the top surface of all
-# point clouds. We sample that top surface by binning points into XY cells and
-# taking a high percentile of Z per cell (top of trench = street surface),
-# then fit z = a*x + b*y + c to those samples.
+# ── Ground-surface sampling settings ─────────────────────────────────────────
+# The ground level follows the road rather than sitting on one plane. The top
+# surface is sampled by binning points into XY cells and taking a high
+# percentile of Z per cell (top of trench = street surface). Those samples feed
+# the IDW lookup in section 3; the best-fit plane is only the no-sample fallback.
 GROUND_CELL_M  = 2.0    # XY cell size (m) for top-surface sampling
 GROUND_PCTILE  = 95.0   # Z percentile per cell (top surface)
 GROUND_TRENCH_CLASS = 2  # class id whose top is the street surface ("Trench")
-
-# Alias for backward compat
-_DEFAULT_CLASS_COLOR = DEFAULT_CLASS_COLOR
 
 
 def _cell_top_samples(pts, cell=GROUND_CELL_M, pctile=GROUND_PCTILE):
@@ -281,7 +272,7 @@ total_pts_read   = 0
 total_pts_filt   = 0
 
 # Top-surface samples (one (x, y, z) per populated XY cell, across all clouds)
-# used to fit a single best-fit ground plane below.
+# used by the locally-adaptive ground lookup below.
 _ground_samples = []
 
 print(f"\n{'Site':>30}  {'Total':>10}  {'Read':>10}  {'In poly':>10}  {'Time':>6}")
@@ -1309,8 +1300,6 @@ pipe_opacity_val = [1.0]
 _layer_visible = {}
 
 _ler_section = LerLegendSection(em, LEDNINGSPAKKE_LABEL)
-ler_toggle_cb = _ler_section.master_cb
-_ler_legend_container = _ler_section.container
 opacity_slider = _ler_section.opacity_slider
 
 
@@ -1372,7 +1361,7 @@ def _on_toggle_all_pipes(checked):
         scene_widget.scene.add_geometry(_line_geom_name(ln), _active_line_mesh(ln), mat)
     window.post_redraw()
 
-_all_pipes_cb = _ler_section.add_all_segments(True, _on_toggle_all_pipes)
+_ler_section.add_all_segments(True, _on_toggle_all_pipes)
 
 # Line layers
 for layer_name in LINE_LAYERS:
@@ -1398,7 +1387,7 @@ def _on_toggle_all_comps(checked):
         scene_widget.scene.add_geometry(_comp_geom_name(ln), _active_comp_mesh(ln), mat)
     window.post_redraw()
 
-_all_comps_cb = _ler_section.add_all_components(True, _on_toggle_all_comps)
+_ler_section.add_all_components(True, _on_toggle_all_comps)
 
 # Component layers
 for layer_name, cfg in COMPONENT_LAYERS.items():
@@ -1517,7 +1506,7 @@ def _place_highlight(centre: np.ndarray):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 13.  Mouse picking  (Ctrl + Left-Click)
+# 13.  Mouse picking  (Left-Click)
 # ─────────────────────────────────────────────────────────────────────────────
 PICK_RADIUS_SEG = 2.0
 PICK_RADIUS_COMP = 1.0

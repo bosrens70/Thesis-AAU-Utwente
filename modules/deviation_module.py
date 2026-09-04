@@ -41,25 +41,23 @@ import open3d.visualization.gui as gui
 import open3d.visualization.rendering as rendering
 import geopandas as gpd
 import numpy as np
-import re
 import time
 import json
 from shapely.geometry import LineString as ShapelyLine, Point as ShapelyPoint, box as shapely_box
 from shapely.ops import unary_union
 
 from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
+    PLY_FILE, GML_PATH, CROP_RADIUS, CROP_MODE, UTILITY_RECT_BUFFER,
     PANEL_WIDTH_EM, LEDNINGSPAKKE_LABEL, layer_display_name,
     LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
     COMPONENT_SPHERE_RADIUS,
     PIPE_DEPTH_CONFIG, COMPONENT_DEPTH_CONFIG,
     UTILITY_TYPE_LABELS, UTILITY_TYPE_COLORS, UTILITY_TO_LER_MATCH,
-    DEVIATION_THRESHOLDS, DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
+    DEVIATION_COLORS, DEVIATION_CLASS_LABELS,
     DEVIATION_GRADIENT_TICKS,
     ACCURACY_CLASS_COLORS, ACCURACY_UNREGISTERED_COLOR, ACCURACY_UNREGISTERED_LABEL,
     accuracy_class_color,
     KLIC_XY_THRESHOLDS, KLIC_XY_COLORS, KLIC_XY_CLASS_LABELS,
-    FORSYNINGSART_COLOR_HINTS, FORSYNINGSART_TO_LINE,
     forsyningsart_color as _forsyningsart_color,
     ler_layers_for_type,
     LEDNINGSTRACE_FALLBACK_WIDTH,
@@ -74,7 +72,7 @@ from core.site_status import (
     instance_dir_for, resolve_labeled_dir, root_class_instances,
 )
 from core.geometry import (
-    batch_point_to_segments, batch_point_to_plane_segments,
+    batch_point_to_plane_segments,
     batch_point_to_plane_segment_components,
     discretize_segment,
     deviation_to_color, deviation_to_color_continuous,
@@ -90,7 +88,7 @@ from core.gui_helpers import (
     PanelTextFitter,
     pivot_oblique, top_view, trench_or_scene_frame,
 )
-from core.ledningstrace import get_bredde_width, is_trace_key, ribbon_alpha
+from core.ledningstrace import get_bredde_width, ribbon_alpha
 from core.trace_render import (
     build_trace_centerlines, add_trace_centerlines, trace_centerline_gn,
 )
@@ -114,8 +112,6 @@ site = init_site(load_gml=False, load_instances=True)
 
 # Unpack area info
 TX, TY, TZ = site.area.TX, site.area.TY, site.area.TZ
-AREA_NUMBER = site.area.area_number
-AREA_NAME   = site.area.area_name
 
 # Unpack point cloud data (DEV1 uses pcd_orig / pts_orig naming)
 pcd_orig        = site.pc.pcd
@@ -577,9 +573,9 @@ print(f"\n  Total: {sum(comp_stats.values())} component spheres")
 # ─────────────────────────────────────────────────────────────────────────────
 # 3c.  Registered accuracy buffers (noejagtighedsklasse, 2D)
 # ─────────────────────────────────────────────────────────────────────────────
-# For every LER line/component feature that registers an accuracy class, draw a
-# flat 2D buffer around its centerline (a circle around components) whose
-# half-width equals the registered horizontal tolerance, coloured by class. The
+# For every LER line feature that registers an accuracy class, draw a flat 2D
+# buffer around its centerline whose half-width equals the registered
+# horizontal tolerance, coloured by class. Components are excluded. The
 # attribute is checked per feature, so a buffer is built only where this dataset
 # actually records the class. Each feature's buffer sits at its resolved depth.
 print("\n--- Building registered accuracy buffers (noejagtighedsklasse, 2D) ---")
@@ -1309,8 +1305,8 @@ print("\n" + "=" * 72)
 # 5b.  Discretized LER deviation point clouds
 # ─────────────────────────────────────────────────────────────────────────────
 # Each LER segment is sampled into a dense cloud of points approximating the
-# utility surface: a tube of the registered radius for pipes, the flat ribbon
-# for traces.  Every sample is coloured by its deviation = distance to the
+# utility surface: a tube of the registered radius for pipes, a bare centreline
+# for traces (radius and half-width passed as 0).  Every sample is coloured by its deviation = distance to the
 # nearest measured instance point of a matching utility type, giving the
 # accuracy-class heatmap resolved over the registered utility surface.
 print("\n--- Discretizing LER surfaces + per-sample deviation ---")
@@ -1569,7 +1565,6 @@ try:
 except Exception:
     pass
 
-_t_load = time.perf_counter()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6.  GUI
@@ -1675,14 +1670,15 @@ def make_mesh_mat(alpha=1.0):
 
 def make_crown_mat():
     """Thin unlit line for the crown, as label_module draws the registered
-    centrelines. Depth testing is disabled for the same reason it is there: the
-    crown is recovered from the top of the measured cloud and so lies exactly in
-    it, and the points it came from would otherwise swallow the line."""
+    centrelines. The crown is recovered from the top of the measured cloud and
+    so lies exactly in it, so the points it came from can swallow the line.
+    Open3D 0.19 has no MaterialRecord.depth_func to force it in front, so the
+    assignment below is a no-op kept only to record the intent."""
     mat = line_material(CROWN_LINE_WIDTH)
     try:
         mat.depth_func = "always"
     except AttributeError:
-        pass                       # older Open3D: the crown depth-tests normally
+        pass                       # no depth_func in 0.19: it depth-tests normally
     return mat
 
 
