@@ -468,8 +468,7 @@ mat_mesh = mesh_material(0.8)
 for layer_name, mesh in _util_meshes.items():
     scene_widget.scene.add_geometry(f"util_{layer_name}", mesh, mat_mesh)
 
-# LER signature overlays, on by default so this viewer reads like the ERR plan
-_signatures_on = [True]
+# LER signature overlays, always on so this viewer reads like the ERR plan
 for layer_name, mesh in _sig_meshes.items():
     scene_widget.scene.add_geometry(signature_gn(layer_name), mesh, mat_mesh)
 
@@ -569,7 +568,7 @@ def hide_layer(name):
     def _hide():
         if scene_widget.scene.has_geometry(gn):
             scene_widget.scene.show_geometry(gn, False)
-        show_signatures(scene_widget.scene, name, False, _signatures_on[0])
+        show_signatures(scene_widget.scene, name, False)
         window.post_redraw()
     _pending_gui_actions.append(_hide)
 
@@ -581,7 +580,7 @@ def show_layer(name):
     def _show():
         if scene_widget.scene.has_geometry(gn):
             scene_widget.scene.show_geometry(gn, True)
-        show_signatures(scene_widget.scene, name, True, _signatures_on[0])
+        show_signatures(scene_widget.scene, name, True)
         window.post_redraw()
     _pending_gui_actions.append(_show)
 
@@ -635,25 +634,6 @@ panel.add_child(gui.Label(f"Area: {area.area_name}  |  Points: {len(pts):,}"))
 panel.add_child(gui.Label(f"Ground Z: {GROUND_Z:.3f} m ({_pick_method})"))
 panel.add_child(gui.Label(f"Utilities near site: {n_total:,} features"))
 panel.add_fixed(int(0.5 * em))
-
-# LER signatures ("Signaturforklaring"): dashed "under etablering", red
-# "meget farlig" triangles, El voltage ticks.
-sig_cb = gui.Checkbox("LER signatures")
-sig_cb.checked = _signatures_on[0]
-if not _sig_meshes:
-    sig_cb.enabled = False
-
-
-def _on_sig(checked):
-    _signatures_on[0] = checked
-    for _ln in _sig_meshes:
-        show_signatures(scene_widget.scene, _ln,
-                        _layer_visible.get(_ln, True), checked)
-    window.post_redraw()
-
-
-sig_cb.set_on_checked(_on_sig)
-panel.add_child(sig_cb)
 
 # -- LER signature legend ("Signaturforklaring", core/signature_legend.py) ----
 # Explains form, the half a colour swatch cannot show. Unlike the other

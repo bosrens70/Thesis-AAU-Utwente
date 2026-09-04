@@ -625,7 +625,6 @@ origin_pt    = np.array([0.0, 0.0, 0.0])
 pick_active  = [False]
 class_labels_active = [False]   # toggled by L key or checkbox
 origin_frame_visible  = [False]  # toggled by the "Show origin axis" checkbox
-signatures_on         = [True]   # toggled by the "LER signatures" checkbox
 
 _t_gui0 = time.perf_counter()
 app = gui.Application.instance
@@ -662,8 +661,7 @@ add_trace_centerlines(
 # Add the LER signature overlays, at the unscaled opacity for the same reason
 add_signature_meshes(
     scene_widget.scene, _sig_meshes, pipe_opacity[0], make_mesh_material,
-    visible_of=lambda k: _layer_visible.get(k, True),
-    signatures_on=signatures_on[0])
+    visible_of=lambda k: _layer_visible.get(k, True))
 
 # Add per-layer component meshes (hidden by default)
 for _ln, _mesh in _comp_layer_meshes.items():
@@ -783,27 +781,6 @@ def _on_origin_toggle(checked):
 origin_toggle_cb.set_on_checked(_on_origin_toggle)
 panel.add_child(origin_toggle_cb)
 
-# ── LER Signature Toggle ────────────────────────────────────────────────────
-# The cartographic signatures of the LER "Signaturforklaring", on by default so
-# this viewer reads like the ERR plan and like LER itself.
-signature_toggle_cb = gui.Checkbox("LER signatures")
-signature_toggle_cb.checked = signatures_on[0]
-if not _sig_meshes:
-    signature_toggle_cb.enabled = False
-
-
-def _on_signature_toggle(checked):
-    signatures_on[0] = checked
-    for ln in _sig_meshes:
-        alpha = pipe_opacity[0] if (_ler_active[0] and _layer_visible.get(ln, True)) else 0.0
-        set_signature_material(scene_widget.scene, ln, alpha,
-                               make_mesh_material, checked)
-    window.post_redraw()
-
-
-signature_toggle_cb.set_on_checked(_on_signature_toggle)
-panel.add_child(signature_toggle_cb)
-
 panel.add_fixed(int(0.8 * em))
 
 # ── Class Label Toggle ──────────────────────────────────────────────────────
@@ -855,8 +832,7 @@ def _apply_opacity(val: float):
 
     for ln in _sig_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
-        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
-                               signatures_on[0])
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material)
 
     for ln in _comp_layer_meshes:
         alpha = val if _layer_visible.get(ln, True) else 0.0
@@ -878,8 +854,7 @@ def _make_pipe_toggle(ln):
         if ln in _pipe_layer_meshes:
             set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                                make_mesh_material)
-        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
-                               signatures_on[0])
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material)
         window.post_redraw()
     return _cb
 
@@ -903,8 +878,7 @@ def _on_toggle_all_pipes(checked):
         if ln in _pipe_layer_meshes:
             set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                                make_mesh_material)
-        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
-                               signatures_on[0])
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material)
     window.post_redraw()
 
 _ler_section.add_all_segments(True, _on_toggle_all_pipes)
@@ -970,8 +944,7 @@ def _on_ler_toggle(checked):
                            make_mesh_material)
     for ln in _sig_meshes:
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
-        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
-                               signatures_on[0])
+        set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material)
     for ln in _comp_layer_meshes:
         alpha = pipe_opacity[0] if (checked and _layer_visible.get(ln, True)) else 0.0
         scene_widget.scene.modify_geometry_material(_comp_gn(ln), make_mesh_material(alpha))

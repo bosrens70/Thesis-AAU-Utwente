@@ -67,10 +67,12 @@ GML_PATH          = DATA_DIR / _ledningspakke_dir / "consolidated.gml"
 # site selection above, so a GUI label can never disagree with the loaded data.
 LEDNINGSPAKKE_NAME = _ledningspakke_dir
 
-# Short display form ("Ledningspakke 2803288") for the legend headers, so every
-# viewer shows the same compact title. Falls back to the raw directory name.
-_lp_match = re.match(r"(Ledningspakke)[_\s]*(\d+)", _ledningspakke_dir, re.IGNORECASE)
-LEDNINGSPAKKE_LABEL = (f"{_lp_match.group(1)} {_lp_match.group(2)}"
+# Short display form ("LER package 2803288") for the legend headers, so every
+# viewer shows the same compact title. The folder on disk keeps its Danish
+# name ("Ledningspakke_2803288_..."); only the GUI label is English. Falls
+# back to the raw directory name when no package number can be read.
+_lp_match = re.match(r"Ledningspakke[_\s]*(\d+)", _ledningspakke_dir, re.IGNORECASE)
+LEDNINGSPAKKE_LABEL = (f"LER package {_lp_match.group(1)}"
                        if _lp_match else _ledningspakke_dir)
 
 

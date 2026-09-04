@@ -1816,7 +1816,7 @@ def _solid_trace_centerlines():
 
 # Add LER pipe meshes
 _ler_visible = {}
-_ler_master_on = [True]   # Ledningspakke master checkbox state (legend section)
+_ler_master_on = [True]   # LER package master checkbox state (legend section)
 for ln, mesh in ler_meshes.items():
     gn = f"ler_{ln}"
     if not mesh.has_vertex_normals():
@@ -1827,9 +1827,9 @@ for ln, mesh in ler_meshes.items():
 # Trace centrelines, at the unscaled opacity so they read like the pipes.
 add_trace_centerlines(scene_widget.scene, _trace_centerlines, 0.6, make_mesh_mat)
 
-# LER signature overlays, at the unscaled opacity for the same reason. On by
-# default, so this viewer reads like the ERR plan and like LER itself.
-_sig_on = [True]
+# LER signature overlays, at the unscaled opacity for the same reason. Always
+# on in the solid colour modes, so this viewer reads like the ERR plan and
+# like LER itself.
 for _sln, _smesh in sig_meshes.items():
     scene_widget.scene.add_geometry(signature_gn(_sln), _smesh, make_mesh_mat(0.6))
 
@@ -2015,7 +2015,7 @@ def _signatures_visible():
     """The LER signatures belong to the solid colour modes only. In a deviation
     mode the colour of the LER geometry carries a measurement, so a fixed red
     hazard triangle beside it would read as a deviation class."""
-    return _sig_on[0] and _color_mode[0] not in _LER_DEV_MODES
+    return _color_mode[0] not in _LER_DEV_MODES
 
 
 def _sync_signatures():
@@ -2210,23 +2210,6 @@ if _n_crown_total:
     panel.add_child(crown_cb)
 else:
     panel.add_child(gui.Label("Crown line: none recovered"))
-
-# LER signature toggle: the cartographic signatures of the LER
-# "Signaturforklaring", shown in the solid colour modes only (_signatures_visible).
-sig_cb = gui.Checkbox("LER signatures")
-sig_cb.checked = _sig_on[0]
-if not sig_meshes:
-    sig_cb.enabled = False
-
-
-def _on_sig(c):
-    _sig_on[0] = c
-    _sync_signatures()
-    window.post_redraw()
-
-
-sig_cb.set_on_checked(_on_sig)
-panel.add_child(sig_cb)
 
 # Crop-region toggle (XY AABB + buffer rectangle in rect mode)
 crop_cb = gui.Checkbox("Crop region (XY AABB + buffer)")

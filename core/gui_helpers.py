@@ -232,7 +232,7 @@ class PanelTextFitter:
 
 def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
                              scene_widget, pipe_gn, make_mesh_material,
-                             pipe_opacity, window, signatures_on=None):
+                             pipe_opacity, window, update_signatures=False):
     """
     Create a callback for the "All segments" master checkbox.
 
@@ -256,10 +256,9 @@ def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
         List containing current pipe opacity [alpha].
     window : gui.Window
         The window to trigger redraws.
-    signatures_on : list of bool, optional
-        One-element list holding the "LER signatures" state. Given, the layer's
-        signature overlay follows this master checkbox too; omitted, the
-        overlay is left alone.
+    update_signatures : bool, optional
+        True, the layer's signature overlay follows this master checkbox too;
+        False (the default), the overlay is left alone.
 
     Returns
     -------
@@ -278,9 +277,9 @@ def make_master_pipe_toggle(pipe_checkboxes, layer_visible, pipe_layer_meshes,
                 # Trace ribbon/centreline split handled centrally
                 set_layer_material(scene_widget.scene, pipe_gn(ln), ln, alpha,
                                    make_mesh_material)
-            if signatures_on is not None:
+            if update_signatures:
                 set_signature_material(scene_widget.scene, ln, alpha,
-                                       make_mesh_material, signatures_on[0])
+                                       make_mesh_material)
         window.post_redraw()
     return _on_toggle_all_pipes
 
@@ -334,7 +333,7 @@ def make_master_comp_toggle(comp_checkboxes, layer_visible, comp_layer_meshes,
 class LerLegendSection:
     """The uniform LER legend block shared by every viewer (base_module look).
 
-    Structure: a Ledningspakke master checkbox above a collapsible container
+    Structure: an LER package master checkbox above a collapsible container
     holding the "LER opacity" slider row, the "All segments" /
     "All components" master checkboxes, and swatch+checkbox layer rows, in
     that order. Owns the look and ordering only; every callback (per layer,
