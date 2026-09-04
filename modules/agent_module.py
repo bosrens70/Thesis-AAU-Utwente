@@ -29,13 +29,7 @@ import urllib.request
 import urllib.error
 import json as _json
 
-from core.config import (
-    PLY_FILE, GML_PATH, AREA_REF_GEOJSON, CROP_RADIUS,
-    PANEL_WIDTH_EM,
-    CLASS_LABELS, DEFAULT_CLASS_COLOR,
-    LINE_LAYERS, COMPONENT_LAYERS, COMP_TO_LINE,
-    forsyningsart_color,
-)
+from core.config import PLY_FILE, PANEL_WIDTH_EM, LINE_LAYERS
 from core.data_loader import init_site, load_or_pick_ground_level, load_trench
 from core.geometry import segment_to_cylinder, segment_to_plane, linear_to_srgb
 from core.signature_legend import SignatureLegendSection
@@ -67,10 +61,6 @@ pc_min          = site.pc.pc_min
 pc_max          = site.pc.pc_max
 
 _ply_path = Path(PLY_FILE)
-_crop_cx_local = site.pc.crop_center_local[0]
-_crop_cy_local = site.pc.crop_center_local[1]
-_crop_cx_utm   = site.pc.crop_center_utm[0]
-_crop_cy_utm   = site.pc.crop_center_utm[1]
 
 # Ground picking
 GROUND_Z = load_or_pick_ground_level(site.pc, _ply_path)

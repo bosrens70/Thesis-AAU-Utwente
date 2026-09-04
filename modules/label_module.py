@@ -134,22 +134,14 @@ pc_max          = site.pc.pc_max
 
 _crop_cx_local = site.pc.crop_center_local[0]
 _crop_cy_local = site.pc.crop_center_local[1]
-_crop_cx_utm   = site.pc.crop_center_utm[0]
-_crop_cy_utm   = site.pc.crop_center_utm[1]
-_crop_r2       = CROP_RADIUS * CROP_RADIUS
 
 # Rectangle region (CROP_MODE == "rect"): full-cloud XY AABB grown by the utility
 # buffer.  Selection and clipping are XY-only so every utility passing through the
-# footprint is rendered regardless of its depth.  pc_min/pc_max are local;
-# UTM = local + (TX, TY).
+# footprint is rendered regardless of its depth.  pc_min/pc_max are local.
 _rect_min_x = pc_min[0] - UTILITY_RECT_BUFFER
 _rect_max_x = pc_max[0] + UTILITY_RECT_BUFFER
 _rect_min_y = pc_min[1] - UTILITY_RECT_BUFFER
 _rect_max_y = pc_max[1] + UTILITY_RECT_BUFFER
-_rect_min_x_utm = _rect_min_x + TX
-_rect_max_x_utm = _rect_max_x + TX
-_rect_min_y_utm = _rect_min_y + TY
-_rect_max_y_utm = _rect_max_y + TY
 
 _ply_path = Path(PLY_FILE)
 
