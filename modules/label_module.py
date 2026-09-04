@@ -2,7 +2,6 @@
 """
 Single Point Cloud Viewer with Instance Labels + Surrounding Utilities
 ======================================================================
-Refactored to use core/ for shared configuration and data loading.
 
 Besides assigning a utility-type label to an instance, an instance can also
 be linked to one specific LER utility line: left-click a utility line while
