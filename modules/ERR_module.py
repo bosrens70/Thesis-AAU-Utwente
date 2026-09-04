@@ -1165,11 +1165,11 @@ def _dsrc_gui_color(src):
     return gui.Color(r, g, b, 1.0)
 
 _hierarchy_display = [
-    ("1. Registered Z",    _depth_stats.get(DepthSource.REGISTERED, 0),   _dsrc_gui_color(DepthSource.REGISTERED)),
-    ("2. vejledendeDybde", _depth_stats.get(DepthSource.VEJLEDENDE, 0),   _dsrc_gui_color(DepthSource.VEJLEDENDE)),
-    ("3. Feature mean Z",  _depth_stats.get(DepthSource.FEATURE_MEAN, 0), _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
-    ("4. Layer mean Z",    _depth_stats.get(DepthSource.LAYER_MEAN, 0),   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
-    ("5. Ground plane",    _depth_stats.get(DepthSource.GROUND_PLANE, 0), _dsrc_gui_color(DepthSource.GROUND_PLANE)),
+    ("1. Registered Z",     _depth_stats.get(DepthSource.REGISTERED, 0),   _dsrc_gui_color(DepthSource.REGISTERED)),
+    ("2. Indicative depth", _depth_stats.get(DepthSource.VEJLEDENDE, 0),   _dsrc_gui_color(DepthSource.VEJLEDENDE)),
+    ("3. Feature mean Z",   _depth_stats.get(DepthSource.FEATURE_MEAN, 0), _dsrc_gui_color(DepthSource.FEATURE_MEAN)),
+    ("4. Layer mean Z",     _depth_stats.get(DepthSource.LAYER_MEAN, 0),   _dsrc_gui_color(DepthSource.LAYER_MEAN)),
+    ("5. Ground plane",     _depth_stats.get(DepthSource.GROUND_PLANE, 0), _dsrc_gui_color(DepthSource.GROUND_PLANE)),
 ]
 
 _depth_legend_container = gui.Vert(0)
