@@ -274,7 +274,6 @@ print("\n--- Loading utility lines within bbox ---")
 all_pipe_meshes   = []          # flat list, kept for count reporting only
 _pipe_layer_cyls  = {}          # layer_name -> [TriangleMesh, ...]  per-layer
 _sig_layer_meshes = {}          # layer_name -> [TriangleMesh, ...]  signatures
-_pipe_layer_seg_pts = {}        # layer_name -> ([p1, ...], [p2, ...]) for XRay centerlines
 layer_stats = {}
 all_pipe_coords = []
 
@@ -415,10 +414,6 @@ for layer_name, cfg in LINE_LAYERS.items():
                     # Track color for this storage key
                     if storage_key not in _storage_key_colors:
                         _storage_key_colors[storage_key] = color
-                    if storage_key not in _pipe_layer_seg_pts:
-                        _pipe_layer_seg_pts[storage_key] = ([], [])
-                    _pipe_layer_seg_pts[storage_key][0].append(clipped[0].copy())
-                    _pipe_layer_seg_pts[storage_key][1].append(clipped[1].copy())
                     midpt = (clipped[0] + clipped[1]) / 2.0
                     pick_seg_p1.append(clipped[0].copy())
                     pick_seg_p2.append(clipped[1].copy())
@@ -493,28 +488,6 @@ for _ln, _sms in _sig_layer_meshes.items():
     if _m is not None:
         _sig_meshes[_ln] = _m
 
-# Per-layer XRay centerline LineSets, one line per clipped segment. Built and
-# added to the scene but never shown: centerline_xray_active is never set true,
-# and Open3D 0.19 has no depth_func, so neither half of the effect is live.
-# Traces are excluded: they always carry their own centreline tube (below), so
-# an XRay line for them would just double it up.
-_pipe_layer_centerlines = {}
-for _ln, (p1s, p2s) in _pipe_layer_seg_pts.items():
-    if is_trace_key(_ln):
-        continue
-    _cl_pts   = []
-    _cl_lines = []
-    for _ci, (_cp1, _cp2) in enumerate(zip(p1s, p2s)):
-        _cl_pts.extend([_cp1, _cp2])
-        _cl_lines.append([2 * _ci, 2 * _ci + 1])
-    _cl_ls = o3d.geometry.LineSet(
-        points=o3d.utility.Vector3dVector(np.array(_cl_pts)),
-        lines=o3d.utility.Vector2iVector(_cl_lines),
-    )
-    # Use tracked color for this storage key (works for both regular and Ledningstrace variants)
-    _color = _storage_key_colors.get(_ln, [1.0, 1.0, 1.0])
-    _cl_ls.paint_uniform_color(_color)
-    _pipe_layer_centerlines[_ln] = _cl_ls
 
 # Trace centrelines: the corridor ribbon is drawn transparent (see
 # core/trace_render.py), so the registered centreline is drawn as a thin tube
@@ -524,19 +497,6 @@ _trace_centerlines = build_trace_centerlines(
     lambda k: _storage_key_colors.get(k, [1.0, 1.0, 1.0]),
     dash_of_index=lambda i: pick_seg_dash[i])
 
-# Combined wireframe (all layers). Added to the scene but hidden: there is no
-# wireframe toggle, so pipe_wireframe_active never becomes true.
-# Build from per-layer meshes using the non-mutating `+` operator so that
-# _pipe_layer_meshes entries are not corrupted (using `+=` on all_pipe_meshes[0]
-# would mutate the first layer's merged mesh to contain all layers).
-combined_pipe_wire = None
-if _pipe_layer_meshes:
-    _wf_meshes = list(_pipe_layer_meshes.values())
-    _wire_src = _wf_meshes[0]
-    for _m in _wf_meshes[1:]:
-        _wire_src = _wire_src + _m  # non-mutating: creates a new merged mesh each time
-    combined_pipe_wire = o3d.geometry.LineSet.create_from_triangle_mesh(_wire_src)
-    combined_pipe_wire.paint_uniform_color([1.0, 1.0, 1.0])
 
 # Pipe centroid
 pipe_centroid = np.array([0.0, 0.0, 0.0])
@@ -754,23 +714,6 @@ def make_point_material() -> rendering.MaterialRecord:
     return point_material_flat(3.0)
 
 
-def make_pipe_wire_material() -> rendering.MaterialRecord:
-    return line_material(1.5)
-
-
-def make_centerline_material() -> rendering.MaterialRecord:
-    mat = line_material(2.5)
-    try:
-        # Intended to render centerlines through occluding geometry so thin
-        # pipes stay visible inside thick ones. Open3D 0.19 has no
-        # MaterialRecord.depth_func, so this is a no-op and they depth-test
-        # normally.
-        mat.depth_func = "always"
-    except AttributeError:
-        pass
-    return mat
-
-
 def make_frame_material() -> rendering.MaterialRecord:
     return flat_material()
 
@@ -785,7 +728,6 @@ def _add_mesh(scene, name, mesh, mat):
 # 9.  Build GUI
 # ─────────────────────────────────────────────────────────────────────────────
 POINT_CLOUD_GEOM = "point_cloud"
-PIPE_WIRE_GEOM   = "pipes_wire"
 FRAME_GEOM       = "frame"
 BBOX_GEOM        = "bbox_wire"
 
@@ -796,7 +738,6 @@ def _inst_pts_gn(idx):  return f"inst_pts_{idx}"
 # Per-layer geometry names
 def _pipe_gn(ln):       return f"pipe_{ln}"
 def _comp_gn(ln):       return f"comp_{ln}"
-def _centerline_gn(ln): return f"centerline_{ln}"
 
 # Per-layer visibility state (True = shown)
 _layer_visible = {ln: True for ln in LINE_LAYERS}
@@ -807,10 +748,6 @@ _layer_visible.update({ln: False for ln in COMPONENT_LAYERS})  # start with all 
 
 pipe_opacity = [1.0]
 origin_frame_visible  = [False] # toggled by the "Show origin axis" checkbox
-# Both overlays are built, but neither has a checkbox, so these stay False for
-# the whole session and the geometry they gate is never shown.
-pipe_wireframe_active = [False]
-centerline_xray_active = [False]
 ler_utilities_visible = [True]   # toggled by the "Show LER utilities" checkbox
 signatures_on         = [True]   # toggled by the "LER signatures" checkbox
 
@@ -851,17 +788,6 @@ add_signature_meshes(
     visible_of=lambda k: _layer_visible.get(k, True),
     signatures_on=signatures_on[0])
 
-# Add combined wireframe overlay (hidden by default)
-if combined_pipe_wire is not None:
-    scene_widget.scene.add_geometry(
-        PIPE_WIRE_GEOM, combined_pipe_wire, make_pipe_wire_material()
-    )
-    scene_widget.scene.show_geometry(PIPE_WIRE_GEOM, False)
-
-# Add per-layer XRay centerlines (hidden by default)
-for _ln, _cls in _pipe_layer_centerlines.items():
-    scene_widget.scene.add_geometry(_centerline_gn(_ln), _cls, make_centerline_material())
-    scene_widget.scene.show_geometry(_centerline_gn(_ln), False)
 
 # Add per-layer component meshes
 for _ln, _mesh in _comp_layer_meshes.items():
@@ -986,16 +912,12 @@ def _make_pipe_toggle(ln):
     def _cb(checked):
         _layer_visible[ln] = checked
         _ler = ler_utilities_visible[0]
-        alpha = pipe_opacity[0] if (_ler and checked and not pipe_wireframe_active[0]) else 0.0
+        alpha = pipe_opacity[0] if (_ler and checked) else 0.0
         if ln in _pipe_layer_meshes:
             set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                                make_mesh_material)
         set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
                                signatures_on[0])
-        if ln in _pipe_layer_centerlines:
-            scene_widget.scene.show_geometry(
-                _centerline_gn(ln), _ler and checked and centerline_xray_active[0]
-            )
         window.post_redraw()
     return _cb
 
@@ -1077,12 +999,12 @@ def _apply_opacity(val: float):
     _ler = ler_utilities_visible[0]
 
     for ln in _pipe_layer_meshes:
-        alpha = val if (_ler and _layer_visible.get(ln, True) and not pipe_wireframe_active[0]) else 0.0
+        alpha = val if (_ler and _layer_visible.get(ln, True)) else 0.0
         set_layer_material(scene_widget.scene, _pipe_gn(ln), ln, alpha,
                            make_mesh_material)
 
     for ln in _sig_meshes:
-        alpha = val if (_ler and _layer_visible.get(ln, True) and not pipe_wireframe_active[0]) else 0.0
+        alpha = val if (_ler and _layer_visible.get(ln, True)) else 0.0
         set_signature_material(scene_widget.scene, ln, alpha, make_mesh_material,
                                signatures_on[0])
 
