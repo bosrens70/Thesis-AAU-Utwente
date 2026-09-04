@@ -37,6 +37,7 @@ from core.config import (
     SIGNATURE_TICK_BAR_WIDTH_M, SIGNATURE_3D_TICK_BAR_WIDTH_M,
     SIGNATURE_TICK_COLOR, SIGNATURE_HAZARD_COLOR,
     SIGNATURE_HAZARD_VALUES, SIGNATURE_DASH_DRIFTSSTATUS,
+    DRIFTSSTATUS_DISPLAY_EN, FAREKLASSE_DISPLAY_EN,
     VOLTAGE_KV_THRESHOLDS,
     SIGNATURE_LEGEND_TITLE, SIGNATURE_LEGEND_BG, SIGNATURE_LEGEND_INK,
     SIGNATURE_LEGEND_TRACE_INK,
@@ -190,44 +191,56 @@ def render_swatch(kind, w, h, style, *, ticks=0, line_px=2.0, bg=SIGNATURE_LEGEN
 # ─────────────────────────────────────────────────────────────────────────────
 # ROWS
 # ─────────────────────────────────────────────────────────────────────────────
+# The El rows name the layer in short form: LAYER_DISPLAY_EN's "Electricity
+# Cable" plus a voltage band overruns the panel at its 20 em width.
+EL_ROW_NAME = "Electricity"
+
+
 def voltage_row_labels(thresholds=VOLTAGE_KV_THRESHOLDS):
     """The El legend bins, written out from the thresholds that classify them.
 
-    ``[1, 30, 131]`` gives "< 1 kV", "1 kV - 29 kV", "30 kV - 130 kV",
-    "> 131 kV", which is what the LER legend prints. Derived rather than typed
-    out, so retuning the thresholds relabels the legend.
+    ``[1, 30, 131]`` gives "Electricity  < 1 kV", "Electricity  1 kV - 29 kV",
+    "Electricity  30 kV - 130 kV", "Electricity  > 131 kV", which is what the
+    LER legend prints. Derived rather than typed out, so retuning the
+    thresholds relabels the legend.
     """
     t = [float(x) for x in thresholds]
     if not t:
-        return ["El"]
-    out = [f"El   < {t[0]:g} kV"]
+        return [EL_ROW_NAME]
+    out = [f"{EL_ROW_NAME}  < {t[0]:g} kV"]
     for i in range(1, len(t)):
-        out.append(f"El   {t[i - 1]:g} kV - {t[i] - 1:g} kV")
-    out.append(f"El   > {t[-1]:g} kV")
+        out.append(f"{EL_ROW_NAME}  {t[i - 1]:g} kV - {t[i] - 1:g} kV")
+    out.append(f"{EL_ROW_NAME}  > {t[-1]:g} kV")
     return out
 
 
 def legend_rows(components="point"):
     """The rows of the legend, as ``(kind, ticks, label)``.
 
+    The labels are English, but translated from the rule constants through the
+    display tables in core/config.py rather than typed out, so a retuned rule
+    still cannot disagree with the label that explains it.
+
     ``components`` is what the viewer actually draws for a component: "plan"
-    for the ERR top view, which draws a point, a polygon and a line, or "point"
-    for the 3D viewers, which draw every component as a sphere and skip
-    non-Point geometry outright. Copying LER's three component rows into a 3D
-    viewer would promise two symbols it never draws.
+    for the ERR top view, which draws a point, a polygon and a line, three
+    forms the colour legend cannot tell apart. The 3D viewers draw every
+    component as a sphere, so their single row would explain no form that the
+    utility legend above does not already carry in colour, and they get none.
     """
+    dash_label = DRIFTSSTATUS_DISPLAY_EN.get(SIGNATURE_DASH_DRIFTSSTATUS,
+                                             SIGNATURE_DASH_DRIFTSSTATUS)
+    hazard_label = " / ".join(FAREKLASSE_DISPLAY_EN.get(v, v)
+                              for v in SIGNATURE_HAZARD_VALUES)
     rows = [
-        ("line",   0, "Ledning"),
-        ("dashed", 0, SIGNATURE_DASH_DRIFTSSTATUS.capitalize()),
+        ("line",   0, "Utility line"),
+        ("dashed", 0, dash_label.capitalize()),
         ("trace",  0, "Trace"),
-        ("hazard", 0, "Fareklasse " + " / ".join(SIGNATURE_HAZARD_VALUES)),
+        ("hazard", 0, f"Hazard class: {hazard_label}"),
     ]
     if components == "plan":
-        rows += [("comp_point",   0, "Komponent punkt"),
-                 ("comp_polygon", 0, "Komponent polygon"),
-                 ("comp_line",    0, "Komponent linje")]
-    else:
-        rows += [("comp_point", 0, "Komponent")]
+        rows += [("comp_point",   0, "Component point"),
+                 ("comp_polygon", 0, "Component polygon"),
+                 ("comp_line",    0, "Component line")]
     rows += [("el", i, lbl) for i, lbl in enumerate(voltage_row_labels())]
     return rows
 

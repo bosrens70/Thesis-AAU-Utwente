@@ -295,6 +295,22 @@ FORSYNINGSART_DISPLAY_EN = {
     "ukendt":            "unknown",
 }
 
+# driftsstatus and fareklasse enumeration values (Danish, straight from the
+# GML) -> English, for the signature legend rows. The rule constants further
+# down keep the GML spelling because they are matched against the data; only
+# the label a user reads is English. Wording matches the manuscript.
+DRIFTSSTATUS_DISPLAY_EN = {
+    "under etablering":       "under construction",
+    "i drift":                "in operation",
+    "permanent ude af drift": "permanently out of operation",
+}
+
+FAREKLASSE_DISPLAY_EN = {
+    "ikke farlig":  "not hazardous",
+    "farlig":       "hazardous",
+    "meget farlig": "very hazardous",
+}
+
 
 def layer_display_name(key):
     """English display text for a layer key, including compound
@@ -429,7 +445,7 @@ SIGNATURE_3D_HAZARD_SIZE      = 0.14   # m, triangle edge scale
 # pixel size that would be wrong at another DPI. Colours here are sRGB, unlike
 # the linear layer colours above: they are rasterised straight into an image
 # rather than handed to Open3D as a material.
-SIGNATURE_LEGEND_TITLE       = "Signaturforklaring"
+SIGNATURE_LEGEND_TITLE       = "Signature Legend"
 SIGNATURE_LEGEND_BG          = [0.96, 0.96, 0.96]   # sRGB, the light legend card
 SIGNATURE_LEGEND_INK         = [0.05, 0.05, 0.05]   # sRGB, generic line ink
 SIGNATURE_LEGEND_TRACE_INK   = [0.72, 0.72, 0.72]   # sRGB, the wide trace band
