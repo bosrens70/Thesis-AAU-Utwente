@@ -855,7 +855,7 @@ for _ln, _src_list in _pipe_seg_dsrc.items():
 print(f"\n  Total line segments: {sum(s for _, s in layer_stats.values()):,}")
 print(f"  Depth hierarchy stats (rendered pipe segments):")
 print(f"    1. Registered Z:     {_depth_stats.get(DepthSource.REGISTERED, 0)}")
-print(f"    2. vejledendeDybde:  {_depth_stats.get(DepthSource.VEJLEDENDE, 0)}")
+print(f"    2. Indicative depth: {_depth_stats.get(DepthSource.VEJLEDENDE, 0)}")
 print(f"    3. Feature mean Z:   {_depth_stats.get(DepthSource.FEATURE_MEAN, 0)}")
 print(f"    4. Layer mean Z:     {_depth_stats.get(DepthSource.LAYER_MEAN, 0)}")
 print(f"    5. Ground plane:     {_depth_stats.get(DepthSource.GROUND_PLANE, 0)}")
